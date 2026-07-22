@@ -31,9 +31,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--group-sizes", type=int, nargs="+", default=(8, 16, 32))
     parser.add_argument("--local-world-size", type=int, default=8)
     parser.add_argument("--slot-increment", type=int, default=1)
-    parser.add_argument("--phase", choices=("steady", "initialize"), default="steady")
+    parser.add_argument("--phase", choices=("steady", "initialize", "initialized-steady"), default="steady")
     parser.add_argument("--max-swaps", type=int, default=1)
     parser.add_argument("--max-covers", type=int, default=1)
+    parser.add_argument("--max-copies", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=7)
     parser.add_argument("--backend", choices=("hccl", "gloo"), default="hccl")
@@ -114,6 +115,8 @@ def main() -> None:
     args = _parse_args()
     if args.warmup < 0 or args.iterations <= 0:
         raise ValueError("warmup must be non-negative and iterations must be positive.")
+    if not 1 <= args.max_copies <= 8:
+        raise ValueError("max-copies must be between 1 and 8.")
     rank, world_size, device = _initialize(args.backend)
     route_rank = rank if world_size > 1 else args.rank
     if world_size > 1 and world_size != args.ep_size:
@@ -145,7 +148,34 @@ def main() -> None:
         slots_per_rank=slots_per_rank,
         reducer=reducer,
         process_group=dist.group.WORLD if dist.is_initialized() else None,
+        max_copies=args.max_copies,
     )
+    initialization_ms = None
+    initialization_actions: list[str] = []
+    if args.phase == "initialized-steady":
+        if dist.is_initialized():
+            dist.barrier()
+        _synchronize(device)
+        started = time.perf_counter()
+        initialization = planner.plan(
+            routes,
+            layout,
+            owners,
+            source_ranks=route_rank,
+            max_swaps=0,
+            max_replicas=args.ep_size * args.slot_increment,
+            step=0,
+            layer_seed=args.layer,
+        )
+        _synchronize(device)
+        elapsed = torch.tensor([(time.perf_counter() - started) * 1000.0], device=device)
+        if dist.is_initialized():
+            dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+        initialization_ms = float(elapsed.item())
+        initialization_actions = [action.format() for action in initialization.actions]
+        layout = torch.tensor(initialization.final_layout, dtype=torch.long, device=device)
+        if bool((layout < 0).any().item()):
+            raise RuntimeError("Initialization did not fill every redundant slot.")
     all_slots = torch.arange(layout.numel(), dtype=torch.long, device=device)
     owner_mask = torch.zeros_like(layout, dtype=torch.bool)
     owner_mask.scatter_(0, owners, True)
@@ -210,6 +240,9 @@ def main() -> None:
         "world_size": world_size,
         "ep_size": args.ep_size,
         "phase": args.phase,
+        "max_copies": args.max_copies,
+        "initialization_ms": initialization_ms,
+        "initialization_actions": initialization_actions,
         "candidate_count": candidate_count,
         "timing_ms": {
             "median": statistics.median(samples),
