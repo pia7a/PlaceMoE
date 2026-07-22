@@ -90,6 +90,9 @@ Following steady-state rounds restore the strict-improvement invariant.
 The NPU path uses a fused AscendC candidate scorer:
 
 - replica_prepare builds sparse expert-to-token route tables once;
+- the small layout, owner, and candidate-row metadata is built on CPU before
+  one compact NPU transfer, avoiding dynamic-shape synchronization with the
+  model-compute stream on every layer;
 - one AI-core work stream evaluates each candidate's affected routes;
 - nearest-copy choices are prepared once per candidate rather than once per
   token;
@@ -132,3 +135,41 @@ Run the saved-route benchmark on one NPU:
 
 Under torchrun, each EP rank automatically loads its matching route file and
 the benchmark includes the real sharded candidate collectives.
+
+## Validation status (2026-07-22)
+
+The saved layer-0 route replay on 32 NPUs contains 11,464 steady-state swap and
+occupied-cover candidates. With two warmups and seven measured iterations,
+the host-metadata optimization reduced median planner latency from 642.7 ms to
+334.0 ms while selecting the same action and producing the same predicted
+communication cost. The measured range changed from 619.6--687.2 ms to
+330.1--341.4 ms. Empty-slot initialization remained approximately 1.5 seconds.
+
+A three-step, four-node Qwen3-VL-30B-A3B run used one redundant slot per rank
+and planning interval two:
+
+- step 0 initialized all 32 slots in every one of 48 layers and completed in
+  43.91 seconds; the accumulated placement planning metric was 5.11 seconds;
+- step 1 reused the initialized layout without planning and took approximately
+  24.7 seconds;
+- step 2 evaluated steady swap and occupied-cover actions in every layer,
+  selected 36 swaps and 12 covers, and took approximately 57 seconds;
+- the pre-host-metadata-optimization accumulated planner time on step 2 was
+  37.32 seconds, including 15.07 seconds attributed to route/candidate stats;
+- the predicted aggregate communication cost fell from 117,321 to 102,461,
+  a strict 12.7 percent reduction.
+
+Accelerator spans on local ranks 0--7 confirm that the selected actions reduce
+real communication. From the no-planning step to the steady-action step, the
+median accumulated forward all-to-all time fell from 7.68 seconds to 4.43
+seconds, and the forward MoE communication region fell from 8.77 seconds to
+6.63 seconds.
+
+The four-node functional path is therefore validated, including placement,
+incremental token remapping, expert transfer, forward/backward execution, and
+redundant-gradient synchronization. The current every-layer, every-planning-
+step schedule is not yet E2E competitive: even at 334 ms per layer, 48
+sequential layer plans cannot meet a roughly 500 ms whole-step planning budget.
+The next performance stage must batch sufficient statistics and collectives
+across layers, or explicitly amortize planning across steps; the single-layer
+latency result must not be reported as whole-step planner latency.
