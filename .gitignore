@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+*.egg-info/
+log.txt
+profile/runs/
+profile/figures/
+profile/processed/
+pretrain_runs/
+veomni/ops/platform/npu/hiermoe_planner_ops/build/
+

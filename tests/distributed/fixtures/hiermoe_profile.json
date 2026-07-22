@@ -1,0 +1,6 @@
+{
+  "a2a": {"alpha": 1.0, "beta": 0.01},
+  "inter": [{"alpha": 0.5, "beta": 0.005}],
+  "intra": {"alpha": 0.1, "beta": 0.001},
+  "source": "bench_hiermoe_perf_model"
+}

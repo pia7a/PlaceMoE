@@ -1,0 +1,331 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project.urls]
+"Homepage" = "https://github.com/ByteDance-Seed/VeOmni"
+"Source Code" = "https://github.com/ByteDance-Seed/VeOmni"
+
+[project]
+name = "veomni"
+dynamic = ["version"]
+description = "VeOmni: Scaling any Modality Model Training to any Accelerators with PyTorch native Training Framework"
+readme = "README.md"
+requires-python = ">=3.11, <3.13"
+license = { file = "LICENSE" }
+authors = [
+  { name="ByteDance-Seed", email="doubao-llm@bytedance.com" },
+]
+
+dependencies = [
+  "blobfile>=3.0.0",
+  "datasets>=2.20.0,<=2.21.0",
+  "packaging>=23.0,<26.0",
+  "torchdata>=0.8.0,<1.0",
+  "tiktoken>=0.9.0",
+  # Comment out transformers version so pip users do not accidentally pull in a
+  # version that conflicts with the uv-managed setup.
+  # For uv user: the actual version is pinned by the "transformers-stable"
+  # default dependency-group (==5.2.0).
+  # For pip user: please install 5.2.0 manually via `pip install transformers==5.2.0`.
+  # "transformers==5.2.0",
+  "psutil",
+  "timm",
+  "wandb",
+  "setuptools",
+  "einops>=0.8.1",
+  # matplotlib is used by veomni.utils.moe_monitor to render the per-step
+  # MoE expert-load heatmap that gets logged to wandb. Falls back to scalar
+  # metrics only if matplotlib is missing.
+  "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pre-commit>=4.0.0,<5.0",
+  "ruff>=0.7.0,<1.0",
+  "pytest>=6.0.0,<8.0",
+  "expecttest>=0.3.0,<0.4"
+]
+audio = [
+  "torchcodec",
+  "av>=14.3.0,<15.0; python_version == '3.11'",
+  "av>=14.0.0,<14.3; python_version == '3.12'",
+  "librosa>=0.11.0,<0.12",
+  "soundfile>=0.13.1,<0.14"
+]
+# Alias for audio extra - includes both video and audio processing dependencies
+video = [
+  "torchcodec",
+  "av>=14.3.0,<15.0; python_version == '3.11'",
+  "av>=14.0.0,<14.3; python_version == '3.12'",
+  "librosa>=0.11.0,<0.12",
+  "soundfile>=0.13.1,<0.14"
+]
+dit = [
+  "diffusers==0.37.0",
+  "torchcodec",
+  "av>=14.3.0,<15.0; python_version == '3.11'",
+  "av>=14.0.0,<14.3; python_version == '3.12'",
+  "librosa>=0.11.0,<0.12",
+  "soundfile>=0.13.1,<0.14",
+  "ftfy",
+]
+npu_aarch64 = [
+  "torch==2.7.1",
+  "torch-npu==2.7.1",
+  "torchvision==0.22.1",
+  "torchaudio==2.7.1",
+  "decorator>=5.2.1",
+  "scipy>=1.16.2"
+]
+npu = [
+  "torch==2.7.1+cpu",
+  "torch-npu==2.7.1",
+  "torchvision==0.22.1+cpu",
+  "torchaudio==2.7.1+cpu",
+  "decorator>=5.2.1",
+  "scipy>=1.16.2",
+  "torchcodec>=0.4.0,<0.6.0"
+]
+gpu = [
+  "torch==2.9.1+cu129",
+  "torchvision==0.24.1+cu129",
+  "torchaudio==2.9.1+cu129",
+  "nvidia-cusparselt-cu12",
+  "nvidia-nccl-cu12",
+  "liger-kernel",
+  "flash-attn",
+  "flash-attn-3",
+  "hf_transfer",
+  "torchcodec==0.8.1", # 0.8.1 is compatible with torch 2.9
+  "cuda-python==12.9.1",
+  "torch-c-dlpack-ext",
+  # For models with linear attention like Qwen 3.5
+  "flash-linear-attention",
+  "quack-kernels==0.3.4",
+]
+megatron = [
+  "megatron-energon>=7.2.1"
+]
+trl = [
+  "trl<=0.9.6"
+]
+lora = [
+  "peft==0.18.1"
+]
+
+fa4 = [
+  "flash-attn-4",
+  "nvidia-cutlass-dsl>=4.4.2"
+]
+
+# Optional alternative chunk_gated_delta_rule kernel for Qwen3.5 linear attention.
+# Opt in by selecting `chunk_gated_delta_rule_implementation: flash_qla` in
+# OpsImplementationConfig — the default `eager` and the `fla` backend
+# (shipped under the `gpu` extra via `flash-linear-attention`) work without
+# this extra. Source: https://github.com/QwenLM/FlashQLA
+flash-qla = [
+  "flash-qla"
+]
+
+[dependency-groups]
+# Follow the best practice in https://docs.astral.sh/uv/concepts/projects/dependencies/#development-dependencies
+# to manage dev dependencies (i.e., dependencies that are only used in development) like
+# test, lint and doc tools.
+dev = [
+  {include-group = "lint"},
+  {include-group = "test"},
+]
+lint = [
+  "pre-commit",
+  "ruff",
+]
+test = [
+  "rich",
+  "pytest",
+  "expecttest",
+]
+# Pin the default transformers version via a dependency group. This is a
+# default group (see default-groups below), so `uv sync` always installs
+# transformers==5.2.0.
+#
+# Why a dependency group instead of `[project.dependencies]`? It keeps the
+# transformers version out of the wheel metadata so pip users are not forced
+# into a specific 5.x patch release.
+transformers-stable = [
+  "transformers==5.2.0"
+]
+
+[tool.uv]
+# This locks the uv version so that we have a consistent uv behavior across the board.
+# Inconsistent uv versions might generate different uv lock files which creates chaos.
+#
+# NOTE 1: Update this at least once per month as uv releases new version every week.
+# NOTE 2: When updating this line, make sure to update Dockerfile under docker/ to the same
+#         version and release new docker images.
+required-version = "==0.9.8"
+no-build-isolation-package = [
+    "flash-attn",
+    "flash-attn-3",
+]
+
+# The "transformers-stable" dependency group is synced by default, ensuring
+# that `uv sync` (with no extra flags) installs transformers==5.2.0.
+default-groups = ["transformers-stable"]
+
+override-dependencies = [
+    # Adding the (extra == 'gpu') mark to declare this override is only for gpu extra.
+    # Without this mark, uv would download torch/torchaudio/torchvision unexpectedly from
+    # PyPI without using the cu128 versions.
+    # Ref: https://github.com/astral-sh/uv/issues/11153
+    "torch==2.9.1+cu129; (extra == 'gpu')",
+    "torchaudio==2.9.1+cu129; (extra == 'gpu')",
+    "torchvision==0.24.1+cu129; (extra == 'gpu')",
+    "torchcodec==0.8.1; (extra == 'gpu')",
+    # Adding explicit override for NPU backends - aarch64 variant
+    "torch==2.7.1; (extra == 'npu_aarch64')",
+    "torchaudio==2.7.1; (extra == 'npu_aarch64')",
+    "torchvision==0.22.1; (extra == 'npu_aarch64')",
+    "torchcodec>=0.4.0,<0.6.0; (extra == 'npu_aarch64')",
+    # Adding explicit override for NPU backends - x86 variant (default npu)
+    "torch==2.7.1+cpu; (extra == 'npu')",
+    "torchaudio==2.7.1+cpu; (extra == 'npu')",
+    "torchvision==0.22.1+cpu; (extra == 'npu')",
+    "torchcodec>=0.4.0,<0.6.0; (extra == 'npu')",
+
+    # Force to use 9.15+ cudnn to avoid torch 2.9 conv3d performance regression issue:
+    # https://github.com/pytorch/pytorch/releases/tag/v2.9.1
+    # TODO: remove this override after we upgrade to torch 2.10.
+    "nvidia-cudnn-cu12==9.15.1.9",
+]
+
+conflicts = [
+  [
+    { extra = "gpu" },
+    { extra = "npu" },
+    { extra = "npu_aarch64" },
+  ],
+]
+
+[tool.uv.sources]
+# To support override-dependencies for multiple extras, one package can only have one index.
+# Using pytorch index for all variants since it has both regular and +cpu versions
+torch = [
+  { index = "pytorch", marker = "(extra == 'npu' or extra == 'npu_aarch64')" },
+  # Due to some unknown bugs, uv might resolve to a wheel from https://download.pytorch.org/whl/cu128_full which does
+  # not include the proper dependencies on nvidia packages like nvidia-cublas and nvidia-nccl. This confuses uv to uninstall
+  # those nvidia packages.
+  #
+  # By forcing it to the proper package here, we avoid the problem that uv could randomly resolve to other packages.
+  #
+  # NOTE: WHEN UPDATE TORCH VERSIONS, PLEASE UPDATE THIS TO THE CORRESPONDING WHEEL URL.
+  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.11'" },
+  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.12'" },
+]
+torchvision = { index = "pytorch" }
+torchaudio = { index = "pytorch" }
+# Download fa2 and fa3 wheels directly to avoid build issues.
+# Both wheels are built against torch 2.9+cu129. From
+# https://github.com/Luosuu/flash-attention-prebuild-wheels since there is no official
+# FA2 prebuilt wheel for torch 2.9+.
+flash-attn = [
+  { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn-2.8.4-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.11'"},
+  { url = "https://github.com/Luosuu/flash-attention-prebuild-wheels/releases/download/fa2cu129/flash_attn-2.8.3+cu129torch2.9-cp312-cp312-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.12'"},
+]
+flash-attn-3 = [
+  # torch 2.9+cu129 — cp39-abi3 (stable ABI) works on both 3.11 and 3.12.
+  { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn_3-3.0.0+20260313.cu129torch291cxx11abitrue.3a0d6b-cp39-abi3-linux_x86_64.whl", marker = "extra == 'gpu'"},
+]
+# FlashAttention 4 is developed under flash-attention/flash-attn/cute folder as a standalone python project.
+# Pinned to 03/18/2026 latest main commit.
+flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "9397816f6094f5ba0de52c221093637054590d0d" }
+# FlashQLA — alternative chunk_gated_delta_rule implementation for Qwen3.5 linear attention.
+# Pinned to 05/08/2026 main HEAD (PR #13 "preserve input dtype in l2norm helper"). Includes
+# fixes accumulated since the prior pin: backward returning wrong number of gradients (#10),
+# auto_cp UnboundLocalError (#8), and l2norm dtype preservation (#13). Strictly newer than
+# v0.1.0 which shipped a chunk_gated_delta_rule wrapper that broke Qwen3.5 GatedDeltaNet
+# training.
+flash-qla = { git = "https://github.com/QwenLM/FlashQLA", rev = "6ef4858b5446e05bd461d9658d877e548182dbcb" }
+
+# Download av wheels directly to avoid FFmpeg build dependency issues in CI.
+# 3.11 uses av 14.4.0 (latest 14.x with cp311 wheel). 3.12 falls back to av 14.2.0 — the
+# newest 14.x release with a cp312 wheel on pypi (14.3.0 and 14.4.0 are 3.11-only).
+av = [
+  { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'audio' or extra == 'video' or extra == 'dit') and python_version == '3.11'" },
+  { url = "https://files.pythonhosted.org/packages/ed/e8/cf60f3fcde3d0eedee3e9ff66b674a9b85bffc907dccebbc56fb5ac4a954/av-14.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'audio' or extra == 'video' or extra == 'dit') and python_version == '3.12'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu/"
+explicit = true
+
+[[tool.uv.dependency-metadata]]
+name = "flash-attn"
+requires-dist = ["torch"]
+
+[[tool.uv.dependency-metadata]]
+name = "flash-attn-3"
+requires-dist = ["torch"]
+
+[tool.setuptools.dynamic]
+version = {attr = "veomni._version.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = [
+  "tests*",
+  "ci*",
+  "configs*",
+  "veomni_patch",
+  "tasks",
+  "scripts",
+  "build*",
+  "veomni.ops.platform.npu.hiermoe_planner_ops.build*",
+]
+
+[tool.setuptools.package-data]
+"veomni.ops.platform.npu.hiermoe_planner_ops" = ["*.md", "*.sh", "csrc/extension/*", "csrc/opp/*"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["build/*", "build/**/*", "*.so"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 119
+indent-width = 4
+
+[tool.ruff.lint]
+ignore = ["B905", "C901", "E501", "E741", "W605", "C408"]
+select = ["B", "C", "E", "F", "I", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F401", "F403", "F811"]
+# Patch gen configs reference names from add_post_import_block (e.g. OpSlot
+# instances, rotate_half) that ruff can't resolve because they only exist as
+# string literals until patchgen materializes them into the generated file.
+"veomni/models/transformers/**/generated/*.py" = ["E402", "B007", "I001"]
+"veomni/models/transformers/**/*_patch_gen_config.py" = ["F821"]
+
+[tool.ruff.lint.isort]
+lines-after-imports = 2
+known-first-party = ["veomni"]
+known-third-party = ["torch", "transformers", "wandb"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.pytest.ini_options]
+markers = [
+    "benchmark: marks tests as benchmark tests (deselect with '-m \"not benchmark\"')",
+    "qwen3_5_ulysses: Qwen3.5 GatedDeltaNet Ulysses SP tests (run when ulysses or qwen3_5 code is touched)",
+]

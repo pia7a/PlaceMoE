@@ -1,0 +1,327 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import hashlib
+import json
+import os
+from typing import TYPE_CHECKING
+
+import torch
+import torch.distributed as dist
+
+from ...checkpoint import CheckpointerBase, build_checkpointer
+from ...distributed.moe.hiermoe import (
+    assert_hiermoe_checkpoint_layout_compatible,
+    assert_hiermoe_trainable_only_checkpoint_safe,
+    hiermoe_state_dict,
+    load_hiermoe_state_dict,
+)
+from ...models import save_model_assets
+from ...utils import helper
+from ...utils.save_safetensor_utils import save_hf_safetensor, save_lora_adapter_with_dcp
+from .base import Callback, TrainerState
+
+
+if TYPE_CHECKING:
+    from ..base import BaseTrainer, VeOmniArguments
+
+
+logger = helper.create_logger(__name__)
+_CHECKPOINT_PREFLIGHT_GROUP: dist.ProcessGroup | None = None
+
+
+def _checkpoint_preflight_group() -> dist.ProcessGroup:
+    global _CHECKPOINT_PREFLIGHT_GROUP
+
+    if "gloo" in str(dist.get_backend()).lower():
+        return dist.group.WORLD
+    if _CHECKPOINT_PREFLIGHT_GROUP is None:
+        _CHECKPOINT_PREFLIGHT_GROUP = dist.new_group(backend="gloo")
+    return _CHECKPOINT_PREFLIGHT_GROUP
+
+
+def _hiermoe_checkpoint_digest(state_dict: dict | None) -> bytes:
+    payload = json.dumps(state_dict or {}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).digest()
+
+
+def _raise_if_checkpoint_preflight_failed(
+    local_error: Exception | None,
+    *,
+    hiermoe_digest: bytes | None = None,
+) -> None:
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+        if local_error is not None:
+            raise local_error
+        return
+
+    preflight_group = _checkpoint_preflight_group()
+    failed = torch.tensor([int(local_error is not None)], dtype=torch.int32, device="cpu")
+    dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=preflight_group)
+    if bool(failed.detach().cpu().item()):
+        if local_error is not None:
+            raise local_error
+        raise RuntimeError(
+            "Distributed checkpoint preflight failed on another rank; refusing to enter the collective DCP load."
+        )
+
+    if hiermoe_digest is None:
+        return
+    if len(hiermoe_digest) != hashlib.sha256().digest_size:
+        raise ValueError("HierMoE checkpoint metadata digest has an invalid length.")
+    local_digest = torch.tensor(list(hiermoe_digest), dtype=torch.uint8, device="cpu")
+    gathered = torch.empty(
+        (dist.get_world_size(group=preflight_group) * local_digest.numel(),),
+        dtype=torch.uint8,
+        device="cpu",
+    )
+    dist.all_gather_into_tensor(gathered, local_digest, group=preflight_group)
+    digest_rows = gathered.view(-1, local_digest.numel())
+    if not bool((digest_rows == digest_rows[0]).all().item()):
+        raise RuntimeError(
+            "HierMoE checkpoint placement metadata differs across ranks; refusing to enter the collective DCP load."
+        )
+
+
+class CheckpointerCallback(Callback):
+    def __init__(self, trainer: "BaseTrainer"):
+        super().__init__(trainer)
+        args: "VeOmniArguments" = self.trainer.args
+        self.every_n_steps = args.train.checkpoint.save_steps
+        self.every_n_epochs = args.train.checkpoint.save_epochs
+        self._last_saved_step: int = -1
+        self.trainer.checkpointer: CheckpointerBase = build_checkpointer(
+            dist_backend=args.train.accelerator.fsdp_config.fsdp_mode, ckpt_manager=args.train.checkpoint.manager
+        )
+
+    def on_step_end(self, state: TrainerState, **kwargs):
+        if self.every_n_steps and state.global_step % self.every_n_steps == 0:
+            self._save_checkpoint(state)
+
+    def on_epoch_end(self, state: TrainerState, **kwargs):
+        if self.every_n_epochs and (state.epoch + 1) % self.every_n_epochs == 0:
+            if state.global_step != self._last_saved_step:
+                self._save_checkpoint(state)
+            else:
+                logger.info_rank0(
+                    f"Skipping duplicate checkpoint save at epoch_end (global_step {state.global_step} "
+                    f"already saved at step_end)."
+                )
+
+    def on_train_begin(self, state: TrainerState, **kwargs) -> None:
+        self._load_checkpoint()
+
+    def _load_checkpoint(self):
+        """Load checkpoint from path."""
+        args: "VeOmniArguments" = self.trainer.args
+        if args.train.checkpoint.load_path is None:
+            return
+
+        state = {
+            "model": self.trainer.model,
+            "optimizer": self.trainer.optimizer,
+            "extra_state": {},
+        }
+
+        if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
+            self.trainer.checkpointer.save_future.result()
+
+        trainable_only = bool(getattr(args.model, "lora_config", None))
+        load_extra_state = getattr(self.trainer.checkpointer, "load_extra_state", None)
+        if callable(load_extra_state):
+            local_error: Exception | None = None
+            hiermoe_digest: bytes | None = None
+            try:
+                load_extra_state(args.train.checkpoint.load_path, state)
+                hiermoe_state = state["extra_state"].get("hiermoe")
+                assert_hiermoe_checkpoint_layout_compatible(hiermoe_state)
+                assert_hiermoe_trainable_only_checkpoint_safe(trainable_only, hiermoe_state, "load")
+                hiermoe_digest = _hiermoe_checkpoint_digest(hiermoe_state)
+            except Exception as exc:
+                local_error = exc
+            _raise_if_checkpoint_preflight_failed(local_error, hiermoe_digest=hiermoe_digest)
+        self.trainer.checkpointer.load(
+            args.train.checkpoint.load_path,
+            state,
+            trainable_only=trainable_only,
+            extra_state_preloaded=callable(load_extra_state),
+        )
+
+        self.trainer.state.global_step = state["extra_state"]["global_step"]
+        self.trainer.start_epoch = self.trainer.state.global_step // args.train_steps
+        self.trainer.start_step = self.trainer.state.global_step % args.train_steps
+
+        assert_hiermoe_trainable_only_checkpoint_safe(trainable_only, state["extra_state"].get("hiermoe"), "load")
+        self.trainer.lr_scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
+        load_hiermoe_state_dict(state["extra_state"].get("hiermoe"))
+
+        # dataloader may only init on sp_rank_0 to save memory
+        if (
+            self.trainer.train_dataloader is not None
+            and state["extra_state"].get("train_dataloader", None) is not None
+        ):
+            self.trainer.train_dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
+
+        self.trainer.environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
+        torch.set_rng_state(state["extra_state"]["torch_rng_state"])
+        if self.trainer.start_step == 0:
+            # If resume at the end of epoch, clear resume state and prefetch data
+            iter(self.trainer.train_dataloader)
+
+        dist.barrier()
+        logger.info_rank0(f"Load distributed checkpoint from {args.train.checkpoint.load_path} successfully!")
+
+    def _save_checkpoint(self, state: TrainerState):
+        """Save distributed checkpoint and optimizer state at each save_steps."""
+        args: "VeOmniArguments" = self.trainer.args
+
+        save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
+
+        ckpt_state = {
+            "model": self.trainer.model,
+            "optimizer": self.trainer.optimizer,
+            "extra_state": {
+                "global_step": state.global_step,
+                "lr_scheduler": self.trainer.lr_scheduler.state_dict(),
+                "train_dataloader": self.trainer.train_dataloader.state_dict()
+                if self.trainer.train_dataloader is not None
+                else {},
+                "environ_meter": self.trainer.environ_meter.state_dict(),
+                "torch_rng_state": torch.get_rng_state(),
+                "hiermoe": hiermoe_state_dict(),
+            },
+        }
+
+        trainable_only = bool(getattr(args.model, "lora_config", None))
+        assert_hiermoe_trainable_only_checkpoint_safe(trainable_only, ckpt_state["extra_state"]["hiermoe"], "save")
+        self.trainer.checkpointer.save(
+            save_checkpoint_path,
+            ckpt_state,
+            save_async=args.train.checkpoint.save_async,
+            trainable_only=trainable_only,
+        )
+
+        # Empty cache and barrier
+        helper.empty_cache()
+        dist.barrier()
+
+        self._last_saved_step = state.global_step
+        logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
+
+
+class HuggingfaceCkptCallback(CheckpointerCallback):
+    def __init__(self, trainer: "BaseTrainer"):
+        super().__init__(trainer)
+        args: "VeOmniArguments" = self.trainer.args
+        self.save_hf_weights = args.train.checkpoint.save_hf_weights
+        self.every_n_steps = args.train.checkpoint.hf_save_steps
+        self.every_n_epochs = args.train.checkpoint.hf_save_epochs
+
+    def on_train_end(self, state: TrainerState, **kwargs):
+        if self.save_hf_weights:
+            if state.global_step != self._last_saved_step:
+                self._save_checkpoint(state, stage="train_end")
+            else:
+                logger.info_rank0(
+                    f"Skipping duplicate HF checkpoint save at train_end (global_step {state.global_step} "
+                    f"already saved)."
+                )
+
+    def on_step_end(self, state: TrainerState, **kwargs):
+        if self.save_hf_weights and self.every_n_steps and state.global_step % self.every_n_steps == 0:
+            self._save_checkpoint(state)
+
+    def on_epoch_end(self, state: TrainerState, **kwargs):
+        if self.save_hf_weights and self.every_n_epochs and (state.epoch + 1) % self.every_n_epochs == 0:
+            if state.global_step != self._last_saved_step:
+                self._save_checkpoint(state)
+            else:
+                logger.info_rank0(
+                    f"Skipping duplicate HF checkpoint save at epoch_end (global_step {state.global_step} "
+                    f"already saved at step_end)."
+                )
+
+    def on_train_begin(self, state: TrainerState, **kwargs) -> None:
+        self._save_model_assets()
+
+    def _save_model_assets(self):
+        args: "VeOmniArguments" = self.trainer.args
+        if args.train.global_rank == 0:
+            save_model_assets(args.train.checkpoint.model_assets_dir, self.trainer.model_assets)
+        dist.barrier()
+
+    def _save_checkpoint(self, state: TrainerState, stage: str = "step_end"):
+        """Save model in HuggingFace format."""
+        args: "VeOmniArguments" = self.trainer.args
+        save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
+        if not os.path.exists(save_checkpoint_path):
+            dist.barrier()
+            super()._save_checkpoint(state)
+
+        if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
+            self.trainer.checkpointer.save_future.result()
+
+        if stage == "train_end":
+            self.trainer.optimizer = None
+            self.trainer.lr_scheduler = None
+
+        hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+        save_hf_safetensor(
+            save_hf_safetensor_path=hf_weights_path,
+            model_assets=self.trainer.model_assets,
+            ckpt_manager=args.train.checkpoint.manager,
+            output_dir=args.train.checkpoint.output_dir,
+            save_checkpoint_path=save_checkpoint_path,
+            model=self.trainer.model,
+            fqn_to_index_mapping=args.model.fqn_to_index_mapping,
+            is_rank_0=args.train.global_rank == 0,
+        )
+
+        # Empty cache and barrier
+        helper.empty_cache()
+        dist.barrier()
+
+        self._last_saved_step = state.global_step
+
+
+class HFLoraCkptCallback(HuggingfaceCkptCallback):
+    """Save LoRA HF weights once at train end."""
+
+    def _save_checkpoint(self, state: TrainerState, stage: str = "step_end"):
+        """Save LoRA checkpoint in HuggingFace format at train end."""
+        args: "VeOmniArguments" = self.trainer.args
+        save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
+        if not os.path.exists(save_checkpoint_path):
+            dist.barrier()
+            CheckpointerCallback._save_checkpoint(self, state)
+
+        if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
+            self.trainer.checkpointer.save_future.result()
+
+        if stage == "train_end":
+            self.trainer.optimizer = None
+            self.trainer.lr_scheduler = None
+
+        lora_save_path = os.path.join(args.train.checkpoint.output_dir, f"global_step_{state.global_step}")
+        assert_hiermoe_trainable_only_checkpoint_safe(True, hiermoe_state_dict(), "save LoRA adapter")
+        save_lora_adapter_with_dcp(
+            model=self.trainer.model,
+            save_path=lora_save_path,
+            adapter_name="default",
+        )
+
+        helper.empty_cache()
+        dist.barrier()
+
+        self._last_saved_step = state.global_step
