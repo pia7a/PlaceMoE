@@ -85,6 +85,7 @@ common_env=(
   -e "HIERMOE_COMMUNICATION_MODE=hierarchical"
   -e "HIERMOE_EXPERT_SWAP=${expert_swap}"
   -e "HIERMOE_EXPERT_SWAP_INTERVAL=${swap_interval}"
+  -e "HIERMOE_LOG_INTERVAL=1"
   -e "HIERMOE_EXPERT_SWAP_MAX_PAIRS_PER_LAYER=${max_pairs}"
   -e "HIERMOE_EXPERT_SWAP_SELECTOR=${swap_selector}"
   -e "HIERMOE_REDUNDANT_SLOT_INCREMENT_PER_DEVICE=${redundant_slots}"
