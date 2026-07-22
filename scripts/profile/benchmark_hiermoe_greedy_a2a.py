@@ -52,6 +52,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--slot-increment", type=int, default=1)
     parser.add_argument("--max-swaps", type=int, default=1)
     parser.add_argument("--max-covers", type=int, default=1)
+    parser.add_argument("--max-copies", type=int, default=8)
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -118,6 +119,7 @@ def _plan_routes(
     source_rank: int,
     max_swaps: int,
     max_covers: int,
+    max_copies: int,
     device: torch.device,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[dict[str, Any]]]:
     def reducer(tensor: torch.Tensor) -> None:
@@ -131,6 +133,7 @@ def _plan_routes(
         slots_per_rank=slots_per_rank,
         reducer=reducer,
         process_group=dist.group.WORLD,
+        max_copies=max_copies,
     )
     initial_routes = []
     greedy_routes = []
@@ -166,6 +169,7 @@ def _plan_routes(
                 num_experts=int(owners.numel()),
                 step=1,
                 layer_seed=layer,
+                max_copies=max_copies,
             ).contiguous()
         )
 
@@ -368,6 +372,8 @@ def _summary(samples: list[tuple[float, ...]]) -> dict[str, dict[str, float]]:
 
 def main() -> None:
     args = _parse_args()
+    if not 1 <= args.max_copies <= 8:
+        raise ValueError("max-copies must be between 1 and 8.")
     if not is_torch_npu_available():
         raise RuntimeError("This benchmark requires torch_npu and Ascend devices.")
     import torch_npu  # noqa: F401
@@ -414,6 +420,7 @@ def main() -> None:
             source_rank=rank,
             max_swaps=args.max_swaps,
             max_covers=args.max_covers,
+            max_copies=args.max_copies,
             device=device,
         )
         owner_routes = [
@@ -474,6 +481,7 @@ def main() -> None:
                     "ranks_per_node": args.ranks_per_node,
                     "num_experts": args.num_experts,
                     "num_physical_slots": int(layout.numel()),
+                    "max_copies": args.max_copies,
                     "top_k": top_k,
                     "timed_scope": "dispatch/preprocess plus combine; planning and remapping excluded",
                 },
