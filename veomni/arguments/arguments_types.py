@@ -467,18 +467,23 @@ class HierMoEConfig:
         default=1,
         metadata={"help": "Maximum disjoint expert pairs to swap per MoE layer; 0 disables swaps."},
     )
-    expert_swap_selector: Literal["current_joint", "hiermoe_exact_p1", "legacy_batched"] = field(
-        default="current_joint",
-        metadata={
-            "help": (
-                "Expert-swap selector. current_joint uses the current communication-plus-compute planner; "
-                "hiermoe_exact_p1 evaluates every expert pair with HierMoE exact duplicate-free "
-                "hierarchical communication cost and applies the globally best improving pair in either "
-                "step or current-route layer mode; "
-                "legacy_batched restores the approximate batched fast-2D/fast-hierarchy P1 selector and "
-                "the compact route-summary P4 selector used by the historical implementation."
-            )
-        },
+    expert_swap_selector: Literal["current_joint", "hiermoe_exact_p1", "hiermoe_greedy_cover_p1", "legacy_batched"] = (
+        field(
+            default="current_joint",
+            metadata={
+                "help": (
+                    "Expert-swap selector. current_joint uses the current communication-plus-compute planner; "
+                    "hiermoe_exact_p1 evaluates every expert pair with HierMoE exact duplicate-free "
+                    "hierarchical communication cost and applies the globally best improving pair in either "
+                    "step or current-route layer mode; "
+                    "hiermoe_greedy_cover_p1 jointly evaluates one owner swap or one redundant-slot cover "
+                    "from exact current-layer routes, optimizes communication only, fills empty slots before "
+                    "steady-state search, and accepts only a strictly improving steady-state action; "
+                    "legacy_batched restores the approximate batched fast-2D/fast-hierarchy P1 selector and "
+                    "the compact route-summary P4 selector used by the historical implementation."
+                )
+            },
+        )
     )
     redundant_slot_increment_per_device: int = field(
         default=0,
@@ -566,29 +571,44 @@ class HierMoEConfig:
             raise ValueError("train.hiermoe.expert_swap_interval must be >= 1.")
         if self.expert_swap_max_pairs_per_layer < 0:
             raise ValueError("train.hiermoe.expert_swap_max_pairs_per_layer must be >= 0.")
-        if self.expert_swap_selector not in {"current_joint", "hiermoe_exact_p1", "legacy_batched"}:
+        if self.expert_swap_selector not in {
+            "current_joint",
+            "hiermoe_exact_p1",
+            "hiermoe_greedy_cover_p1",
+            "legacy_batched",
+        }:
             raise ValueError(
-                "train.hiermoe.expert_swap_selector must be current_joint, hiermoe_exact_p1, or legacy_batched."
+                "train.hiermoe.expert_swap_selector must be current_joint, hiermoe_exact_p1, "
+                "hiermoe_greedy_cover_p1, or legacy_batched."
             )
         if self.expert_swap_selector == "hiermoe_exact_p1":
             if self.expert_swap_max_pairs_per_layer != 1:
                 raise ValueError(
-                    "train.hiermoe.expert_swap_selector=hiermoe_exact_p1 requires "
-                    "expert_swap_max_pairs_per_layer=1."
+                    "train.hiermoe.expert_swap_selector=hiermoe_exact_p1 requires expert_swap_max_pairs_per_layer=1."
                 )
             if self.redundant_slot_increment_per_device != 0:
                 raise ValueError(
                     "train.hiermoe.expert_swap_selector=hiermoe_exact_p1 does not support redundant slots."
                 )
+        if self.expert_swap_selector == "hiermoe_greedy_cover_p1":
+            if self.expert_swap_mode != "layer":
+                raise ValueError(
+                    "train.hiermoe.expert_swap_selector=hiermoe_greedy_cover_p1 requires expert_swap_mode=layer."
+                )
+            if self.expert_swap_max_pairs_per_layer > 1:
+                raise ValueError(
+                    "train.hiermoe.expert_swap_selector=hiermoe_greedy_cover_p1 supports at most one "
+                    "steady-state swap per layer."
+                )
+            if self.redundant_slot_increment_per_device <= 0:
+                raise ValueError(
+                    "train.hiermoe.expert_swap_selector=hiermoe_greedy_cover_p1 requires redundant slots."
+                )
         if self.expert_swap_selector == "legacy_batched":
             if self.redundant_slot_increment_per_device != 0:
-                raise ValueError(
-                    "train.hiermoe.expert_swap_selector=legacy_batched does not support redundant slots."
-                )
+                raise ValueError("train.hiermoe.expert_swap_selector=legacy_batched does not support redundant slots.")
             if self.expert_swap_mode != "step":
-                raise ValueError(
-                    "train.hiermoe.expert_swap_selector=legacy_batched requires expert_swap_mode=step."
-                )
+                raise ValueError("train.hiermoe.expert_swap_selector=legacy_batched requires expert_swap_mode=step.")
         if self.redundant_slot_increment_per_device < 0:
             raise ValueError("train.hiermoe.redundant_slot_increment_per_device must be >= 0.")
         if self.max_slot_op_search_rounds is not None and self.max_slot_op_search_rounds < 0:

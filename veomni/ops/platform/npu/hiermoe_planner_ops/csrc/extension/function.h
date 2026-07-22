@@ -26,6 +26,26 @@ at::Tensor hiermoe_replica_score_npu(
     int64_t level_size2,
     int64_t top_k);
 
+at::Tensor hiermoe_cover_score_npu(
+    const at::Tensor &selected,
+    const at::Tensor &route_indices,
+    const at::Tensor &multiplicities,
+    const at::Tensor &token_counts,
+    const at::Tensor &route_ranks,
+    const at::Tensor &route_hashes,
+    const at::Tensor &token_group_counts,
+    const at::Tensor &copy_slots,
+    const at::Tensor &candidate_rows,
+    int64_t num_slots,
+    int64_t slots_per_rank,
+    int64_t ep_size,
+    int64_t source_rank,
+    int64_t num_levels,
+    int64_t level_size0,
+    int64_t level_size1,
+    int64_t level_size2,
+    int64_t top_k);
+
 void hiermoe_replica_apply_npu(
     const at::Tensor &route_indices,
     const at::Tensor &token_counts,

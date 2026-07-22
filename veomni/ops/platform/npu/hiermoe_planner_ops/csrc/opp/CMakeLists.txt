@@ -38,6 +38,11 @@ npu_op_kernel_sources(ascendc_kernels
 )
 
 npu_op_kernel_sources(ascendc_kernels
+    OP_TYPE HiermoeCoverScore
+    KERNEL_FILE cover_score_kernel.cpp
+)
+
+npu_op_kernel_sources(ascendc_kernels
     OP_TYPE HiermoeReplicaPrepare
     KERNEL_FILE replica_prepare_kernel.cpp
 )

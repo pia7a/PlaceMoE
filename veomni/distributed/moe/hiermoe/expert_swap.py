@@ -42,6 +42,7 @@ from .core_planner import (
     QuotaPolicyEntry,
     assign_tokens_to_copies_with_quota,
 )
+from .greedy_planner import GreedyCommunicationPlanner, assign_tokens_to_copies_greedy
 from .perf_model import HierMoEPerfModel
 from .planner import (
     CurrentRoutePlanner,
@@ -2353,8 +2354,16 @@ class ExpertSwapManager:
         self.perf_model = perf_model
         self.expert_swap_mode = str(expert_swap_mode)
         self.expert_swap_selector = str(expert_swap_selector)
-        if self.expert_swap_selector not in {"current_joint", "hiermoe_exact_p1", "legacy_batched"}:
-            raise ValueError("expert_swap_selector must be current_joint, hiermoe_exact_p1, or legacy_batched.")
+        if self.expert_swap_selector not in {
+            "current_joint",
+            "hiermoe_exact_p1",
+            "hiermoe_greedy_cover_p1",
+            "legacy_batched",
+        }:
+            raise ValueError(
+                "expert_swap_selector must be current_joint, hiermoe_exact_p1, "
+                "hiermoe_greedy_cover_p1, or legacy_batched."
+            )
         if self.expert_swap_selector == "hiermoe_exact_p1":
             if self.expert_swap_max_pairs_per_layer != 1:
                 raise ValueError("hiermoe_exact_p1 requires expert_swap_max_pairs_per_layer=1.")
@@ -2365,6 +2374,13 @@ class ExpertSwapManager:
                 raise ValueError("legacy_batched does not support redundant expert slots.")
             if self.expert_swap_mode != "step":
                 raise ValueError("legacy_batched requires expert_swap_mode=step.")
+        if self.expert_swap_selector == "hiermoe_greedy_cover_p1":
+            if self.expert_swap_mode != "layer":
+                raise ValueError("hiermoe_greedy_cover_p1 requires expert_swap_mode=layer.")
+            if self.expert_swap_max_pairs_per_layer > 1:
+                raise ValueError("hiermoe_greedy_cover_p1 supports at most one steady-state swap per layer.")
+            if self.redundant_slot_increment_per_device <= 0:
+                raise ValueError("hiermoe_greedy_cover_p1 requires redundant expert slots.")
         self.activation_checkpointing_enabled = bool(activation_checkpointing_enabled)
         self._swap_group = (
             _create_expert_swap_process_group(ep_group, self.ep_size)
@@ -2845,6 +2861,18 @@ class ExpertSwapManager:
                 layer_seed=zlib.crc32(layer.key.encode("utf-8")),
             )
             physical = mapping.physical_slots
+            return physical.squeeze(-1) if original_ndim == 1 else physical
+        if self.expert_swap_selector == "hiermoe_greedy_cover_p1":
+            physical = assign_tokens_to_copies_greedy(
+                selected,
+                layer.slot_to_logical,
+                slots_per_rank=layer.num_local_experts,
+                source_ranks=self.ep_rank,
+                hierarchy_group_sizes=self.hierarchy.group_sizes,
+                num_experts=layer.num_experts,
+                step=max(0, int(layer.latest_route_step)),
+                layer_seed=zlib.crc32(layer.key.encode("utf-8")),
+            )
             return physical.squeeze(-1) if original_ndim == 1 else physical
         copy_slots, copy_mask = layer.copy_slots_for_device(selected.device)
         if layer.fixed_r2_layout:
@@ -3941,7 +3969,18 @@ class ExpertSwapManager:
         *,
         communication_scale: float,
         forward_compute_per_assignment: float,
-    ) -> CurrentRoutePlanner:
+    ) -> CurrentRoutePlanner | GreedyCommunicationPlanner:
+        if self.expert_swap_selector == "hiermoe_greedy_cover_p1":
+            return GreedyCommunicationPlanner(
+                hierarchy=self.hierarchy,
+                perf_model=self.perf_model,
+                hidden_size=layer.latest_hidden_size,
+                bytes_per_element=layer.latest_bytes_per_element,
+                slots_per_rank=layer.num_local_experts,
+                smooth_max_gamma=self.smooth_max_gamma,
+                reducer=self._planner_reduce_sum,
+                candidate_chunk_size=_SWAP_COST_CHUNK_CANDIDATES,
+            )
         if self.expert_swap_mode != "layer":
             return CurrentRoutePlanner(
                 hierarchy=self.hierarchy,
@@ -4573,12 +4612,13 @@ class ExpertSwapManager:
     def _plan_current_layer(self, layer: ExpertLayerState, step: int) -> list[str]:
         calibration = layer.planner_calibration
         selected = layer.latest_selected_experts
-        if calibration is None or selected is None or selected.numel() == 0:
+        greedy_cover = self.expert_swap_selector == "hiermoe_greedy_cover_p1"
+        if selected is None or selected.numel() == 0 or (calibration is None and not greedy_cover):
             return []
         planner = self._planner_for_layer(
             layer,
-            communication_scale=calibration.communication_scale,
-            forward_compute_per_assignment=calibration.forward_compute_per_assignment,
+            communication_scale=1.0 if calibration is None else calibration.communication_scale,
+            forward_compute_per_assignment=0.0 if calibration is None else calibration.forward_compute_per_assignment,
         )
         with _full_timing_range("hiermoe_placement_planning"):
             plan = planner.plan(
@@ -4674,7 +4714,12 @@ class ExpertSwapManager:
                 committed = self._plan_legacy_batched_layers(layers)
         else:
             self.prepare_calibrations(step)
-            if int(step) <= 0 or self.expert_swap_interval <= 0 or int(step) % self.expert_swap_interval != 0:
+            minimum_step = 0 if self.expert_swap_selector == "hiermoe_greedy_cover_p1" else 1
+            if (
+                int(step) < minimum_step
+                or self.expert_swap_interval <= 0
+                or int(step) % self.expert_swap_interval != 0
+            ):
                 self.latest_pair = "none"
                 return self.latest_pair
             committed = []
@@ -4702,7 +4747,8 @@ class ExpertSwapManager:
             step=step,
         )
         self._begin_metrics_step(step)
-        if int(step) <= 0 or self.expert_swap_interval <= 0 or int(step) % self.expert_swap_interval != 0:
+        minimum_step = 0 if self.expert_swap_selector == "hiermoe_greedy_cover_p1" else 1
+        if int(step) < minimum_step or self.expert_swap_interval <= 0 or int(step) % self.expert_swap_interval != 0:
             self.latest_pair = "none"
             return self.latest_pair
 

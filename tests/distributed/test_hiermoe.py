@@ -1780,6 +1780,45 @@ def test_redundant_slot_mapping_uses_parallel_owner_rank_priority():
     torch.testing.assert_close(mapped, torch.tensor([[2, 5]], dtype=torch.long))
 
 
+def test_greedy_cover_runtime_mapping_matches_planner_nearest_copy_policy():
+    manager = expert_swap_module.ExpertSwapManager(
+        ep_group=None,
+        ep_size=4,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=1,
+        redundant_slot_increment_per_device=1,
+        max_replica_rounds=1,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=4, group_sizes=(2, 4), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="layer",
+        expert_swap_selector="hiermoe_greedy_cover_p1",
+    )
+    module = _FakeExperts(num_experts=8, local_start=0, local_experts=3, hidden_size=2)
+    manager.register_layer("layers.0.mlp.experts", module)
+    layer = manager.layers["layers.0.mlp.experts"]
+    layer.slot_to_logical = torch.tensor([0, 1, 6, 2, 3, 7, 4, 5, 7, 6, 7, 0], dtype=torch.long)
+    layer.latest_route_step = 7
+    manager._refresh_layer_mapping_from_slots(layer)
+    selected = torch.tensor([[7, 0, 7], [6, 3, 0], [1, 7, 6]], dtype=torch.long)
+
+    mapped = manager.map_logical_to_physical("layers.0.mlp.experts", selected)
+    expected = expert_swap_module.assign_tokens_to_copies_greedy(
+        selected,
+        layer.slot_to_logical,
+        slots_per_rank=layer.num_local_experts,
+        source_ranks=manager.ep_rank,
+        hierarchy_group_sizes=manager.hierarchy.group_sizes,
+        num_experts=layer.num_experts,
+        step=layer.latest_route_step,
+        layer_seed=expert_swap_module.zlib.crc32(layer.key.encode("utf-8")),
+    )
+
+    torch.testing.assert_close(mapped, expected)
+    assert mapped[0, 0].item() == mapped[0, 2].item()
+
+
 def test_redundant_copy_groups_cache_invalidates_with_layout():
     manager = expert_swap_module.ExpertSwapManager(
         ep_group=None,

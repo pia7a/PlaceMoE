@@ -6,6 +6,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module)
 {
     module.def("replica_prepare", &hiermoe_replica_prepare_npu, "Exact HierMoE packed replica routes");
     module.def("replica_score", &hiermoe_replica_score_npu, "Exact HierMoE replica candidate scoring");
+    module.def("cover_score", &hiermoe_cover_score_npu, "Exact HierMoE swap/cover candidate scoring");
     module.def("dual_map", &hiermoe_dual_map_npu, "CoRe-MoE dual-layout route mapping");
     module.def("quota_map", &hiermoe_quota_map_npu, "CoRe-MoE quota-aware dual-layout route mapping");
     module.def("swap_search", &hiermoe_swap_search_npu, "CoRe-MoE device-resident swap search");
