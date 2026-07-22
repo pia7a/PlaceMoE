@@ -859,16 +859,26 @@ class GreedyCommunicationPlanner:
             }
             for rank in range(self.ep_size)
         ]
+        copy_counts: dict[int, int] = {}
+        for value in layout_cpu.tolist():
+            logical = int(value)
+            if logical >= 0:
+                copy_counts[logical] = copy_counts.get(logical, 0) + 1
         used_slots: set[int] = set()
         actions: list[PlacementAction] = []
         for row in ordered_rows:
             action = self._placement_action(row)
             rank = action.dst_slot // self.slots_per_rank
-            if action.dst_slot in used_slots or action.src_logical in rank_experts[rank]:
+            if (
+                action.dst_slot in used_slots
+                or action.src_logical in rank_experts[rank]
+                or copy_counts.get(action.src_logical, 0) >= self.max_copies
+            ):
                 continue
             actions.append(action)
             used_slots.add(action.dst_slot)
             rank_experts[rank].add(action.src_logical)
+            copy_counts[action.src_logical] = copy_counts.get(action.src_logical, 0) + 1
             if len(actions) >= limit:
                 break
         return tuple(actions)

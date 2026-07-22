@@ -27,7 +27,7 @@ from veomni.distributed.moe.hiermoe.perf_model import HierMoEPerfModel
 from veomni.distributed.moe.hiermoe.topology import Hierarchy
 
 
-def _planner(*, chunk_size: int = 8) -> GreedyCommunicationPlanner:
+def _planner(*, chunk_size: int = 8, max_copies: int = 8) -> GreedyCommunicationPlanner:
     return GreedyCommunicationPlanner(
         hierarchy=Hierarchy(ep_size=4, group_sizes=(2, 4), source="test"),
         perf_model=HierMoEPerfModel.default(),
@@ -35,6 +35,7 @@ def _planner(*, chunk_size: int = 8) -> GreedyCommunicationPlanner:
         bytes_per_element=2,
         slots_per_rank=2,
         candidate_chunk_size=chunk_size,
+        max_copies=max_copies,
     )
 
 
@@ -165,6 +166,27 @@ def test_empty_slots_are_filled_before_swap_and_never_increase_communication():
     assert plan.final_cost.communication <= plan.baseline_cost.communication
     assert plan.local_physical_routes is not None
     _assert_routes_match_layout(routes, plan.local_physical_routes, plan.final_layout)
+
+
+def test_empty_slot_batch_selection_respects_fused_copy_capacity():
+    layout = torch.tensor([0, -1, 1, -1, 2, -1, 3, -1], dtype=torch.long)
+    owners = torch.tensor([0, 2, 4, 6], dtype=torch.long)
+    routes = torch.zeros((20, 1), dtype=torch.long)
+
+    plan = _planner(max_copies=2).plan(
+        routes,
+        layout,
+        owners,
+        source_ranks=torch.tensor([0] * 10 + [1] * 10, dtype=torch.long),
+        max_swaps=0,
+        max_replicas=4,
+        step=0,
+    )
+
+    assert len(plan.actions) == 4
+    copy_counts = torch.bincount(torch.tensor(plan.final_layout), minlength=4)
+    assert int(copy_counts.max().item()) <= 2
+    assert -1 not in plan.final_layout
 
 
 def test_occupied_cover_uses_add_evict_interaction_and_installs_exact_winner_routes():
