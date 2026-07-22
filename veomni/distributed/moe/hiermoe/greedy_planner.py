@@ -904,9 +904,9 @@ class GreedyCommunicationPlanner:
         if selected.ndim != 2:
             raise ValueError(f"selected_experts must have rank 1 or 2, got shape={tuple(selected.shape)}.")
         device = selected.device
-        layout = slot_to_logical.to(device=device, dtype=torch.long, non_blocking=True).clone()
-        owners = owner_slots.to(device=device, dtype=torch.long, non_blocking=True).reshape(-1).clone()
-        if layout.numel() != self.ep_size * self.slots_per_rank:
+        host_layout = slot_to_logical.detach().to(device="cpu", dtype=torch.long).clone()
+        host_owners = owner_slots.detach().to(device="cpu", dtype=torch.long).reshape(-1).clone()
+        if host_layout.numel() != self.ep_size * self.slots_per_rank:
             raise ValueError("slot_to_logical does not match hierarchy.ep_size * slots_per_rank.")
         if isinstance(source_ranks, int):
             sources = torch.full((selected.shape[0],), int(source_ranks), dtype=torch.long, device=device)
@@ -921,26 +921,33 @@ class GreedyCommunicationPlanner:
             raise ValueError("source_ranks and token_ordinals must match the local token count.")
 
         candidate_started = time.perf_counter()
-        all_slots = torch.arange(layout.numel(), dtype=torch.long, device=device)
-        owner_mask = torch.zeros((layout.numel(),), dtype=torch.bool, device=device)
-        owner_mask.scatter_(0, owners, True)
-        empty_slots = torch.nonzero(layout < 0, as_tuple=False).flatten()
+        # Layout metadata is tiny and originates on the host. Constructing
+        # dynamic-shape candidate rows on the accelerator would make nonzero
+        # and boolean indexing synchronize the model-compute stream on every
+        # layer. Build the rows on CPU and transfer one compact matrix.
+        all_slots = torch.arange(host_layout.numel(), dtype=torch.long)
+        owner_mask = torch.zeros((host_layout.numel(),), dtype=torch.bool)
+        owner_mask.scatter_(0, host_owners, True)
+        empty_slots = torch.nonzero(host_layout < 0, as_tuple=False).flatten()
         initializing = empty_slots.numel() > 0 and max(0, int(max_replicas)) > 0
         if initializing:
-            rows = self._cover_rows(layout, owners, empty_slots)
+            host_rows = self._cover_rows(host_layout, host_owners, empty_slots)
         else:
             rows_by_kind = []
             if max(0, int(max_swaps)) > 0:
-                rows_by_kind.append(self._swap_rows(layout, owners))
+                rows_by_kind.append(self._swap_rows(host_layout, host_owners))
             if max(0, int(max_replicas)) > 0:
-                cover_slots = all_slots[(~owner_mask) & (layout >= 0)]
-                rows_by_kind.append(self._cover_rows(layout, owners, cover_slots))
+                cover_slots = all_slots[(~owner_mask) & (host_layout >= 0)]
+                rows_by_kind.append(self._cover_rows(host_layout, host_owners, cover_slots))
             nonempty_rows = [value for value in rows_by_kind if value.numel()]
-            rows = (
+            host_rows = (
                 torch.cat(nonempty_rows, dim=0)
                 if nonempty_rows
-                else torch.empty((0, 5), dtype=torch.long, device=device)
+                else torch.empty((0, 5), dtype=torch.long)
             )
+        layout = host_layout.to(device=device, non_blocking=True)
+        owners = host_owners.to(device=device, non_blocking=True)
+        rows = host_rows.to(device=device, non_blocking=True)
         route_stats_ms = (time.perf_counter() - candidate_started) * 1000.0
 
         score_started = time.perf_counter()
