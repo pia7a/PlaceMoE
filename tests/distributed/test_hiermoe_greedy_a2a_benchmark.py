@@ -27,6 +27,15 @@ def test_shifted_initial_replicas_preserve_owners_and_fill_one_slot_per_rank():
     torch.testing.assert_close(layout.index_select(0, owners), torch.arange(8))
 
 
+def test_empty_initial_layout_preserves_capacity_for_planner_initialization():
+    layout, owners, _slots_per_rank = benchmark._initial_layout(
+        8, 4, 1, torch.device("cpu"), fill_replicas=False
+    )
+
+    torch.testing.assert_close(layout, torch.tensor([0, 1, -1, 2, 3, -1, 4, 5, -1, 6, 7, -1]))
+    torch.testing.assert_close(layout.index_select(0, owners), torch.arange(8))
+
+
 def test_communication_score_separates_assignment_and_rank_dedup_counts():
     logical = [torch.tensor([[0, 1, 2, 3], [0, 2, 4, 6]], dtype=torch.long)]
     physical = [torch.tensor([[0, 1, 3, 4], [0, 3, 6, 9]], dtype=torch.long)]

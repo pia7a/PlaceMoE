@@ -33,7 +33,7 @@ from veomni.utils.import_utils import is_torch_npu_available
 
 _BASELINE0 = "baseline0_original_flat_a2a"
 _BASELINE1 = "baseline1_owner_hierarchical_rank_dedup"
-_INITIAL = "baseline2_initial_redundant_layout"
+_INITIAL = "baseline2_greedy_initialized_redundant_layout"
 _GREEDY = "greedy_swap_cover"
 _METRICS = ("wall_ms", "dispatch_ms", "combine_ms", "a2a_ms")
 
@@ -61,6 +61,7 @@ def _initial_layout(
     ep_size: int,
     slot_increment: int,
     device: torch.device,
+    fill_replicas: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     if num_experts % ep_size:
         raise ValueError("num_experts must be divisible by EP size.")
@@ -70,10 +71,11 @@ def _initial_layout(
     owners = torch.div(experts, base, rounding_mode="floor") * slots_per_rank + torch.remainder(experts, base)
     layout = torch.full((ep_size * slots_per_rank,), -1, dtype=torch.long, device=device)
     layout.scatter_(0, owners, experts)
-    ranks = torch.arange(ep_size, dtype=torch.long, device=device)
-    for offset in range(slot_increment):
-        replica = torch.remainder(ranks + offset + 1, ep_size) * base + (offset % base)
-        layout[ranks * slots_per_rank + base + offset] = replica
+    if fill_replicas:
+        ranks = torch.arange(ep_size, dtype=torch.long, device=device)
+        for offset in range(slot_increment):
+            replica = torch.remainder(ranks + offset + 1, ep_size) * base + (offset % base)
+            layout[ranks * slots_per_rank + base + offset] = replica
     return layout, owners, slots_per_rank
 
 
@@ -133,11 +135,31 @@ def _plan_routes(
     initial_routes = []
     greedy_routes = []
     records = []
+    empty_slots = int((layout < 0).sum().item())
     for layer, routes in zip(layers, logical_routes, strict=True):
+        torch.npu.synchronize(device)
+        dist.barrier()
+        started = time.perf_counter()
+        initialization = planner.plan(
+            routes,
+            layout,
+            owners,
+            source_ranks=source_rank,
+            max_swaps=0,
+            max_replicas=empty_slots,
+            step=0,
+            layer_seed=layer,
+        )
+        torch.npu.synchronize(device)
+        initialization_elapsed = torch.tensor([(time.perf_counter() - started) * 1000.0], device=device)
+        dist.all_reduce(initialization_elapsed, op=dist.ReduceOp.MAX)
+        initialized_layout = torch.tensor(initialization.final_layout, dtype=torch.long, device=device)
+        if bool((initialized_layout < 0).any().item()):
+            raise RuntimeError(f"Initialization did not fill every redundant slot for layer {layer}.")
         initial_routes.append(
             assign_tokens_to_copies_greedy(
                 routes,
-                layout,
+                initialized_layout,
                 slots_per_rank=slots_per_rank,
                 source_ranks=source_rank,
                 hierarchy_group_sizes=hierarchy.group_sizes,
@@ -146,12 +168,13 @@ def _plan_routes(
                 layer_seed=layer,
             ).contiguous()
         )
+
         torch.npu.synchronize(device)
         dist.barrier()
         started = time.perf_counter()
-        plan = planner.plan(
+        steady = planner.plan(
             routes,
-            layout,
+            initialized_layout,
             owners,
             source_ranks=source_rank,
             max_swaps=max_swaps,
@@ -160,15 +183,17 @@ def _plan_routes(
             layer_seed=layer,
         )
         torch.npu.synchronize(device)
-        elapsed = torch.tensor([(time.perf_counter() - started) * 1000.0], device=device)
-        dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
-        if plan.local_physical_routes is None:
+        steady_elapsed = torch.tensor([(time.perf_counter() - started) * 1000.0], device=device)
+        dist.all_reduce(steady_elapsed, op=dist.ReduceOp.MAX)
+        if steady.local_physical_routes is None:
             raise RuntimeError("Greedy planner did not return physical routes.")
-        greedy_routes.append(plan.local_physical_routes.contiguous())
+        greedy_routes.append(steady.local_physical_routes.contiguous())
         digest_payload = json.dumps(
             {
-                "actions": [action.format() for action in plan.actions],
-                "layout": list(plan.final_layout),
+                "initialization_actions": [action.format() for action in initialization.actions],
+                "initialized_layout": list(initialization.final_layout),
+                "steady_actions": [action.format() for action in steady.actions],
+                "final_layout": list(steady.final_layout),
             },
             sort_keys=True,
         ).encode()
@@ -184,13 +209,15 @@ def _plan_routes(
         records.append(
             {
                 "layer": layer,
-                "planning_ms": float(elapsed.item()),
-                "actions": [action.format() for action in plan.actions],
-                "baseline_communication": plan.baseline_cost.communication,
-                "final_communication": plan.final_cost.communication,
+                "initialization_planning_ms": float(initialization_elapsed.item()),
+                "initialization_actions": [action.format() for action in initialization.actions],
+                "steady_planning_ms": float(steady_elapsed.item()),
+                "steady_actions": [action.format() for action in steady.actions],
+                "baseline_communication": steady.baseline_cost.communication,
+                "final_communication": steady.final_cost.communication,
                 "predicted_speedup": (
-                    plan.baseline_cost.communication / plan.final_cost.communication
-                    if plan.final_cost.communication > 0
+                    steady.baseline_cost.communication / steady.final_cost.communication
+                    if steady.final_cost.communication > 0
                     else math.inf
                 ),
             }
@@ -372,6 +399,7 @@ def main() -> None:
             ep_size,
             args.slot_increment,
             device,
+            fill_replicas=False,
         )
         hierarchy = Hierarchy(ep_size, tuple(args.group_sizes), "benchmark", args.ranks_per_node)
         initial_routes, greedy_routes, plans = _plan_routes(
