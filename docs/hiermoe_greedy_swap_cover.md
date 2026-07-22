@@ -73,6 +73,9 @@ Empty slots are handled before steady-state replacement:
 - only empty-cover candidates are generated;
 - compatible covers are selected to fill available capacity in one
   initialization pass;
+- the batch selector updates per-expert copy counts after every accepted
+  cover, so the resulting layout cannot exceed
+  train.hiermoe.greedy_max_copies_per_expert;
 - owner slots are never evicted;
 - initialization steps are reported separately from steady-state swaps and
   occupied covers.
@@ -113,6 +116,11 @@ and unique-token counts U(e), the work is:
 Candidate actions run in parallel across AI cores. Current fused limits are
 16,384 local tokens, EP size 64, three hierarchy levels, and eight copies per
 expert. Inputs outside those limits use the exact PyTorch fallback.
+
+The production default is train.hiermoe.greedy_max_copies_per_expert=4.
+The same cap is used by empty-slot initialization, steady-state candidate
+generation, and runtime token remapping. Values from 1 through 8 are accepted
+for workload-specific profiling.
 
 ## Reproducible planner benchmark
 

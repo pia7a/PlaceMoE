@@ -47,6 +47,7 @@ class HierMoEState:
     active: bool
     communication_mode: str = "hierarchical"
     planner_route_sample_size: int = 1024
+    greedy_max_copies_per_expert: int = 4
     expert_swap_selector: str = "current_joint"
     activation_checkpointing_enabled: bool = False
     placement_mapping_enabled: bool = True
@@ -155,6 +156,7 @@ def configure_hiermoe(
             configured_max_replica_rounds=configured_replica_rounds,
             replica_slot_capacity=int(config.redundant_slot_increment_per_device) * ep_size,
             planner_route_sample_size=int(config.planner_route_sample_size),
+            greedy_max_copies_per_expert=int(config.greedy_max_copies_per_expert),
             debug_validate=bool(config.debug_validate),
         )
 
@@ -179,6 +181,7 @@ def configure_hiermoe(
         active=active,
         communication_mode=str(config.communication_mode),
         planner_route_sample_size=int(config.planner_route_sample_size),
+        greedy_max_copies_per_expert=int(config.greedy_max_copies_per_expert),
         expert_swap_selector=str(config.expert_swap_selector),
         expert_swap_manager=expert_swap_manager,
     )
@@ -189,7 +192,7 @@ def configure_hiermoe(
             "expert_swap_max_pairs_per_layer=%s expert_swap_mode=%s expert_swap_selector=%s "
             "redundant_slot_increment_per_device=%s "
             "max_slot_op_search_rounds=%s replica_slot_capacity=%s max_replica_rounds=%s "
-            "planner_route_sample_size=%s runtime_cost_model=%s",
+            "planner_route_sample_size=%s greedy_max_copies_per_expert=%s runtime_cost_model=%s",
             active,
             ep_size,
             hierarchy.group_sizes,
@@ -204,6 +207,7 @@ def configure_hiermoe(
             int(config.redundant_slot_increment_per_device) * ep_size,
             max_replica_rounds,
             config.planner_route_sample_size,
+            config.greedy_max_copies_per_expert,
             perf_model.runtime_cost_status,
         )
         if placement_enabled and not perf_model.has_runtime_placement_costs:

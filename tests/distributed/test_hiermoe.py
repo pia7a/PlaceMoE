@@ -82,6 +82,7 @@ def test_hiermoe_config_defaults_and_cli_override(tmp_path, monkeypatch):
     assert TrainingArguments().hiermoe.redundant_slot_increment_per_device == 0
     assert TrainingArguments().hiermoe.max_slot_op_search_rounds is None
     assert TrainingArguments().hiermoe.planner_route_sample_size == 1024
+    assert TrainingArguments().hiermoe.greedy_max_copies_per_expert == 4
     assert TrainingArguments().hiermoe.expert_swap_mode == "step"
 
     config_path = tmp_path / "config.yaml"
@@ -127,6 +128,8 @@ data:
             "3",
             "--train.hiermoe.planner_route_sample_size",
             "512",
+            "--train.hiermoe.greedy_max_copies_per_expert",
+            "3",
             "--train.hiermoe.expert_swap_mode",
             "layer",
         ],
@@ -140,12 +143,19 @@ data:
     assert args.train.hiermoe.redundant_slot_increment_per_device == 1
     assert args.train.hiermoe.max_slot_op_search_rounds == 3
     assert args.train.hiermoe.planner_route_sample_size == 512
+    assert args.train.hiermoe.greedy_max_copies_per_expert == 3
     assert args.train.hiermoe.expert_swap_mode == "layer"
 
 
 def test_hiermoe_route_sample_size_must_be_positive():
     with pytest.raises(ValueError, match="planner_route_sample_size must be > 0"):
         HierMoEConfig(planner_route_sample_size=0)
+
+
+@pytest.mark.parametrize("value", (0, 9))
+def test_hiermoe_greedy_max_copies_must_match_fused_limits(value):
+    with pytest.raises(ValueError, match="greedy_max_copies_per_expert must be between 1 and 8"):
+        HierMoEConfig(greedy_max_copies_per_expert=value)
 
 
 def test_hiermoe_communication_mode_must_be_supported():
@@ -1794,6 +1804,7 @@ def test_greedy_cover_runtime_mapping_matches_planner_nearest_copy_policy():
         perf_model=HierMoEPerfModel.default(),
         expert_swap_mode="layer",
         expert_swap_selector="hiermoe_greedy_cover_p1",
+        greedy_max_copies_per_expert=3,
     )
     module = _FakeExperts(num_experts=8, local_start=0, local_experts=3, hidden_size=2)
     manager.register_layer("layers.0.mlp.experts", module)
@@ -1813,10 +1824,17 @@ def test_greedy_cover_runtime_mapping_matches_planner_nearest_copy_policy():
         num_experts=layer.num_experts,
         step=layer.latest_route_step,
         layer_seed=expert_swap_module.zlib.crc32(layer.key.encode("utf-8")),
+        max_copies=3,
     )
 
     torch.testing.assert_close(mapped, expected)
     assert mapped[0, 0].item() == mapped[0, 2].item()
+    planner = manager._planner_for_layer(
+        layer,
+        communication_scale=1.0,
+        forward_compute_per_assignment=1.0,
+    )
+    assert planner.max_copies == 3
 
 
 def test_redundant_copy_groups_cache_invalidates_with_layout():

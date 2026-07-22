@@ -172,7 +172,7 @@ class GreedyCommunicationPlanner:
         reducer: Callable[[torch.Tensor], torch.Tensor | None] | None = None,
         candidate_chunk_size: int = 128,
         process_group: dist.ProcessGroup | None = None,
-        max_copies: int = 8,
+        max_copies: int = 4,
     ) -> None:
         if smooth_max_gamma <= 0:
             raise ValueError("smooth_max_gamma must be positive.")

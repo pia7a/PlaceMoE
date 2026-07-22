@@ -494,6 +494,15 @@ class HierMoEConfig:
             )
         },
     )
+    greedy_max_copies_per_expert: int = field(
+        default=4,
+        metadata={
+            "help": (
+                "Maximum physical copies per logical expert for hiermoe_greedy_cover_p1. "
+                "Must be between 1 and 8; 4 balances placement freedom and fused planner cost."
+            )
+        },
+    )
     max_slot_op_search_rounds: Optional[int] = field(
         default=None,
         metadata={
@@ -611,6 +620,8 @@ class HierMoEConfig:
                 raise ValueError("train.hiermoe.expert_swap_selector=legacy_batched requires expert_swap_mode=step.")
         if self.redundant_slot_increment_per_device < 0:
             raise ValueError("train.hiermoe.redundant_slot_increment_per_device must be >= 0.")
+        if not 1 <= self.greedy_max_copies_per_expert <= 8:
+            raise ValueError("train.hiermoe.greedy_max_copies_per_expert must be between 1 and 8.")
         if self.max_slot_op_search_rounds is not None and self.max_slot_op_search_rounds < 0:
             raise ValueError("train.hiermoe.max_slot_op_search_rounds must be >= 0.")
         if self.planner_route_sample_size <= 0:

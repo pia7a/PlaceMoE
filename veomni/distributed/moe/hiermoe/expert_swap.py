@@ -2329,6 +2329,7 @@ class ExpertSwapManager:
         configured_max_replica_rounds: int | None = None,
         replica_slot_capacity: int | None = None,
         planner_route_sample_size: int = 1024,
+        greedy_max_copies_per_expert: int = 4,
         debug_validate: bool = False,
     ) -> None:
         self.ep_group = ep_group
@@ -2349,6 +2350,9 @@ class ExpertSwapManager:
         if planner_route_sample_size <= 0:
             raise ValueError("planner_route_sample_size must be positive.")
         self.planner_route_sample_size = int(planner_route_sample_size)
+        if not 1 <= greedy_max_copies_per_expert <= 8:
+            raise ValueError("greedy_max_copies_per_expert must be between 1 and 8.")
+        self.greedy_max_copies_per_expert = int(greedy_max_copies_per_expert)
         self.smooth_max_gamma = float(smooth_max_gamma)
         self.hierarchy = hierarchy
         self.perf_model = perf_model
@@ -2872,6 +2876,7 @@ class ExpertSwapManager:
                 num_experts=layer.num_experts,
                 step=max(0, int(layer.latest_route_step)),
                 layer_seed=zlib.crc32(layer.key.encode("utf-8")),
+                max_copies=self.greedy_max_copies_per_expert,
             )
             return physical.squeeze(-1) if original_ndim == 1 else physical
         copy_slots, copy_mask = layer.copy_slots_for_device(selected.device)
@@ -3981,6 +3986,7 @@ class ExpertSwapManager:
                 reducer=self._planner_reduce_sum,
                 candidate_chunk_size=_SWAP_COST_CHUNK_CANDIDATES,
                 process_group=self.ep_group,
+                max_copies=self.greedy_max_copies_per_expert,
             )
         if self.expert_swap_mode != "layer":
             return CurrentRoutePlanner(
