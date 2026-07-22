@@ -21,6 +21,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 
 from .perf_model import HierMoEPerfModel
 from .planner import PlacementAction, PlacementCost, PlacementPlan, _hierarchy_distance, _route_hash
@@ -170,6 +171,7 @@ class GreedyCommunicationPlanner:
         smooth_max_gamma: float = 10.0,
         reducer: Callable[[torch.Tensor], torch.Tensor | None] | None = None,
         candidate_chunk_size: int = 128,
+        process_group: dist.ProcessGroup | None = None,
         max_copies: int = 8,
     ) -> None:
         if smooth_max_gamma <= 0:
@@ -182,6 +184,7 @@ class GreedyCommunicationPlanner:
         self.smooth_max_gamma = float(smooth_max_gamma)
         self.reducer = reducer
         self.candidate_chunk_size = max(1, int(candidate_chunk_size))
+        self.process_group = process_group
         self.max_copies = max(1, int(max_copies))
 
     @property
@@ -285,6 +288,74 @@ class GreedyCommunicationPlanner:
             selected_dim=selected_dim,
             baseline_physical_routes=baseline_physical,
         )
+
+    def _use_sharded_candidate_collective(self, device: torch.device) -> bool:
+        if self.process_group is None or not dist.is_initialized() or self.ep_size <= 1:
+            return False
+        if dist.get_world_size(self.process_group) != self.ep_size:
+            return False
+        backend = str(dist.get_backend(self.process_group)).lower().rsplit(".", maxsplit=1)[-1]
+        return backend != "gloo" or device.type == "cpu"
+
+    def _global_action_costs(
+        self,
+        baseline_local: torch.Tensor,
+        candidate_local: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if candidate_local.numel() == 0 or not self._use_sharded_candidate_collective(baseline_local.device):
+            local_counts = torch.cat((baseline_local, candidate_local), dim=0)
+            global_counts = _reduce_sum(local_counts, self.reducer)
+            return self._communication_cost(global_counts)
+
+        assert self.process_group is not None
+        baseline_global = baseline_local.clone()
+        dist.all_reduce(baseline_global, op=dist.ReduceOp.SUM, group=self.process_group)
+        baseline_communication, baseline_peak, baseline_dim = self._communication_cost(baseline_global)
+
+        group_size = dist.get_world_size(self.process_group)
+        num_candidates, width = candidate_local.shape
+        shard_rows = (num_candidates + group_size - 1) // group_size
+        padded_rows = shard_rows * group_size
+        if padded_rows != num_candidates:
+            padding = torch.zeros(
+                (padded_rows - num_candidates, width),
+                dtype=candidate_local.dtype,
+                device=candidate_local.device,
+            )
+            reduce_input = torch.cat((candidate_local, padding), dim=0)
+        else:
+            reduce_input = candidate_local
+        reduced_shard = torch.empty(
+            (shard_rows, width),
+            dtype=candidate_local.dtype,
+            device=candidate_local.device,
+        )
+        dist.reduce_scatter_tensor(
+            reduced_shard,
+            reduce_input.contiguous(),
+            op=dist.ReduceOp.SUM,
+            group=self.process_group,
+        )
+        shard_communication, shard_peak, shard_dim = self._communication_cost(reduced_shard)
+        shard_metrics = torch.stack(
+            (
+                shard_communication,
+                shard_peak.to(shard_communication.dtype),
+                shard_dim.to(shard_communication.dtype),
+            ),
+            dim=1,
+        ).contiguous()
+        gathered_metrics = torch.empty(
+            (padded_rows, 3),
+            dtype=shard_metrics.dtype,
+            device=shard_metrics.device,
+        )
+        dist.all_gather_into_tensor(gathered_metrics, shard_metrics, group=self.process_group)
+        candidate_metrics = gathered_metrics[:num_candidates]
+        communication = torch.cat((baseline_communication, candidate_metrics[:, 0]), dim=0)
+        peak_rank = torch.cat((baseline_peak, candidate_metrics[:, 1].to(baseline_peak.dtype)), dim=0)
+        selected_dim = torch.cat((baseline_dim, candidate_metrics[:, 2].to(baseline_dim.dtype)), dim=0)
+        return communication, peak_rank, selected_dim
 
     def _copy_table(self, layout: torch.Tensor, num_experts: int) -> torch.Tensor:
         num_slots = int(layout.numel())
@@ -642,9 +713,8 @@ class GreedyCommunicationPlanner:
                     rank_by_expert=rank_by_expert,
                 )
                 candidate_local.append(baseline_local + delta)
-        local_counts = torch.cat((baseline_local, *candidate_local), dim=0)
-        global_counts = _reduce_sum(local_counts, self.reducer)
-        communication, peak_rank, selected_dim = self._communication_cost(global_counts)
+        candidates = torch.cat(candidate_local, dim=0) if candidate_local else baseline_local.new_empty((0, baseline_local.shape[1]))
+        communication, peak_rank, selected_dim = self._global_action_costs(baseline_local, candidates)
         return _ScoredLayouts(
             communication=communication,
             peak_rank=peak_rank,

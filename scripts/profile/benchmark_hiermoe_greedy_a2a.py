@@ -128,6 +128,7 @@ def _plan_routes(
         bytes_per_element=bytes_per_element,
         slots_per_rank=slots_per_rank,
         reducer=reducer,
+        process_group=dist.group.WORLD,
     )
     initial_routes = []
     greedy_routes = []

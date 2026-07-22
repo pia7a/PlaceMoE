@@ -14,7 +14,9 @@
 
 import pytest
 import torch
+import torch.distributed as dist
 
+from tests.tools.launch_utils import torchrun
 from veomni.arguments import HierMoEConfig
 from veomni.distributed.moe.hiermoe.greedy_planner import (
     GREEDY_COVER_ALGORITHM_VERSION,
@@ -222,6 +224,61 @@ def test_swap_and_cover_are_compared_in_one_round_and_cover_wins():
     assert len(plan.actions) == 1
     assert plan.actions[0].kind == "replica"
     assert plan.actions[0].dst_slot == 3
+
+
+def _sharded_collective_parity_worker():
+    rank = dist.get_rank()
+    layout = torch.tensor([0, 1, 2, 2, 3, 0], dtype=torch.long)
+    owners = torch.tensor([0, 1, 3, 4], dtype=torch.long)
+    if rank == 0:
+        routes = torch.tensor([[0, 1], [0, 2], [1, 3], [0, 3]] * 4, dtype=torch.long)
+    else:
+        routes = torch.tensor([[2, 3], [1, 3], [0, 2], [1, 2]] * 4, dtype=torch.long)
+
+    def reducer(tensor: torch.Tensor) -> torch.Tensor:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        return tensor
+
+    kwargs = dict(
+        hierarchy=Hierarchy(ep_size=2, group_sizes=(2,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        hidden_size=16,
+        bytes_per_element=2,
+        slots_per_rank=3,
+        reducer=reducer,
+        candidate_chunk_size=4,
+    )
+    exact = GreedyCommunicationPlanner(**kwargs).plan(
+        routes,
+        layout,
+        owners,
+        source_ranks=rank,
+        max_swaps=1,
+        max_replicas=1,
+        step=7,
+        layer_seed=11,
+    )
+    sharded = GreedyCommunicationPlanner(**kwargs, process_group=dist.group.WORLD).plan(
+        routes,
+        layout,
+        owners,
+        source_ranks=rank,
+        max_swaps=1,
+        max_replicas=1,
+        step=7,
+        layer_seed=11,
+    )
+
+    assert sharded.actions == exact.actions
+    assert sharded.final_layout == exact.final_layout
+    assert sharded.final_owner_slots == exact.final_owner_slots
+    assert sharded.baseline_cost == exact.baseline_cost
+    assert sharded.final_cost == exact.final_cost
+    torch.testing.assert_close(sharded.local_physical_routes, exact.local_physical_routes, rtol=0, atol=0)
+
+
+def test_reduce_scatter_candidate_scoring_matches_full_all_reduce():
+    torchrun(_sharded_collective_parity_worker, world_size=2, backend="gloo")
 
 
 def test_full_layout_rejects_non_improving_swap_and_cover():

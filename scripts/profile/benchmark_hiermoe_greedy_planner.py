@@ -144,6 +144,7 @@ def main() -> None:
         bytes_per_element=int(metadata["bytes_per_element"]),
         slots_per_rank=slots_per_rank,
         reducer=reducer,
+        process_group=dist.group.WORLD if dist.is_initialized() else None,
     )
     all_slots = torch.arange(layout.numel(), dtype=torch.long, device=device)
     owner_mask = torch.zeros_like(layout, dtype=torch.bool)

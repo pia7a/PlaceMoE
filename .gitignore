@@ -14,3 +14,4 @@ profile/processed/
 pretrain_runs/
 veomni/ops/platform/npu/hiermoe_planner_ops/build/
 
+/results/

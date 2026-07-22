@@ -58,11 +58,13 @@ The interaction term is not estimated separately. It is captured by applying
 the additions and removals together before testing the zero/nonzero occupancy
 boundary. Swap scoring uses the same mechanism with two moved experts.
 
-Every rank evaluates the same candidate rows for its local tokens. All
-candidate group-count deltas and the baseline are packed into one tensor and
-summed with one EP all-reduce. The alpha/beta hierarchy model then selects the
-globally cheapest action. A steady-state action is accepted only when its cost
-is strictly below the current cost.
+Every rank evaluates the same candidate rows for its local tokens. Candidate
+group-count deltas are globally summed with reduce-scatter, so each rank
+evaluates the exact global cost of one candidate shard. Compact cost,
+peak-rank, and selected-dimension triples are then all-gathered. The baseline
+row uses a separate all-reduce. Environments without a suitable process group
+retain the exact full all-reduce fallback. The hierarchy model selects the
+globally cheapest action and accepts it only on strict improvement.
 
 ## Empty-slot initialization
 
@@ -89,6 +91,8 @@ The NPU path uses a fused AscendC candidate scorer:
 - nearest-copy choices are prepared once per candidate rather than once per
   token;
 - the common single-expert move has a specialized occupancy-update path;
+- distributed candidate counts use reduce-scatter instead of replicating the
+  full reduced count matrix on every rank;
 - the output contains compact hierarchy-count deltas, not full token maps.
 
 After choosing a winner, the planner clones the baseline route map and updates
@@ -101,8 +105,9 @@ and unique-token counts U(e), the work is:
 - baseline mapping and occupancy: O(T * K * (C + L));
 - fused scoring:
   O(sum_a (U(lhs_a) + U(rhs_a)) * (K + L) + A * C^2);
-- one collective with
-  (A + 1) * sum_level(number of groups at level) scalar counts;
+- one small baseline all-reduce, one sharded candidate reduce-scatter over
+  A * sum_level(number of groups at level) counts, and one all-gather of
+  3 * A scalar metrics;
 - winner apply: O(T * K + T * C).
 
 Candidate actions run in parallel across AI cores. Current fused limits are
@@ -118,4 +123,4 @@ Run the saved-route benchmark on one NPU:
       --layer 0 --rank 0
 
 Under torchrun, each EP rank automatically loads its matching route file and
-the benchmark includes the real candidate-delta all-reduce.
+the benchmark includes the real sharded candidate collectives.

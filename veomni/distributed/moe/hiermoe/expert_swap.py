@@ -3980,6 +3980,7 @@ class ExpertSwapManager:
                 smooth_max_gamma=self.smooth_max_gamma,
                 reducer=self._planner_reduce_sum,
                 candidate_chunk_size=_SWAP_COST_CHUNK_CANDIDATES,
+                process_group=self.ep_group,
             )
         if self.expert_swap_mode != "layer":
             return CurrentRoutePlanner(
