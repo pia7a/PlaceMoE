@@ -276,7 +276,7 @@ def test_hierarchy_retains_node_size_for_ep16_ep32_ep64(monkeypatch):
 
     assert (ep16.group_sizes, ep16.local_world_size) == ((8, 16), 8)
     assert (ep32.group_sizes, ep32.local_world_size) == ((8, 32), 8)
-    assert (ep64.group_sizes, ep64.local_world_size) == ((8, 16, 64), 8)
+    assert (ep64.group_sizes, ep64.local_world_size) == ((8, 64), 8)
 
 
 def test_startup_probe_pairs_are_symmetric_with_odd_and_partial_nodes():

@@ -74,15 +74,6 @@ def infer_hierarchy(
             local_world_size=min(local_world_size, ep_size),
         )
 
-    num_nodes = ep_size // intra_size
-    if num_nodes >= 8 and ep_size % (2 * intra_size) == 0:
-        return Hierarchy(
-            ep_size=ep_size,
-            group_sizes=(intra_size, 2 * intra_size, ep_size),
-            source="auto-3d",
-            local_world_size=intra_size,
-        )
-
     return Hierarchy(
         ep_size=ep_size,
         group_sizes=(intra_size, ep_size),
