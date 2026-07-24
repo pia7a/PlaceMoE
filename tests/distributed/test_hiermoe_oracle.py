@@ -89,6 +89,37 @@ def _capture_route_worker(output_path: str) -> None:
     )
 
 
+def _capture_local_route_worker(_output_path: str) -> None:
+    rank = dist.get_rank()
+    selected_experts = torch.full((rank + 1, 2), rank, dtype=torch.long)
+    slot_to_logical = torch.tensor([0, 1, rank], dtype=torch.long)
+
+    def forbidden_collective(*_args, **_kwargs):
+        raise AssertionError("Local route capture must not issue a route collective.")
+
+    original_all_gather = dist.all_gather
+    original_all_gather_into_tensor = dist.all_gather_into_tensor
+    dist.all_gather = forbidden_collective
+    dist.all_gather_into_tensor = forbidden_collective
+    try:
+        maybe_capture_route_snapshot(
+            selected_experts=selected_experts,
+            num_experts=2,
+            hidden_size=4,
+            bytes_per_element=2,
+            ep_group=dist.group.WORLD,
+            hierarchy=Hierarchy(ep_size=2, group_sizes=(2,), source="test"),
+            layer_key="model.layers.7.mlp.experts",
+            step=3,
+            logical_to_physical=torch.arange(2),
+            slot_to_logical=slot_to_logical,
+            selected_dim=1,
+        )
+    finally:
+        dist.all_gather = original_all_gather
+        dist.all_gather_into_tensor = original_all_gather_into_tensor
+
+
 def test_distributed_capture_handles_unequal_route_lengths_and_single_writer(tmp_path, monkeypatch):
     output = tmp_path / "route.pt"
     monkeypatch.setenv("VEOMNI_HIERMOE_ORACLE_CAPTURE_PATH", str(output))
@@ -99,6 +130,29 @@ def test_distributed_capture_handles_unequal_route_lengths_and_single_writer(tmp
     assert [routes.shape[0] for routes in snapshot.routes_by_rank] == [1, 2]
     assert torch.equal(snapshot.routes_by_rank[0], torch.tensor([[0]]))
     assert torch.equal(snapshot.routes_by_rank[1], torch.tensor([[1], [1]]))
+
+
+def test_distributed_local_capture_writes_each_rank_without_route_collective(tmp_path, monkeypatch):
+    output = tmp_path / "step{step:04d}" / "layer{layer_index:02d}_rank{rank:02d}.pt"
+    monkeypatch.setenv("VEOMNI_HIERMOE_ORACLE_CAPTURE_PATH", str(output))
+    monkeypatch.setenv("VEOMNI_HIERMOE_ORACLE_CAPTURE_MODE", "local")
+    torchrun(_capture_local_route_worker, 2, str(output), backend="gloo")
+
+    for rank in range(2):
+        path = tmp_path / "step0003" / f"layer07_rank{rank:02d}.pt"
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        assert payload["format"] == "veomni.hiermoe.local_route"
+        assert payload["version"] == 1
+        assert payload["global_rank"] == rank
+        assert payload["ep_rank"] == rank
+        assert payload["ep_size"] == 2
+        assert payload["step"] == 3
+        assert payload["layer"] == 7
+        assert payload["call_index"] == 0
+        assert payload["layer_key"] == "model.layers.7.mlp.experts"
+        assert torch.equal(payload["routes"], torch.full((rank + 1, 2), rank, dtype=torch.int32))
+        assert torch.equal(payload["logical_to_physical"], torch.arange(2))
+        assert torch.equal(payload["slot_to_logical"], torch.tensor([0, 1, rank]))
 
 
 class _FakeExperts(torch.nn.Module):

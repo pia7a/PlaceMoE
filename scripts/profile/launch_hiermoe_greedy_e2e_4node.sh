@@ -15,6 +15,14 @@ data_num_workers=${DATA_NUM_WORKERS_OVERRIDE:-4}
 data_prefetch_factor=${DATA_PREFETCH_FACTOR_OVERRIDE:-2}
 perf_model_path=${HIERMOE_PERF_MODEL_PATH_OVERRIDE:-/workspace/output/hiermoe_perf_model_c009_ep32_20260720/v2/hiermoe_perf_model.json}
 greedy_copy_cap=${HIERMOE_GREEDY_MAX_COPIES_OVERRIDE:-4}
+greedy_adaptive_topk=${HIERMOE_GREEDY_ADAPTIVE_TOPK_OVERRIDE:-0}
+greedy_adaptive_topk_initial=${HIERMOE_GREEDY_ADAPTIVE_TOPK_INITIAL_OVERRIDE:-32}
+greedy_adaptive_topk_strict=${HIERMOE_GREEDY_ADAPTIVE_TOPK_STRICT_OVERRIDE:-0}
+capture_routes=${HIERMOE_CAPTURE_ROUTES:-0}
+capture_mode=${HIERMOE_CAPTURE_MODE_OVERRIDE:-local}
+capture_step=${HIERMOE_CAPTURE_STEP_OVERRIDE:--1}
+capture_layer=${HIERMOE_CAPTURE_LAYER_OVERRIDE:-}
+capture_call=${HIERMOE_CAPTURE_CALL_OVERRIDE:-0}
 key=/home/tzq/KeyPair-3bce.pem
 
 hiermoe_enable=false
@@ -42,6 +50,17 @@ case "${variant}" in
     expert_swap=true
     redundant_slots=4
     fixed_r2=1
+    ;;
+  r2_planner)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    max_pairs=1
+    redundant_slots=4
+    replica_rounds=1
+    fixed_r2=1
+    swap_mode=layer
+    swap_selector=hiermoe_greedy_cover_p1
     ;;
   greedy)
     hiermoe_enable=true
@@ -95,6 +114,9 @@ common_env=(
   -e "HIERMOE_FIT_PERF_MODEL_ON_STARTUP=0"
   -e "HIERMOE_PERF_MODEL_PATH=${perf_model_path}"
   -e "VEOMNI_HIERMOE_FIXED_R2_LAYOUT=${fixed_r2}"
+  -e "VEOMNI_HIERMOE_GREEDY_ADAPTIVE_TOPK=${greedy_adaptive_topk}"
+  -e "VEOMNI_HIERMOE_GREEDY_ADAPTIVE_TOPK_INITIAL=${greedy_adaptive_topk_initial}"
+  -e "VEOMNI_HIERMOE_GREEDY_ADAPTIVE_TOPK_STRICT=${greedy_adaptive_topk_strict}"
   -e "VEOMNI_HIERMOE_FULL_ROUTE_GATHER_MAX_TOKENS=16384"
   -e "VEOMNI_FULL_PROFILE_ENABLE=1"
   -e "VEOMNI_FULL_PROFILE_START_STEP=3"
@@ -104,6 +126,17 @@ common_env=(
   -e "VEOMNI_TORCH_PROFILE_ENABLE=0"
   -e "VEOMNI_MOE_TIMING_SYNC_EVENTS=0"
 )
+
+if [[ "${capture_routes}" == "1" ]]; then
+  capture_root=${source_root}/route_captures/${run_name}
+  common_env+=(
+    -e "VEOMNI_HIERMOE_ORACLE_CAPTURE_MODE=${capture_mode}"
+    -e "VEOMNI_HIERMOE_ORACLE_CAPTURE_PATH=${capture_root}/step{step:04d}/layer{layer_index:02d}_call{call}_rank{rank:02d}.pt"
+    -e "VEOMNI_HIERMOE_ORACLE_CAPTURE_STEP=${capture_step}"
+    -e "VEOMNI_HIERMOE_ORACLE_CAPTURE_LAYER=${capture_layer}"
+    -e "VEOMNI_HIERMOE_ORACLE_CAPTURE_CALL=${capture_call}"
+  )
+fi
 
 launch_remote() {
   local host=$1

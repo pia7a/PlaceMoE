@@ -17,28 +17,71 @@
 from __future__ import annotations
 
 import time
+from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
+from ....utils.device import get_torch_device
 from .perf_model import HierMoEPerfModel
 from .planner import PlacementAction, PlacementCost, PlacementPlan, _hierarchy_distance, _route_hash
+from .statistical_scorer import (
+    StatisticalPairContext,
+    StatisticalRouteTables,
+    _canonical_route_mask,
+    statistical_batched_selected_pair_local_deltas,
+    statistical_candidate_local_deltas,
+    statistical_pair_interaction_bound_local,
+    statistical_selected_pair_local_deltas,
+    statistical_unary_candidate_local_deltas,
+    uniform_statistical_baseline_routes,
+)
 from .topology import Hierarchy
 
 
-GREEDY_COVER_ALGORITHM_VERSION = "hiermoe-greedy-cover-p1-v1"
+GREEDY_COVER_ALGORITHM_VERSION = "hiermoe-greedy-cover-p1-exact-stats-v8-adaptive-topk"
+GREEDY_COMMUNICATION_PHASE_MULTIPLIER = 4.0
+GREEDY_COMPUTE_PHASE_MULTIPLIER = 3.0
 _ACTION_SWAP = 0
 _ACTION_COVER = 1
+_LAYER_COMPUTE_STREAMS: dict[tuple[str, int | None, int], tuple[object, ...]] = {}
 
 
 @dataclass(frozen=True)
 class _ScoredLayouts:
     communication: torch.Tensor
+    compute: torch.Tensor
+    communication_model_units: torch.Tensor
     peak_rank: torch.Tensor
+    peak_compute_rank: torch.Tensor
     selected_dim: torch.Tensor
     baseline_physical_routes: torch.Tensor
+    route_hashes: torch.Tensor | None = None
+    route_tables: StatisticalRouteTables | None = None
+    exact_cost_lower_bound: torch.Tensor | None = None
+
+    @property
+    def total(self) -> torch.Tensor:
+        return self.communication + self.compute
+
+
+@dataclass(frozen=True)
+class _PreparedActionCounts:
+    baseline_local: torch.Tensor
+    candidate_local: torch.Tensor
+    baseline_assignment_local: torch.Tensor | None
+    candidate_assignment_local: torch.Tensor | None
+    affected_groups: torch.Tensor | None
+    affected_assignment_ranks: torch.Tensor | None
+    baseline_physical_routes: torch.Tensor
+    route_hashes: torch.Tensor
+    route_tables: StatisticalRouteTables | None
+    pair_context: StatisticalPairContext | None = None
+    candidate_pair_bound_local: torch.Tensor | None = None
+    certificate_affected_groups: torch.Tensor | None = None
 
 
 def _reduce_sum(
@@ -76,6 +119,7 @@ def assign_tokens_to_copies_greedy(
     step: int = 0,
     layer_seed: int = 0,
     max_copies: int = 8,
+    route_hashes: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Map every logical route to its nearest available physical copy.
 
@@ -139,12 +183,17 @@ def assign_tokens_to_copies_greedy(
     minimum = score.min(dim=-1, keepdim=True).values
     tied = selected_valid & (score == minimum)
     tie_order = tied.to(torch.long).cumsum(dim=-1) - 1
-    route_hashes = _route_hash(
-        selected,
-        token_ordinals=ordinals,
-        step=step,
-        layer_seed=layer_seed,
-    )
+    if route_hashes is None:
+        route_hashes = _route_hash(
+            selected,
+            token_ordinals=ordinals,
+            step=step,
+            layer_seed=layer_seed,
+        )
+    else:
+        route_hashes = route_hashes.to(device=selected.device, dtype=torch.long, non_blocking=True)
+        if route_hashes.shape != selected.shape:
+            raise ValueError("route_hashes must match selected_experts after rank normalization.")
     tie_count = tied.sum(dim=-1, keepdim=True).clamp_min(1)
     tie_target = torch.remainder(route_hashes.view(1, num_tokens, top_k, 1), tie_count)
     chosen_copy = (tied & (tie_order == tie_target)).to(torch.long).argmax(dim=-1)
@@ -168,24 +217,58 @@ class GreedyCommunicationPlanner:
         hidden_size: int,
         bytes_per_element: int,
         slots_per_rank: int,
+        communication_scale: float = 1.0,
+        forward_compute_per_assignment: float = 0.0,
+        forward_compute_constant: float = 0.0,
         smooth_max_gamma: float = 10.0,
         reducer: Callable[[torch.Tensor], torch.Tensor | None] | None = None,
         candidate_chunk_size: int = 128,
         process_group: dist.ProcessGroup | None = None,
         max_copies: int = 4,
+        candidate_scorer: str = "statistics",
+        compact_candidate_collective: bool = False,
+        assume_unique_routes: bool = False,
+        layer_parallel_streams: int = 8,
+        adaptive_topk: bool = False,
+        adaptive_topk_initial: int = 16,
+        adaptive_topk_growth_factor: int = 2,
+        adaptive_topk_epsilon: float = 1e-6,
+        adaptive_topk_strict_certificate: bool = False,
     ) -> None:
         if smooth_max_gamma <= 0:
             raise ValueError("smooth_max_gamma must be positive.")
+        if candidate_scorer not in {"statistics", "reference"}:
+            raise ValueError("candidate_scorer must be 'statistics' or 'reference'.")
         self.hierarchy = hierarchy
         self.perf_model = perf_model
         self.hidden_size = int(hidden_size)
         self.bytes_per_element = int(bytes_per_element)
         self.slots_per_rank = int(slots_per_rank)
+        self.communication_scale = float(communication_scale)
+        self.forward_compute_per_assignment = float(forward_compute_per_assignment)
+        self.forward_compute_constant = float(forward_compute_constant)
         self.smooth_max_gamma = float(smooth_max_gamma)
         self.reducer = reducer
         self.candidate_chunk_size = max(1, int(candidate_chunk_size))
         self.process_group = process_group
         self.max_copies = max(1, int(max_copies))
+
+        self.candidate_scorer = candidate_scorer
+        self.compact_candidate_collective = bool(compact_candidate_collective)
+        self.assume_unique_routes = bool(assume_unique_routes)
+        self.layer_parallel_streams = max(1, int(layer_parallel_streams))
+        self.adaptive_topk = bool(adaptive_topk)
+        self.adaptive_topk_initial = max(1, int(adaptive_topk_initial))
+        self.adaptive_topk_growth_factor = max(2, int(adaptive_topk_growth_factor))
+        self.adaptive_topk_epsilon = max(0.0, float(adaptive_topk_epsilon))
+        self.adaptive_topk_strict_certificate = bool(adaptive_topk_strict_certificate)
+        self.last_adaptive_topk_stats: dict[str, object] = {}
+        if self.communication_scale < 0.0:
+            raise ValueError("communication_scale must be non-negative.")
+        if self.forward_compute_per_assignment < 0.0:
+            raise ValueError("forward_compute_per_assignment must be non-negative.")
+        if self.forward_compute_constant < 0.0:
+            raise ValueError("forward_compute_constant must be non-negative.")
 
     @property
     def ep_size(self) -> int:
@@ -224,7 +307,10 @@ class GreedyCommunicationPlanner:
             rows.append(group_hits.view(batch, num_tokens, num_groups).sum(dim=1).to(torch.float32))
         return torch.cat(rows, dim=1)
 
-    def _communication_cost(self, packed_counts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _communication_cost_details(
+        self,
+        packed_counts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         widths = self._count_widths()
         rows = packed_counts.split(widths, dim=1)
         rank_counts = rows[0]
@@ -247,8 +333,58 @@ class GreedyCommunicationPlanner:
             total = total + self.perf_model.intra.alpha + intra_scale * rank_max * self.perf_model.intra.beta
             dimensions.append(total)
         per_dim = torch.stack(dimensions, dim=1)
-        communication = torch.logsumexp(per_dim * self.smooth_max_gamma, dim=1) / self.smooth_max_gamma
-        return communication, rank_counts.argmax(dim=1), per_dim.argmax(dim=1) + 1
+        communication_units = torch.logsumexp(per_dim * self.smooth_max_gamma, dim=1) / self.smooth_max_gamma
+        communication = GREEDY_COMMUNICATION_PHASE_MULTIPLIER * self.communication_scale * communication_units
+        return communication, communication_units, rank_counts.argmax(dim=1), per_dim.argmax(dim=1) + 1
+
+    def _communication_cost(self, packed_counts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        communication, _units, peak_rank, selected_dim = self._communication_cost_details(packed_counts)
+        return communication, peak_rank, selected_dim
+
+    def _compute_cost(
+        self,
+        assignment_counts: torch.Tensor | None,
+        *,
+        rows: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if assignment_counts is None:
+            compute = torch.full(
+                (rows,),
+                GREEDY_COMPUTE_PHASE_MULTIPLIER * self.forward_compute_constant,
+                dtype=torch.float32,
+                device=device,
+            )
+            peak_rank = torch.full((rows,), -1, dtype=torch.long, device=device)
+            return compute, peak_rank
+        peak_assignments, peak_rank = assignment_counts.max(dim=1)
+        compute = GREEDY_COMPUTE_PHASE_MULTIPLIER * (
+            self.forward_compute_per_assignment * peak_assignments + self.forward_compute_constant
+        )
+        return compute, peak_rank
+
+    def _cost_details(
+        self,
+        packed_counts: torch.Tensor,
+        assignment_counts: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        communication, units, peak_rank, selected_dim = self._communication_cost_details(packed_counts)
+        compute, peak_compute_rank = self._compute_cost(
+            assignment_counts,
+            rows=packed_counts.shape[0],
+            device=packed_counts.device,
+        )
+        return communication, compute, units, peak_rank, peak_compute_rank, selected_dim
+
+    def _local_assignment_counts(self, physical_slots: torch.Tensor) -> torch.Tensor:
+        physical = physical_slots
+        if physical.ndim == 2:
+            physical = physical.unsqueeze(0)
+        ranks = torch.div(physical, self.slots_per_rank, rounding_mode="floor")
+        counts = torch.zeros((ranks.shape[0], self.ep_size), dtype=torch.float32, device=ranks.device)
+        updates = torch.ones_like(ranks, dtype=torch.float32)
+        counts.scatter_add_(1, ranks.reshape(ranks.shape[0], -1), updates.reshape(ranks.shape[0], -1))
+        return counts
 
     def _score_layouts(
         self,
@@ -262,6 +398,7 @@ class GreedyCommunicationPlanner:
         num_experts: int,
     ) -> _ScoredLayouts:
         local_rows: list[torch.Tensor] = []
+        local_assignments: list[torch.Tensor] = []
         baseline_physical: torch.Tensor | None = None
         for start in range(0, layouts.shape[0], self.candidate_chunk_size):
             physical = assign_tokens_to_copies_greedy(
@@ -279,12 +416,31 @@ class GreedyCommunicationPlanner:
             if start == 0:
                 baseline_physical = physical[0].clone()
             local_rows.append(self._local_packed_counts(physical))
+            if self.forward_compute_per_assignment > 0.0:
+                local_assignments.append(self._local_assignment_counts(physical))
         assert baseline_physical is not None
-        global_counts = _reduce_sum(torch.cat(local_rows, dim=0), self.reducer)
-        communication, peak_rank, selected_dim = self._communication_cost(global_counts)
+        local_counts = torch.cat(local_rows, dim=0)
+        assignment_counts = torch.cat(local_assignments, dim=0) if local_assignments else None
+        if assignment_counts is None:
+            global_counts = _reduce_sum(local_counts, self.reducer)
+            communication, compute, units, peak_rank, peak_compute_rank, selected_dim = self._cost_details(
+                global_counts,
+                None,
+            )
+        else:
+            combined = _reduce_sum(torch.cat((local_counts, assignment_counts), dim=1), self.reducer)
+            global_counts = combined[:, : local_counts.shape[1]]
+            global_assignments = combined[:, local_counts.shape[1] :]
+            communication, compute, units, peak_rank, peak_compute_rank, selected_dim = self._cost_details(
+                global_counts,
+                global_assignments,
+            )
         return _ScoredLayouts(
             communication=communication,
+            compute=compute,
+            communication_model_units=units,
             peak_rank=peak_rank,
+            peak_compute_rank=peak_compute_rank,
             selected_dim=selected_dim,
             baseline_physical_routes=baseline_physical,
         )
@@ -301,34 +457,77 @@ class GreedyCommunicationPlanner:
         self,
         baseline_local: torch.Tensor,
         candidate_local: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if candidate_local.numel() == 0 or not self._use_sharded_candidate_collective(baseline_local.device):
-            local_counts = torch.cat((baseline_local, candidate_local), dim=0)
+        baseline_assignment_local: torch.Tensor | None = None,
+        candidate_assignment_local: torch.Tensor | None = None,
+        affected_groups: torch.Tensor | None = None,
+        affected_assignment_ranks: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        communication_width = baseline_local.shape[1]
+        has_assignments = baseline_assignment_local is not None
+        if has_assignments != (candidate_assignment_local is not None):
+            raise ValueError("Baseline and candidate assignment counts must either both be present or both be absent.")
+        if has_assignments:
+            assert baseline_assignment_local is not None and candidate_assignment_local is not None
+            baseline_combined = torch.cat((baseline_local, baseline_assignment_local), dim=1)
+            candidate_combined = torch.cat((candidate_local, candidate_assignment_local), dim=1)
+        else:
+            baseline_combined = baseline_local
+            candidate_combined = candidate_local
+
+        def costs(combined: torch.Tensor):
+            assignments = combined[:, communication_width:] if has_assignments else None
+            return self._cost_details(combined[:, :communication_width], assignments)
+
+        if candidate_local.numel() == 0:
+            return costs(_reduce_sum(baseline_combined, self.reducer))
+        if affected_groups is not None and self.reducer is not None and dist.is_initialized():
+            combined_affected = affected_groups
+            if has_assignments:
+                if affected_assignment_ranks is None:
+                    raise ValueError("Compact assignment scoring requires affected assignment ranks.")
+                offset_assignment_ranks = torch.where(
+                    affected_assignment_ranks >= 0,
+                    affected_assignment_ranks + communication_width,
+                    affected_assignment_ranks,
+                )
+                combined_affected = torch.cat(
+                    (affected_groups, offset_assignment_ranks),
+                    dim=1,
+                )
+            return self._global_compact_action_costs(
+                baseline_combined,
+                candidate_combined,
+                combined_affected,
+                communication_width=communication_width,
+                has_assignments=has_assignments,
+            )
+        if not self._use_sharded_candidate_collective(baseline_combined.device):
+            local_counts = torch.cat((baseline_combined, candidate_combined), dim=0)
             global_counts = _reduce_sum(local_counts, self.reducer)
-            return self._communication_cost(global_counts)
+            return costs(global_counts)
 
         assert self.process_group is not None
-        baseline_global = baseline_local.clone()
+        baseline_global = baseline_combined.clone()
         dist.all_reduce(baseline_global, op=dist.ReduceOp.SUM, group=self.process_group)
-        baseline_communication, baseline_peak, baseline_dim = self._communication_cost(baseline_global)
+        baseline_metrics = costs(baseline_global)
 
         group_size = dist.get_world_size(self.process_group)
-        num_candidates, width = candidate_local.shape
+        num_candidates, width = candidate_combined.shape
         shard_rows = (num_candidates + group_size - 1) // group_size
         padded_rows = shard_rows * group_size
         if padded_rows != num_candidates:
             padding = torch.zeros(
                 (padded_rows - num_candidates, width),
-                dtype=candidate_local.dtype,
-                device=candidate_local.device,
+                dtype=candidate_combined.dtype,
+                device=candidate_combined.device,
             )
-            reduce_input = torch.cat((candidate_local, padding), dim=0)
+            reduce_input = torch.cat((candidate_combined, padding), dim=0)
         else:
-            reduce_input = candidate_local
+            reduce_input = candidate_combined
         reduced_shard = torch.empty(
             (shard_rows, width),
-            dtype=candidate_local.dtype,
-            device=candidate_local.device,
+            dtype=candidate_combined.dtype,
+            device=candidate_combined.device,
         )
         dist.reduce_scatter_tensor(
             reduced_shard,
@@ -336,26 +535,169 @@ class GreedyCommunicationPlanner:
             op=dist.ReduceOp.SUM,
             group=self.process_group,
         )
-        shard_communication, shard_peak, shard_dim = self._communication_cost(reduced_shard)
+        shard_communication, shard_compute, shard_units, shard_peak, shard_compute_peak, shard_dim = costs(
+            reduced_shard
+        )
         shard_metrics = torch.stack(
             (
                 shard_communication,
+                shard_compute,
+                shard_units,
                 shard_peak.to(shard_communication.dtype),
+                shard_compute_peak.to(shard_communication.dtype),
                 shard_dim.to(shard_communication.dtype),
             ),
             dim=1,
         ).contiguous()
         gathered_metrics = torch.empty(
-            (padded_rows, 3),
+            (padded_rows, 6),
             dtype=shard_metrics.dtype,
             device=shard_metrics.device,
         )
         dist.all_gather_into_tensor(gathered_metrics, shard_metrics, group=self.process_group)
         candidate_metrics = gathered_metrics[:num_candidates]
-        communication = torch.cat((baseline_communication, candidate_metrics[:, 0]), dim=0)
-        peak_rank = torch.cat((baseline_peak, candidate_metrics[:, 1].to(baseline_peak.dtype)), dim=0)
-        selected_dim = torch.cat((baseline_dim, candidate_metrics[:, 2].to(baseline_dim.dtype)), dim=0)
-        return communication, peak_rank, selected_dim
+        return (
+            torch.cat((baseline_metrics[0], candidate_metrics[:, 0]), dim=0),
+            torch.cat((baseline_metrics[1], candidate_metrics[:, 1]), dim=0),
+            torch.cat((baseline_metrics[2], candidate_metrics[:, 2]), dim=0),
+            torch.cat((baseline_metrics[3], candidate_metrics[:, 3].to(baseline_metrics[3].dtype)), dim=0),
+            torch.cat((baseline_metrics[4], candidate_metrics[:, 4].to(baseline_metrics[4].dtype)), dim=0),
+            torch.cat((baseline_metrics[5], candidate_metrics[:, 5].to(baseline_metrics[5].dtype)), dim=0),
+        )
+
+    @staticmethod
+    def _restore_candidate_counts(
+        baseline: torch.Tensor,
+        packed_deltas: torch.Tensor,
+        affected_groups: torch.Tensor,
+    ) -> torch.Tensor:
+        """Restore dense group counts after reducing only affected groups."""
+
+        num_candidates = packed_deltas.shape[0]
+        width = baseline.shape[1]
+        dense = baseline.expand(num_candidates, -1).clone()
+        if packed_deltas.numel() == 0:
+            return dense
+        valid = affected_groups >= 0
+        safe_groups = affected_groups.clamp_min(0)
+        candidate_rows = torch.arange(num_candidates, dtype=torch.long, device=dense.device).view(-1, 1)
+        flat_indices = candidate_rows * width + safe_groups
+        dense.reshape(-1).index_add_(
+            0,
+            flat_indices.reshape(-1),
+            (packed_deltas * valid.to(packed_deltas.dtype)).reshape(-1),
+        )
+        return dense
+
+    def _global_compact_action_costs(
+        self,
+        baseline_local: torch.Tensor,
+        candidate_local: torch.Tensor,
+        affected_groups: torch.Tensor,
+        *,
+        communication_width: int,
+        has_assignments: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reduce only groups whose counts can change for each action."""
+
+        def costs(combined: torch.Tensor):
+            assignments = combined[:, communication_width:] if has_assignments else None
+            return self._cost_details(combined[:, :communication_width], assignments)
+
+        num_candidates = candidate_local.shape[0]
+        valid = affected_groups >= 0
+        safe_groups = affected_groups.clamp_min(0)
+        local_deltas = candidate_local - baseline_local
+        packed_local = local_deltas.gather(1, safe_groups) * valid.to(local_deltas.dtype)
+        if not self._use_sharded_candidate_collective(baseline_local.device):
+            payload = torch.cat((baseline_local.reshape(-1), packed_local.reshape(-1)), dim=0)
+            global_payload = _reduce_sum(payload, self.reducer)
+            baseline_global = global_payload[: baseline_local.numel()].view_as(baseline_local)
+            packed_global = global_payload[baseline_local.numel() :].view_as(packed_local)
+            candidate_global = self._restore_candidate_counts(
+                baseline_global,
+                packed_global,
+                affected_groups,
+            )
+            return costs(torch.cat((baseline_global, candidate_global), dim=0))
+
+        assert self.process_group is not None
+        baseline_global = baseline_local.clone()
+        dist.all_reduce(baseline_global, op=dist.ReduceOp.SUM, group=self.process_group)
+        baseline_metrics = costs(baseline_global)
+
+        group_size = dist.get_world_size(self.process_group)
+        group_rank = dist.get_rank(self.process_group)
+        packed_width = packed_local.shape[1]
+        shard_rows = (num_candidates + group_size - 1) // group_size
+        padded_rows = shard_rows * group_size
+        if padded_rows != num_candidates:
+            packed_local = torch.cat(
+                (
+                    packed_local,
+                    torch.zeros(
+                        (padded_rows - num_candidates, packed_width),
+                        dtype=packed_local.dtype,
+                        device=packed_local.device,
+                    ),
+                ),
+                dim=0,
+            )
+            affected_groups = torch.cat(
+                (
+                    affected_groups,
+                    torch.full(
+                        (padded_rows - num_candidates, packed_width),
+                        -1,
+                        dtype=affected_groups.dtype,
+                        device=affected_groups.device,
+                    ),
+                ),
+                dim=0,
+            )
+        reduced_shard = torch.empty(
+            (shard_rows, packed_width),
+            dtype=packed_local.dtype,
+            device=packed_local.device,
+        )
+        dist.reduce_scatter_tensor(
+            reduced_shard,
+            packed_local.contiguous(),
+            op=dist.ReduceOp.SUM,
+            group=self.process_group,
+        )
+        shard_start = group_rank * shard_rows
+        shard_groups = affected_groups[shard_start : shard_start + shard_rows]
+        shard_counts = self._restore_candidate_counts(baseline_global, reduced_shard, shard_groups)
+        shard_communication, shard_compute, shard_units, shard_peak, shard_compute_peak, shard_dim = costs(
+            shard_counts
+        )
+        shard_metrics = torch.stack(
+            (
+                shard_communication,
+                shard_compute,
+                shard_units,
+                shard_peak.to(shard_communication.dtype),
+                shard_compute_peak.to(shard_communication.dtype),
+                shard_dim.to(shard_communication.dtype),
+            ),
+            dim=1,
+        ).contiguous()
+        gathered_metrics = torch.empty(
+            (padded_rows, 6),
+            dtype=shard_metrics.dtype,
+            device=shard_metrics.device,
+        )
+        dist.all_gather_into_tensor(gathered_metrics, shard_metrics, group=self.process_group)
+        candidate_metrics = gathered_metrics[:num_candidates]
+        return (
+            torch.cat((baseline_metrics[0], candidate_metrics[:, 0]), dim=0),
+            torch.cat((baseline_metrics[1], candidate_metrics[:, 1]), dim=0),
+            torch.cat((baseline_metrics[2], candidate_metrics[:, 2]), dim=0),
+            torch.cat((baseline_metrics[3], candidate_metrics[:, 3].to(baseline_metrics[3].dtype)), dim=0),
+            torch.cat((baseline_metrics[4], candidate_metrics[:, 4].to(baseline_metrics[4].dtype)), dim=0),
+            torch.cat((baseline_metrics[5], candidate_metrics[:, 5].to(baseline_metrics[5].dtype)), dim=0),
+        )
 
     def _copy_table(self, layout: torch.Tensor, num_experts: int) -> torch.Tensor:
         num_slots = int(layout.numel())
@@ -399,7 +741,201 @@ class GreedyCommunicationPlanner:
             torch.full_like(rhs_options, num_slots),
             rhs_options,
         )
-        return lhs_options.sort(dim=1).values, rhs_options.sort(dim=1).values, rhs_valid
+        sorted_options = torch.cat((lhs_options, rhs_options), dim=0).sort(dim=1).values
+        return sorted_options[: rows.shape[0]], sorted_options[rows.shape[0] :], rhs_valid
+
+    def _candidate_affected_groups(
+        self,
+        copy_slots: torch.Tensor,
+        rows: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return canonical packed group ids that may change per action."""
+
+        if rows.numel() == 0:
+            return rows.new_empty((0, 0))
+        num_slots = self.ep_size * self.slots_per_rank
+        lhs = rows[:, 3]
+        rhs_valid = rows[:, 4] >= 0
+        rhs = rows[:, 4].clamp_min(0)
+        lhs_before = copy_slots.index_select(0, lhs)
+        rhs_before = copy_slots.index_select(0, rhs)
+        rhs_before = torch.where(
+            rhs_valid.view(-1, 1),
+            rhs_before,
+            torch.full_like(rhs_before, num_slots),
+        )
+        lhs_after, rhs_after, _ = self._candidate_copy_options(
+            torch.empty(num_slots, dtype=torch.long, device=rows.device),
+            copy_slots,
+            rows,
+        )
+        rhs_after = torch.where(
+            rhs_valid.view(-1, 1),
+            rhs_after,
+            torch.full_like(rhs_after, num_slots),
+        )
+        all_options = torch.cat((lhs_before, lhs_after, rhs_before, rhs_after), dim=1)
+        valid = all_options < num_slots
+        ranks = torch.div(all_options.clamp(max=num_slots - 1), self.slots_per_rank, rounding_mode="floor")
+        level_sizes = (1,) + tuple(
+            int(size) for size in self.hierarchy.group_sizes[: max(0, int(self.hierarchy.selected_dim) - 1)]
+        )
+        if rows.device.type == "cpu":
+            rank_values = ranks.numpy()
+            valid_values = valid.numpy()
+            packed_values = []
+            offset = 0
+            for size in level_sizes:
+                num_groups = self.ep_size // size
+                groups = np.where(valid_values, np.floor_divide(rank_values, size), num_groups)
+                first = valid_values.copy()
+                for position in range(1, groups.shape[1]):
+                    first[:, position] &= np.all(
+                        groups[:, position : position + 1] != groups[:, :position],
+                        axis=1,
+                    )
+                packed_values.append(np.where(first, groups + offset, -1))
+                offset += num_groups
+            return torch.from_numpy(np.concatenate(packed_values, axis=1))
+
+        packed_levels: list[torch.Tensor] = []
+        offset = 0
+        option_count = all_options.shape[1]
+        positions = torch.arange(option_count, dtype=torch.long, device=rows.device)
+        earlier = positions.view(1, 1, -1) < positions.view(1, -1, 1)
+        for size in level_sizes:
+            num_groups = self.ep_size // size
+            groups = torch.div(ranks, size, rounding_mode="floor")
+            groups = torch.where(valid, groups, torch.full_like(groups, num_groups))
+            duplicate = groups.unsqueeze(2).eq(groups.unsqueeze(1)) & earlier
+            first = (groups < num_groups) & ~duplicate.any(dim=2)
+            packed_levels.append(torch.where(first, groups + offset, torch.full_like(groups, -1)))
+            offset += num_groups
+        return torch.cat(packed_levels, dim=1)
+
+    @staticmethod
+    def _candidate_affected_assignment_ranks(
+        affected_groups: torch.Tensor,
+        copy_slots: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reuse the rank-level affected groups for compact assignment deltas."""
+
+        rank_option_count = 4 * int(copy_slots.shape[1]) + 2
+        return affected_groups[:, :rank_option_count]
+
+    def _statistical_assignment_local_deltas(
+        self,
+        selected: torch.Tensor,
+        rows: torch.Tensor,
+        route_hashes: torch.Tensor,
+        route_tables: StatisticalRouteTables,
+    ) -> torch.Tensor:
+        """Compute exact non-deduplicated rank-load deltas from hash-state tables."""
+
+        state_count = route_tables.state_count
+        num_experts = int(route_tables.baseline_slots.shape[0])
+        route_states = torch.remainder(route_hashes, state_count)
+        pseudo = selected * state_count + route_states
+        multiplicities = torch.zeros(
+            (num_experts * state_count,),
+            dtype=torch.float32,
+            device=selected.device,
+        )
+        multiplicities.index_add_(
+            0,
+            pseudo.reshape(-1),
+            torch.ones_like(pseudo, dtype=torch.float32).reshape(-1),
+        )
+        multiplicities = multiplicities.view(num_experts, state_count)
+        lhs = rows[:, 3]
+        rhs_valid = rows[:, 4] >= 0
+        rhs = rows[:, 4].clamp_min(0)
+        baseline_ranks = torch.div(
+            route_tables.baseline_slots,
+            self.slots_per_rank,
+            rounding_mode="floor",
+        )
+        lhs_old = baseline_ranks.index_select(0, lhs)
+        rhs_old = baseline_ranks.index_select(0, rhs)
+        lhs_new = torch.div(route_tables.lhs_slots, self.slots_per_rank, rounding_mode="floor")
+        rhs_new = torch.div(route_tables.rhs_slots, self.slots_per_rank, rounding_mode="floor")
+        lhs_weights = multiplicities.index_select(0, lhs)
+        rhs_weights = multiplicities.index_select(0, rhs) * rhs_valid.view(-1, 1).to(torch.float32)
+        deltas = torch.zeros((rows.shape[0], self.ep_size), dtype=torch.float32, device=selected.device)
+        for ranks, values in (
+            (lhs_old, -lhs_weights),
+            (lhs_new, lhs_weights),
+            (rhs_old, -rhs_weights),
+            (rhs_new, rhs_weights),
+        ):
+            deltas.scatter_add_(1, ranks, values)
+        return deltas
+
+    def _reference_assignment_local_deltas(
+        self,
+        selected: torch.Tensor,
+        rows: torch.Tensor,
+        *,
+        layout: torch.Tensor,
+        copy_slots: torch.Tensor,
+        physical: torch.Tensor,
+        source_ranks: torch.Tensor,
+        route_hashes: torch.Tensor,
+    ) -> torch.Tensor:
+        """Exact fallback for non-uniform sources without compact route tables."""
+
+        num_tokens = selected.shape[0]
+        num_experts = int(copy_slots.shape[0])
+        route_hash_by_expert = torch.zeros(
+            (num_tokens, num_experts),
+            dtype=torch.long,
+            device=selected.device,
+        )
+        route_hash_by_expert.scatter_(1, selected, route_hashes)
+        multiplicity_by_expert = torch.zeros(
+            (num_tokens, num_experts),
+            dtype=torch.float32,
+            device=selected.device,
+        )
+        multiplicity_by_expert.scatter_add_(1, selected, torch.ones_like(selected, dtype=torch.float32))
+        rank_by_expert = torch.zeros_like(route_hash_by_expert)
+        rank_by_expert.scatter_(
+            1,
+            selected,
+            torch.div(physical, self.slots_per_rank, rounding_mode="floor"),
+        )
+        lhs = rows[:, 3]
+        rhs_valid = rows[:, 4] >= 0
+        rhs = rows[:, 4].clamp_min(0)
+        lhs_options, rhs_options, _ = self._candidate_copy_options(layout, copy_slots, rows)
+        lhs_hash = route_hash_by_expert.index_select(1, lhs).transpose(0, 1)
+        rhs_hash = route_hash_by_expert.index_select(1, rhs).transpose(0, 1)
+        lhs_old = rank_by_expert.index_select(1, lhs).transpose(0, 1)
+        rhs_old = rank_by_expert.index_select(1, rhs).transpose(0, 1)
+        lhs_new = self._candidate_route_ranks(
+            lhs_options,
+            lhs_hash,
+            source_ranks,
+            int(layout.numel()),
+        )
+        rhs_new = self._candidate_route_ranks(
+            rhs_options,
+            rhs_hash,
+            source_ranks,
+            int(layout.numel()),
+        )
+        lhs_weights = multiplicity_by_expert.index_select(1, lhs).transpose(0, 1)
+        rhs_weights = multiplicity_by_expert.index_select(1, rhs).transpose(0, 1)
+        rhs_weights *= rhs_valid.view(-1, 1).to(rhs_weights.dtype)
+        deltas = torch.zeros((rows.shape[0], self.ep_size), dtype=torch.float32, device=selected.device)
+        for ranks, values in (
+            (lhs_old, -lhs_weights),
+            (lhs_new, lhs_weights),
+            (rhs_old, -rhs_weights),
+            (rhs_new, rhs_weights),
+        ):
+            deltas.scatter_add_(1, ranks, values)
+        return deltas
 
     def _candidate_route_slots(
         self,
@@ -447,6 +983,7 @@ class GreedyCommunicationPlanner:
         *,
         source_ranks: torch.Tensor,
         token_ordinals: torch.Tensor,
+        route_hashes: torch.Tensor | None = None,
         step: int,
         layer_seed: int,
         num_experts: int,
@@ -459,12 +996,19 @@ class GreedyCommunicationPlanner:
         num_tokens = selected.shape[0]
         lhs = row[0, 3]
         lhs_selected = lhs.expand(num_tokens, 1)
-        lhs_hash = _route_hash(
-            lhs_selected,
-            token_ordinals=token_ordinals,
-            step=step,
-            layer_seed=layer_seed,
-        ).transpose(0, 1)
+        if route_hashes is None:
+            lhs_hash = _route_hash(
+                lhs_selected,
+                token_ordinals=token_ordinals,
+                step=step,
+                layer_seed=layer_seed,
+            ).transpose(0, 1)
+        else:
+            lhs_hash = (
+                torch.where(selected == lhs, route_hashes, torch.zeros_like(route_hashes))
+                .max(dim=1, keepdim=True)
+                .values.transpose(0, 1)
+            )
         lhs_slots = self._candidate_route_slots(
             lhs_options,
             lhs_hash,
@@ -476,12 +1020,19 @@ class GreedyCommunicationPlanner:
         if bool(rhs_valid[0].item()):
             rhs = row[0, 4]
             rhs_selected = rhs.expand(num_tokens, 1)
-            rhs_hash = _route_hash(
-                rhs_selected,
-                token_ordinals=token_ordinals,
-                step=step,
-                layer_seed=layer_seed,
-            ).transpose(0, 1)
+            if route_hashes is None:
+                rhs_hash = _route_hash(
+                    rhs_selected,
+                    token_ordinals=token_ordinals,
+                    step=step,
+                    layer_seed=layer_seed,
+                ).transpose(0, 1)
+            else:
+                rhs_hash = (
+                    torch.where(selected == rhs, route_hashes, torch.zeros_like(route_hashes))
+                    .max(dim=1, keepdim=True)
+                    .values.transpose(0, 1)
+                )
             rhs_slots = self._candidate_route_slots(
                 rhs_options,
                 rhs_hash,
@@ -491,18 +1042,47 @@ class GreedyCommunicationPlanner:
             updated = torch.where(selected == rhs, rhs_slots.view(-1, 1), updated)
         return updated
 
-    def _token_level_occupancies(self, physical_slots: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    @staticmethod
+    def _apply_statistical_action_routes(
+        selected: torch.Tensor,
+        row: torch.Tensor,
+        action_index: int,
+        baseline_physical: torch.Tensor,
+        route_hashes: torch.Tensor,
+        route_tables: StatisticalRouteTables,
+    ) -> torch.Tensor:
+        """Install one winner from the route tables already used for scoring."""
+
+        route_states = torch.remainder(route_hashes, route_tables.state_count)
+        lhs_table = route_tables.lhs_slots[action_index]
+        rhs_table = route_tables.rhs_slots[action_index]
+        lhs_slots = lhs_table.index_select(0, route_states.reshape(-1)).view_as(selected)
+        rhs_slots = rhs_table.index_select(0, route_states.reshape(-1)).view_as(selected)
+        updated = torch.where(selected == row[3], lhs_slots, baseline_physical)
+        return torch.where(selected == row[4], rhs_slots, updated)
+
+    def _token_level_occupancies(
+        self,
+        physical_slots: torch.Tensor,
+        *,
+        route_weights: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
         ranks = torch.div(physical_slots, self.slots_per_rank, rounding_mode="floor")
         num_tokens, top_k = ranks.shape
         occupancies = []
         level_sizes = (1,) + tuple(
             int(size) for size in self.hierarchy.group_sizes[: max(0, int(self.hierarchy.selected_dim) - 1)]
         )
+        updates = (
+            torch.ones((num_tokens, top_k), dtype=torch.int32, device=ranks.device)
+            if route_weights is None
+            else route_weights.to(dtype=torch.int32, device=ranks.device)
+        )
         for size in level_sizes:
             groups = torch.div(ranks, size, rounding_mode="floor")
             num_groups = self.ep_size // size
             counts = torch.zeros((num_tokens, num_groups), dtype=torch.int32, device=ranks.device)
-            counts.scatter_add_(1, groups, torch.ones((num_tokens, top_k), dtype=torch.int32, device=ranks.device))
+            counts.scatter_add_(1, groups, updates)
             occupancies.append(counts)
         return tuple(occupancies)
 
@@ -588,8 +1168,7 @@ class GreedyCommunicationPlanner:
     ) -> torch.Tensor | None:
         if (
             rows.numel() == 0
-            or
-            selected.device.type != "npu"
+            or selected.device.type != "npu"
             or selected.shape[0] > 16384
             or self.ep_size > 64
             or copy_slots.shape[1] > 8
@@ -637,57 +1216,139 @@ class GreedyCommunicationPlanner:
         )
         return output[:, : token_group_counts.shape[1]].to(torch.float32)
 
-    def _score_actions(
+    def _prepare_action_counts(
         self,
         selected: torch.Tensor,
         layout: torch.Tensor,
         rows: torch.Tensor,
         *,
         source_ranks: torch.Tensor,
+        uniform_source_rank: int | None,
+        copy_slots: torch.Tensor | None,
+        affected_groups: torch.Tensor | None,
         token_ordinals: torch.Tensor,
         step: int,
         layer_seed: int,
         num_experts: int,
-    ) -> _ScoredLayouts:
-        physical = assign_tokens_to_copies_greedy(
+        include_assignment_counts: bool | None = None,
+        include_pair_interactions: bool = True,
+        include_pair_bounds: bool = False,
+    ) -> _PreparedActionCounts:
+        route_hashes = _route_hash(
             selected,
-            layout,
-            slots_per_rank=self.slots_per_rank,
-            source_ranks=source_ranks,
-            hierarchy_group_sizes=self.hierarchy.group_sizes,
-            num_experts=num_experts,
             token_ordinals=token_ordinals,
             step=step,
             layer_seed=layer_seed,
-            max_copies=self.max_copies,
         )
-        occupancies = self._token_level_occupancies(physical)
-        baseline_local = torch.cat(
-            tuple((counts > 0).sum(dim=0, keepdim=True).to(torch.float32) for counts in occupancies),
-            dim=1,
+        if copy_slots is None:
+            copy_slots = self._copy_table(layout, num_experts)
+        uniform_baseline = None
+        if self.candidate_scorer == "statistics" and uniform_source_rank is not None:
+            uniform_baseline = uniform_statistical_baseline_routes(
+                self,
+                selected,
+                copy_slots,
+                route_hashes,
+                source_rank=uniform_source_rank,
+            )
+        physical = None if uniform_baseline is None else uniform_baseline.physical
+        if physical is None:
+            physical = assign_tokens_to_copies_greedy(
+                selected,
+                layout,
+                slots_per_rank=self.slots_per_rank,
+                source_ranks=source_ranks,
+                hierarchy_group_sizes=self.hierarchy.group_sizes,
+                num_experts=num_experts,
+                token_ordinals=token_ordinals,
+                step=step,
+                layer_seed=layer_seed,
+                max_copies=self.max_copies,
+                route_hashes=route_hashes,
+            )
+        unique_routes = None
+        if self.candidate_scorer == "statistics":
+            unique_routes = None if self.assume_unique_routes else _canonical_route_mask(selected)
+        occupancies = self._token_level_occupancies(
+            physical,
+            route_weights=None if self.assume_unique_routes else unique_routes,
         )
-        copy_slots = self._copy_table(layout, num_experts)
-        fused_delta = self._fused_candidate_local_deltas(
-            selected,
-            rows,
-            layout=layout,
-            copy_slots=copy_slots,
-            physical=physical,
-            occupancies=occupancies,
-            source_ranks=source_ranks,
-            token_ordinals=token_ordinals,
-            step=step,
-            layer_seed=layer_seed,
-            num_experts=num_experts,
-        )
+        baseline_local = (torch.cat(occupancies, dim=1) > 0).sum(dim=0, keepdim=True).to(torch.float32)
+        candidate_delta = None
+        route_tables = None
+        pair_context = None
+        candidate_pair_bound_local = None
+        if self.candidate_scorer == "statistics":
+            unary = None
+            if not include_pair_interactions:
+                unary = statistical_unary_candidate_local_deltas(
+                    self,
+                    selected,
+                    rows,
+                    layout=layout,
+                    copy_slots=copy_slots,
+                    physical=physical,
+                    occupancies=occupancies,
+                    token_ordinals=token_ordinals,
+                    route_hashes=route_hashes,
+                    uniform_source_rank=uniform_source_rank,
+                    uniform_baseline=uniform_baseline,
+                    routes_are_unique=self.assume_unique_routes,
+                    unique_routes=unique_routes,
+                    step=step,
+                    layer_seed=layer_seed,
+                    num_experts=num_experts,
+                )
+            if unary is not None:
+                candidate_delta, route_tables, pair_context = unary
+                if include_pair_bounds:
+                    candidate_pair_bound_local = statistical_pair_interaction_bound_local(
+                        pair_context,
+                        rows,
+                    )
+            else:
+                statistical = statistical_candidate_local_deltas(
+                    self,
+                    selected,
+                    rows,
+                    layout=layout,
+                    copy_slots=copy_slots,
+                    physical=physical,
+                    occupancies=occupancies,
+                    source_ranks=source_ranks,
+                    token_ordinals=token_ordinals,
+                    route_hashes=route_hashes,
+                    uniform_source_rank=uniform_source_rank,
+                    uniform_baseline=uniform_baseline,
+                    routes_are_unique=self.assume_unique_routes,
+                    unique_routes=unique_routes,
+                    return_route_tables=True,
+                    step=step,
+                    layer_seed=layer_seed,
+                    num_experts=num_experts,
+                )
+                assert isinstance(statistical, tuple)
+                candidate_delta, route_tables = statistical
+        elif self.candidate_scorer == "reference":
+            candidate_delta = self._fused_candidate_local_deltas(
+                selected,
+                rows,
+                layout=layout,
+                copy_slots=copy_slots,
+                physical=physical,
+                occupancies=occupancies,
+                source_ranks=source_ranks,
+                token_ordinals=token_ordinals,
+                step=step,
+                layer_seed=layer_seed,
+                num_experts=num_experts,
+            )
         if rows.numel() == 0:
             candidate_local = []
-        elif fused_delta is not None:
-            candidate_local = [baseline_local + fused_delta]
+        elif candidate_delta is not None:
+            candidate_local = [baseline_local + candidate_delta]
         else:
-            route_hashes = _route_hash(
-                selected, token_ordinals=token_ordinals, step=step, layer_seed=layer_seed
-            )
+            route_hashes = _route_hash(selected, token_ordinals=token_ordinals, step=step, layer_seed=layer_seed)
             route_hash_by_expert = torch.zeros(
                 (selected.shape[0], num_experts), dtype=torch.long, device=selected.device
             )
@@ -713,13 +1374,114 @@ class GreedyCommunicationPlanner:
                     rank_by_expert=rank_by_expert,
                 )
                 candidate_local.append(baseline_local + delta)
-        candidates = torch.cat(candidate_local, dim=0) if candidate_local else baseline_local.new_empty((0, baseline_local.shape[1]))
-        communication, peak_rank, selected_dim = self._global_action_costs(baseline_local, candidates)
+        candidates = (
+            torch.cat(candidate_local, dim=0)
+            if candidate_local
+            else baseline_local.new_empty((0, baseline_local.shape[1]))
+        )
+        if (
+            affected_groups is None
+            and self.compact_candidate_collective
+            and self.reducer is not None
+            and dist.is_initialized()
+        ):
+            affected_groups = self._candidate_affected_groups(copy_slots, rows)
+        baseline_assignment_local = None
+        candidate_assignment_local = None
+        affected_assignment_ranks = None
+        include_assignments = (
+            self.forward_compute_per_assignment > 0.0
+            if include_assignment_counts is None
+            else bool(include_assignment_counts)
+        )
+        if include_assignments:
+            baseline_assignment_local = self._local_assignment_counts(physical)
+            if rows.numel() == 0:
+                candidate_assignment_local = baseline_assignment_local.new_empty((0, self.ep_size))
+            else:
+                if route_tables is not None:
+                    assignment_delta = self._statistical_assignment_local_deltas(
+                        selected,
+                        rows,
+                        route_hashes,
+                        route_tables,
+                    )
+                else:
+                    assignment_delta = self._reference_assignment_local_deltas(
+                        selected,
+                        rows,
+                        layout=layout,
+                        copy_slots=copy_slots,
+                        physical=physical,
+                        source_ranks=source_ranks,
+                        route_hashes=route_hashes,
+                    )
+                candidate_assignment_local = baseline_assignment_local + assignment_delta
+            if affected_groups is not None:
+                affected_assignment_ranks = self._candidate_affected_assignment_ranks(
+                    affected_groups,
+                    copy_slots,
+                )
+        return _PreparedActionCounts(
+            baseline_local=baseline_local,
+            candidate_local=candidates,
+            baseline_assignment_local=baseline_assignment_local,
+            candidate_assignment_local=candidate_assignment_local,
+            affected_groups=affected_groups,
+            affected_assignment_ranks=affected_assignment_ranks,
+            baseline_physical_routes=physical,
+            route_hashes=route_hashes,
+            route_tables=route_tables,
+            pair_context=pair_context,
+            candidate_pair_bound_local=candidate_pair_bound_local,
+        )
+
+    def _score_actions(
+        self,
+        selected: torch.Tensor,
+        layout: torch.Tensor,
+        rows: torch.Tensor,
+        *,
+        source_ranks: torch.Tensor,
+        uniform_source_rank: int | None,
+        copy_slots: torch.Tensor | None,
+        affected_groups: torch.Tensor | None,
+        token_ordinals: torch.Tensor,
+        step: int,
+        layer_seed: int,
+        num_experts: int,
+    ) -> _ScoredLayouts:
+        prepared = self._prepare_action_counts(
+            selected,
+            layout,
+            rows,
+            source_ranks=source_ranks,
+            uniform_source_rank=uniform_source_rank,
+            copy_slots=copy_slots,
+            affected_groups=affected_groups,
+            token_ordinals=token_ordinals,
+            step=step,
+            layer_seed=layer_seed,
+            num_experts=num_experts,
+        )
+        communication, compute, units, peak_rank, peak_compute_rank, selected_dim = self._global_action_costs(
+            prepared.baseline_local,
+            prepared.candidate_local,
+            prepared.baseline_assignment_local,
+            prepared.candidate_assignment_local,
+            prepared.affected_groups,
+            prepared.affected_assignment_ranks,
+        )
         return _ScoredLayouts(
             communication=communication,
+            compute=compute,
+            communication_model_units=units,
             peak_rank=peak_rank,
+            peak_compute_rank=peak_compute_rank,
             selected_dim=selected_dim,
-            baseline_physical_routes=physical,
+            baseline_physical_routes=prepared.baseline_physical_routes,
+            route_hashes=prepared.route_hashes,
+            route_tables=prepared.route_tables,
         )
 
     def _rank_presence(self, layout: torch.Tensor, num_experts: int) -> torch.Tensor:
@@ -787,6 +1549,93 @@ class GreedyCommunicationPlanner:
         )
         return rows[valid]
 
+    def _can_complete_empty_initialization(self, layout: torch.Tensor, requested_fills: int) -> bool:
+        """Check replica-fill feasibility with a small CPU bipartite max flow."""
+
+        requested = max(0, int(requested_fills))
+        if requested == 0:
+            return True
+        active = layout[layout >= 0]
+        if active.numel() == 0:
+            return False
+        num_experts = int(active.max().item()) + 1
+        copy_counts = torch.bincount(active, minlength=num_experts)
+        capacities = (self.max_copies - copy_counts).clamp_min(0).tolist()
+        empty_by_rank = (layout.view(self.ep_size, self.slots_per_rank) < 0).sum(dim=1).to(dtype=torch.long).tolist()
+        if sum(empty_by_rank) < requested or sum(capacities) < requested:
+            return False
+
+        rank_experts = [
+            {
+                int(value)
+                for value in layout[rank * self.slots_per_rank : (rank + 1) * self.slots_per_rank].tolist()
+                if int(value) >= 0
+            }
+            for rank in range(self.ep_size)
+        ]
+        source = 0
+        rank_offset = 1
+        expert_offset = rank_offset + self.ep_size
+        sink = expert_offset + num_experts
+        graph: list[list[list[int]]] = [[] for _ in range(sink + 1)]
+
+        def add_edge(lhs: int, rhs: int, capacity: int) -> None:
+            graph[lhs].append([rhs, len(graph[rhs]), capacity])
+            graph[rhs].append([lhs, len(graph[lhs]) - 1, 0])
+
+        for rank, empty_count in enumerate(empty_by_rank):
+            if empty_count <= 0:
+                continue
+            add_edge(source, rank_offset + rank, empty_count)
+            for expert, capacity in enumerate(capacities):
+                if capacity > 0 and expert not in rank_experts[rank]:
+                    add_edge(rank_offset + rank, expert_offset + expert, 1)
+        for expert, capacity in enumerate(capacities):
+            if capacity > 0:
+                add_edge(expert_offset + expert, sink, capacity)
+
+        flow = 0
+        while flow < requested:
+            levels = [-1] * len(graph)
+            levels[source] = 0
+            queue = deque((source,))
+            while queue:
+                lhs = queue.popleft()
+                for rhs, _reverse, capacity in graph[lhs]:
+                    if capacity > 0 and levels[rhs] < 0:
+                        levels[rhs] = levels[lhs] + 1
+                        queue.append(rhs)
+            if levels[sink] < 0:
+                return False
+            positions = [0] * len(graph)
+
+            def send(
+                lhs: int,
+                available: int,
+                levels: list[int] = levels,
+                positions: list[int] = positions,
+            ) -> int:
+                if lhs == sink:
+                    return available
+                while positions[lhs] < len(graph[lhs]):
+                    edge = graph[lhs][positions[lhs]]
+                    rhs, reverse, capacity = edge
+                    if capacity > 0 and levels[rhs] == levels[lhs] + 1:
+                        sent = send(rhs, min(available, capacity))
+                        if sent:
+                            edge[2] -= sent
+                            graph[rhs][reverse][2] += sent
+                            return sent
+                    positions[lhs] += 1
+                return 0
+
+            while flow < requested:
+                sent = send(source, requested - flow)
+                if not sent:
+                    break
+                flow += sent
+        return flow >= requested
+
     @staticmethod
     def _apply_rows(layout: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
         if rows.numel() == 0:
@@ -822,7 +1671,10 @@ class GreedyCommunicationPlanner:
             torch.stack(
                 (
                     scored.communication[index],
+                    scored.compute[index],
+                    scored.communication_model_units[index],
                     scored.peak_rank[index].to(scored.communication.dtype),
+                    scored.peak_compute_rank[index].to(scored.communication.dtype),
                     scored.selected_dim[index].to(scored.communication.dtype),
                 )
             )
@@ -830,58 +1682,774 @@ class GreedyCommunicationPlanner:
             .to(device="cpu")
             .tolist()
         )
+        return GreedyCommunicationPlanner._placement_cost_from_values(values)
+
+    @staticmethod
+    def _placement_cost_from_values(values: Sequence[float]) -> PlacementCost:
         return PlacementCost(
             communication=float(values[0]),
-            compute=0.0,
-            communication_model_units=float(values[0]),
-            peak_communication_rank=int(values[1]),
-            peak_compute_rank=-1,
-            selected_dim=int(values[2]),
+            compute=float(values[1]),
+            communication_model_units=float(values[2]),
+            peak_communication_rank=int(values[3]),
+            peak_compute_rank=int(values[4]),
+            selected_dim=int(values[5]),
         )
 
-    def _select_empty_actions(
+    def _score_prepared_layers(
         self,
+        prepared_layers: Sequence[_PreparedActionCounts],
+        *,
+        communication_scales: Sequence[float],
+        forward_compute_per_assignment: Sequence[float],
+        forward_compute_constant: Sequence[float],
+    ) -> list[_ScoredLayouts]:
+        """Score independent layers with one full EP reduction."""
+
+        if not prepared_layers:
+            return []
+        layer_count = len(prepared_layers)
+        if not (
+            len(communication_scales)
+            == len(forward_compute_per_assignment)
+            == len(forward_compute_constant)
+            == layer_count
+        ):
+            raise ValueError("Batched layer cost-model arrays must match the number of prepared layers.")
+        include_assignments = any(value > 0.0 for value in forward_compute_per_assignment)
+        include_pair_bounds = all(prepared.candidate_pair_bound_local is not None for prepared in prepared_layers)
+        communication_width = prepared_layers[0].baseline_local.shape[1]
+        local_blocks: list[torch.Tensor] = []
+        row_counts: list[int] = []
+        for prepared in prepared_layers:
+            communication = torch.cat((prepared.baseline_local, prepared.candidate_local), dim=0)
+            if communication.shape[1] != communication_width:
+                raise ValueError("Batched layers must use the same communication-statistic width.")
+            row_counts.append(int(communication.shape[0]))
+            if include_assignments:
+                if prepared.baseline_assignment_local is None or prepared.candidate_assignment_local is None:
+                    raise ValueError("Batched joint-cost scoring requires assignment counts for every layer.")
+                assignments = torch.cat(
+                    (prepared.baseline_assignment_local, prepared.candidate_assignment_local),
+                    dim=0,
+                )
+                communication = torch.cat((communication, assignments), dim=1)
+            if include_pair_bounds:
+                assert prepared.candidate_pair_bound_local is not None
+                pair_bounds = torch.cat(
+                    (
+                        prepared.candidate_pair_bound_local.new_zeros((1, communication_width)),
+                        prepared.candidate_pair_bound_local,
+                    ),
+                    dim=0,
+                )
+                communication = torch.cat((communication, pair_bounds), dim=1)
+            local_blocks.append(communication)
+
+        global_rows = _reduce_sum(torch.cat(local_blocks, dim=0), self.reducer)
+        communication_rows = global_rows[:, :communication_width]
+        assignment_end = communication_width + (self.ep_size if include_assignments else 0)
+        assignment_rows = global_rows[:, communication_width:assignment_end] if include_assignments else None
+        pair_bound_rows = global_rows[:, -communication_width:] if include_pair_bounds else None
+        _unused, units, peak_rank, selected_dim = self._communication_cost_details(communication_rows)
+        device = global_rows.device
+        layer_indices = torch.repeat_interleave(
+            torch.arange(layer_count, dtype=torch.long, device=device),
+            torch.tensor(row_counts, dtype=torch.long, device=device),
+        )
+        communication_scale_rows = torch.tensor(
+            communication_scales,
+            dtype=units.dtype,
+            device=device,
+        ).index_select(0, layer_indices)
+        communication = GREEDY_COMMUNICATION_PHASE_MULTIPLIER * communication_scale_rows * units
+        compute_slope_rows = torch.tensor(
+            forward_compute_per_assignment,
+            dtype=units.dtype,
+            device=device,
+        ).index_select(0, layer_indices)
+        compute_constant_rows = torch.tensor(
+            forward_compute_constant,
+            dtype=units.dtype,
+            device=device,
+        ).index_select(0, layer_indices)
+        if assignment_rows is None:
+            compute = GREEDY_COMPUTE_PHASE_MULTIPLIER * compute_constant_rows
+            peak_compute_rank = torch.full_like(peak_rank, -1)
+        else:
+            peak_assignments, peak_compute_rank = assignment_rows.max(dim=1)
+            compute = GREEDY_COMPUTE_PHASE_MULTIPLIER * (compute_slope_rows * peak_assignments + compute_constant_rows)
+
+        exact_cost_lower_bound = None
+        if pair_bound_rows is not None:
+            lower_count_rows = (communication_rows - pair_bound_rows).clamp_min_(0)
+            _unused, lower_units, _lower_peak, _lower_dim = self._communication_cost_details(lower_count_rows)
+            lower_communication = GREEDY_COMMUNICATION_PHASE_MULTIPLIER * communication_scale_rows * lower_units
+            exact_cost_lower_bound = lower_communication + compute
+
+        scored_layers: list[_ScoredLayouts] = []
+        offset = 0
+        for prepared, row_count in zip(prepared_layers, row_counts, strict=True):
+            rows = slice(offset, offset + row_count)
+            scored_layers.append(
+                _ScoredLayouts(
+                    communication=communication[rows],
+                    compute=compute[rows],
+                    communication_model_units=units[rows],
+                    peak_rank=peak_rank[rows],
+                    peak_compute_rank=peak_compute_rank[rows],
+                    selected_dim=selected_dim[rows],
+                    baseline_physical_routes=prepared.baseline_physical_routes,
+                    route_hashes=prepared.route_hashes,
+                    route_tables=prepared.route_tables,
+                    exact_cost_lower_bound=(None if exact_cost_lower_bound is None else exact_cost_lower_bound[rows]),
+                )
+            )
+            offset += row_count
+        return scored_layers
+
+    def _selected_exact_prepared(
+        self,
+        prepared: _PreparedActionCounts,
         rows: torch.Tensor,
-        candidate_costs: torch.Tensor,
-        layout: torch.Tensor,
-        limit: int,
-    ) -> tuple[PlacementAction, ...]:
-        if rows.numel() == 0 or limit <= 0:
-            return ()
-        order = torch.argsort(candidate_costs, stable=True)
-        ordered_rows = rows.index_select(0, order).detach().to(device="cpu").tolist()
-        layout_cpu = layout.detach().to(device="cpu", dtype=torch.long)
-        rank_experts = [
-            {
-                int(value)
-                for value in layout_cpu[rank * self.slots_per_rank : (rank + 1) * self.slots_per_rank].tolist()
-                if int(value) >= 0
-            }
-            for rank in range(self.ep_size)
-        ]
-        copy_counts: dict[int, int] = {}
-        for value in layout_cpu.tolist():
-            logical = int(value)
-            if logical >= 0:
-                copy_counts[logical] = copy_counts.get(logical, 0) + 1
-        used_slots: set[int] = set()
-        actions: list[PlacementAction] = []
-        for row in ordered_rows:
-            action = self._placement_action(row)
-            rank = action.dst_slot // self.slots_per_rank
-            if (
-                action.dst_slot in used_slots
-                or action.src_logical in rank_experts[rank]
-                or copy_counts.get(action.src_logical, 0) >= self.max_copies
+        action_indices: torch.Tensor,
+        pair_delta: torch.Tensor | None = None,
+    ) -> _PreparedActionCounts:
+        """Materialize exact counts only for selected unary-ranked actions."""
+
+        if prepared.pair_context is None:
+            raise ValueError("Sparse exact reranking requires a statistical pair context.")
+        if pair_delta is None:
+            pair_delta = statistical_selected_pair_local_deltas(
+                prepared.pair_context,
+                rows,
+                action_indices,
+            )
+        candidate_local = prepared.candidate_local.index_select(0, action_indices) + pair_delta
+        candidate_assignment_local = (
+            None
+            if prepared.candidate_assignment_local is None
+            else prepared.candidate_assignment_local.index_select(0, action_indices)
+        )
+        affected_groups = (
+            None if prepared.affected_groups is None else prepared.affected_groups.index_select(0, action_indices)
+        )
+        affected_assignment_ranks = (
+            None
+            if prepared.affected_assignment_ranks is None
+            else prepared.affected_assignment_ranks.index_select(0, action_indices)
+        )
+        return _PreparedActionCounts(
+            baseline_local=prepared.baseline_local,
+            candidate_local=candidate_local,
+            baseline_assignment_local=prepared.baseline_assignment_local,
+            candidate_assignment_local=candidate_assignment_local,
+            affected_groups=affected_groups,
+            affected_assignment_ranks=affected_assignment_ranks,
+            baseline_physical_routes=prepared.baseline_physical_routes,
+            route_hashes=prepared.route_hashes,
+            route_tables=prepared.route_tables,
+        )
+
+    def _adaptive_fast_path_available_on_all_ranks(
+        self,
+        prepared_layers: Sequence[_PreparedActionCounts],
+    ) -> bool:
+        """Agree on unary/pair fast-path availability before any scoring reduction."""
+
+        local_available = all(
+            prepared.pair_context is not None
+            and (not self.adaptive_topk_strict_certificate or prepared.candidate_pair_bound_local is not None)
+            for prepared in prepared_layers
+        )
+        if self.reducer is None or not dist.is_initialized() or not prepared_layers:
+            return local_available
+        available = prepared_layers[0].baseline_local.new_tensor([float(local_available)])
+        available_count = _reduce_sum(available, self.reducer)
+        return int(available_count.item()) == self.ep_size
+
+    def _adaptive_score_layers(
+        self,
+        prepared_layers: Sequence[_PreparedActionCounts],
+        contexts: Sequence[dict[str, object]],
+        *,
+        communication_scales: Sequence[float],
+        forward_compute_per_assignment: Sequence[float],
+        forward_compute_constant: Sequence[float],
+    ) -> tuple[list[_ScoredLayouts], list[torch.Tensor], dict[str, object]]:
+        """Rerank unary Top-K exactly, with optional strict-certificate expansion."""
+
+        if any(prepared.pair_context is None for prepared in prepared_layers) or (
+            self.adaptive_topk_strict_certificate
+            and any(prepared.candidate_pair_bound_local is None for prepared in prepared_layers)
+        ):
+            raise RuntimeError("Adaptive Top-K scoring requires group-consistent unary/pair statistics.")
+        unary_scored = self._score_prepared_layers(
+            prepared_layers,
+            communication_scales=communication_scales,
+            forward_compute_per_assignment=forward_compute_per_assignment,
+            forward_compute_constant=forward_compute_constant,
+        )
+
+        action_orders = [torch.argsort(scored.total[1:], stable=True) for scored in unary_scored]
+        layer_count = len(prepared_layers)
+        selected_indices: list[torch.Tensor | None] = [None] * layer_count
+        final_scored: list[_ScoredLayouts | None] = [None] * layer_count
+        final_k = [0] * layer_count
+        rounds = [0] * layer_count
+        certified = [False] * layer_count
+        pending = list(range(layer_count))
+        current_k = [min(self.adaptive_topk_initial, int(context["rows"].shape[0])) for context in contexts]
+        rerank_started = time.perf_counter()
+        collective_rounds = 0
+        while pending:
+            round_prepared: list[_PreparedActionCounts] = []
+            round_indices: list[torch.Tensor] = []
+            for layer_index in pending:
+                action_indices = action_orders[layer_index][: current_k[layer_index]]
+                round_indices.append(action_indices)
+            pair_deltas = statistical_batched_selected_pair_local_deltas(
+                [prepared_layers[layer_index].pair_context for layer_index in pending],
+                [contexts[layer_index]["rows"] for layer_index in pending],
+                round_indices,
+            )
+            for layer_index, action_indices, pair_delta in zip(
+                pending,
+                round_indices,
+                pair_deltas,
+                strict=True,
             ):
-                continue
-            actions.append(action)
-            used_slots.add(action.dst_slot)
-            rank_experts[rank].add(action.src_logical)
-            copy_counts[action.src_logical] = copy_counts.get(action.src_logical, 0) + 1
-            if len(actions) >= limit:
-                break
-        return tuple(actions)
+                assert prepared_layers[layer_index].pair_context is not None
+                round_prepared.append(
+                    self._selected_exact_prepared(
+                        prepared_layers[layer_index],
+                        contexts[layer_index]["rows"],
+                        action_indices,
+                        pair_delta,
+                    )
+                )
+            round_scored = self._score_prepared_layers(
+                round_prepared,
+                communication_scales=[communication_scales[index] for index in pending],
+                forward_compute_per_assignment=[forward_compute_per_assignment[index] for index in pending],
+                forward_compute_constant=[forward_compute_constant[index] for index in pending],
+            )
+            collective_rounds += 1
+            certificate_rows = []
+            for layer_index, action_indices, scored in zip(
+                pending,
+                round_indices,
+                round_scored,
+                strict=True,
+            ):
+                candidate_costs = scored.total[1:]
+                minimum = candidate_costs.min()
+                original_or_sentinel = torch.where(
+                    candidate_costs == minimum,
+                    action_indices,
+                    torch.full_like(action_indices, int(contexts[layer_index]["rows"].shape[0])),
+                )
+                winner_action = original_or_sentinel.min()
+                winner_position = (action_indices == winner_action).to(torch.long).argmax()
+                keep = torch.cat(
+                    (
+                        torch.zeros((1,), dtype=torch.long, device=winner_position.device),
+                        winner_position.view(1) + 1,
+                    )
+                )
+                final_scored[layer_index] = _ScoredLayouts(
+                    communication=scored.communication.index_select(0, keep),
+                    compute=scored.compute.index_select(0, keep),
+                    communication_model_units=scored.communication_model_units.index_select(0, keep),
+                    peak_rank=scored.peak_rank.index_select(0, keep),
+                    peak_compute_rank=scored.peak_compute_rank.index_select(0, keep),
+                    selected_dim=scored.selected_dim.index_select(0, keep),
+                    baseline_physical_routes=prepared_layers[layer_index].baseline_physical_routes,
+                    route_hashes=prepared_layers[layer_index].route_hashes,
+                    route_tables=prepared_layers[layer_index].route_tables,
+                )
+                selected_indices[layer_index] = winner_action.view(1)
+                final_k[layer_index] = int(action_indices.numel())
+                rounds[layer_index] += 1
+
+                candidate_count = int(contexts[layer_index]["rows"].shape[0])
+                if not self.adaptive_topk_strict_certificate:
+                    certificate_rows.append(torch.ones((), dtype=torch.bool, device=minimum.device))
+                    continue
+                if int(action_indices.numel()) >= candidate_count:
+                    certificate_rows.append(torch.ones((), dtype=torch.bool, device=minimum.device))
+                    continue
+                assert unary_scored[layer_index].exact_cost_lower_bound is not None
+                rest_lower = unary_scored[layer_index].exact_cost_lower_bound[1:].clone()
+                rest_lower.index_fill_(0, action_indices, torch.inf)
+                certificate_rows.append(minimum + self.adaptive_topk_epsilon < rest_lower.min())
+            certificate_values = torch.stack(certificate_rows).detach().to(device="cpu").tolist()
+            next_pending = []
+            for layer_index, passed in zip(pending, certificate_values, strict=True):
+                if bool(passed):
+                    certified[layer_index] = self.adaptive_topk_strict_certificate
+                    continue
+                candidate_count = int(contexts[layer_index]["rows"].shape[0])
+                current_k[layer_index] = min(
+                    candidate_count,
+                    current_k[layer_index] * self.adaptive_topk_growth_factor,
+                )
+                next_pending.append(layer_index)
+            pending = next_pending
+
+        if any(value is None for value in final_scored) or any(value is None for value in selected_indices):
+            raise RuntimeError("Adaptive Top-K scoring did not produce every layer decision.")
+        stats = {
+            "enabled": True,
+            "certificate_mode": ("strict" if self.adaptive_topk_strict_certificate else "empirical_fixed_k"),
+            "initial_k": self.adaptive_topk_initial,
+            "final_k": final_k,
+            "rounds": rounds,
+            "certified": certified,
+            "collective_rounds": collective_rounds,
+            "rerank_ms": (time.perf_counter() - rerank_started) * 1000.0,
+        }
+        return (
+            [value for value in final_scored if value is not None],
+            [value for value in selected_indices if value is not None],
+            stats,
+        )
+
+    def _prepare_independent_layers(
+        self,
+        contexts: Sequence[dict[str, object]],
+        *,
+        step: int,
+        include_assignment_counts: bool,
+        include_pair_interactions: bool = True,
+        include_pair_bounds: bool = False,
+    ) -> list[_PreparedActionCounts]:
+        """Build exact per-layer statistics concurrently on accelerator streams.
+
+        The first layer runs on the caller stream to populate the shared
+        fixed-shape route/hash caches. Remaining layers are independent and
+        can safely execute on a bounded stream pool. The caller stream waits
+        on that pool before concatenating the one batched collective payload.
+        """
+
+        def prepare(context: dict[str, object]) -> _PreparedActionCounts:
+            return self._prepare_action_counts(
+                context["selected"],
+                context["layout"],
+                context["rows"],
+                source_ranks=context["sources"],
+                uniform_source_rank=context["uniform_source_rank"],
+                copy_slots=context["copy_slots"],
+                affected_groups=None,
+                token_ordinals=context["ordinals"],
+                step=step,
+                layer_seed=context["layer_seed"],
+                num_experts=int(context["owners"].numel()),
+                include_assignment_counts=include_assignment_counts,
+                include_pair_interactions=include_pair_interactions,
+                include_pair_bounds=include_pair_bounds,
+            )
+
+        if not contexts:
+            return []
+        device = contexts[0]["selected"].device
+        if any(context["selected"].device != device for context in contexts):
+            raise ValueError("Batched layers must reside on the same device.")
+        prepared: list[_PreparedActionCounts | None] = [None] * len(contexts)
+        prepared[0] = prepare(contexts[0])
+        common_shape = tuple(contexts[0]["selected"].shape)
+        shapes_match = all(tuple(context["selected"].shape) == common_shape for context in contexts)
+        # Shared fixed-shape route caches are populated by the first layer.
+        # If token/top-k shapes differ, use the caller stream so a later layer
+        # cannot observe a cache tensor still being produced by another stream.
+        stream_count = min(self.layer_parallel_streams, len(contexts) - 1) if shapes_match else 0
+        if device.type == "cpu" or stream_count <= 1:
+            for index in range(1, len(contexts)):
+                prepared[index] = prepare(contexts[index])
+        else:
+            device_api = get_torch_device()
+            try:
+                caller_stream = device_api.current_stream(device)
+            except TypeError:
+                caller_stream = device_api.current_stream()
+            cache_key = (device.type, device.index, stream_count)
+            compute_streams = _LAYER_COMPUTE_STREAMS.get(cache_key)
+            if compute_streams is None:
+                values = []
+                for _ in range(stream_count):
+                    try:
+                        values.append(device_api.Stream(device=device))
+                    except TypeError:
+                        values.append(device_api.Stream())
+                compute_streams = tuple(values)
+                _LAYER_COMPUTE_STREAMS[cache_key] = compute_streams
+            for compute_stream in compute_streams:
+                compute_stream.wait_stream(caller_stream)
+            for index in range(1, len(contexts)):
+                compute_stream = compute_streams[(index - 1) % stream_count]
+                with device_api.stream(compute_stream):
+                    prepared[index] = prepare(contexts[index])
+            for compute_stream in compute_streams:
+                caller_stream.wait_stream(compute_stream)
+        if any(value is None for value in prepared):
+            raise RuntimeError("Batched layer statistic preparation did not produce every layer.")
+        return [value for value in prepared if value is not None]
+
+    def score_layout(
+        self,
+        selected_experts: torch.Tensor,
+        slot_to_logical: torch.Tensor,
+        *,
+        source_ranks: int | torch.Tensor,
+        owner_slots: torch.Tensor,
+        token_ordinals: torch.Tensor | None = None,
+        step: int = 0,
+        layer_seed: int = 0,
+        max_copies: int | None = None,
+    ) -> PlacementCost:
+        """Evaluate one layout with the same exact route mapping used by planning."""
+
+        if max_copies is not None and int(max_copies) > self.max_copies:
+            raise ValueError("score_layout max_copies exceeds the planner copy limit.")
+        return self.plan(
+            selected_experts,
+            slot_to_logical,
+            owner_slots,
+            source_ranks=source_ranks,
+            max_swaps=0,
+            max_replicas=0,
+            token_ordinals=token_ordinals,
+            step=step,
+            layer_seed=layer_seed,
+        ).baseline_cost
+
+    def plan_layers(
+        self,
+        selected_experts: Sequence[torch.Tensor],
+        slot_to_logical: Sequence[torch.Tensor],
+        owner_slots: Sequence[torch.Tensor],
+        *,
+        source_ranks: int | Sequence[int | torch.Tensor],
+        max_swaps: int,
+        max_replicas: int,
+        layer_seeds: Sequence[int],
+        step: int = 0,
+        communication_scales: Sequence[float] | None = None,
+        forward_compute_per_assignment: Sequence[float] | None = None,
+        forward_compute_constant: Sequence[float] | None = None,
+        skip_final_route_update: bool = True,
+    ) -> list[PlacementPlan]:
+        """Plan one steady-state action per independent layer with one EP collective."""
+
+        started = time.perf_counter()
+        layer_count = len(selected_experts)
+        if not (len(slot_to_logical) == len(owner_slots) == len(layer_seeds) == layer_count):
+            raise ValueError("Batched planner inputs must have identical layer counts.")
+        if layer_count == 0:
+            return []
+        scales = (
+            [self.communication_scale] * layer_count
+            if communication_scales is None
+            else [float(value) for value in communication_scales]
+        )
+        compute_slopes = (
+            [self.forward_compute_per_assignment] * layer_count
+            if forward_compute_per_assignment is None
+            else [float(value) for value in forward_compute_per_assignment]
+        )
+        compute_constants = (
+            [self.forward_compute_constant] * layer_count
+            if forward_compute_constant is None
+            else [float(value) for value in forward_compute_constant]
+        )
+        if not (len(scales) == len(compute_slopes) == len(compute_constants) == layer_count):
+            raise ValueError("Batched planner cost-model arrays must match the number of layers.")
+        if isinstance(source_ranks, int):
+            source_values: list[int | torch.Tensor] = [int(source_ranks)] * layer_count
+        else:
+            source_values = list(source_ranks)
+            if len(source_values) != layer_count:
+                raise ValueError("Batched source_ranks must match the number of layers.")
+
+        candidate_started = time.perf_counter()
+        contexts: list[dict[str, object]] = []
+        include_assignments = any(value > 0.0 for value in compute_slopes)
+        for layer_index, (raw_selected, raw_layout, raw_owners, raw_source, layer_seed) in enumerate(
+            zip(
+                selected_experts,
+                slot_to_logical,
+                owner_slots,
+                source_values,
+                layer_seeds,
+                strict=True,
+            )
+        ):
+            selected = raw_selected.to(torch.long)
+            original_selected_ndim = selected.ndim
+            if selected.ndim == 1:
+                selected = selected.unsqueeze(-1)
+            if selected.ndim != 2:
+                raise ValueError(
+                    f"selected_experts[{layer_index}] must have rank 1 or 2, got shape={tuple(selected.shape)}."
+                )
+            device = selected.device
+            host_layout = raw_layout.detach().to(device="cpu", dtype=torch.long).clone()
+            host_owners = raw_owners.detach().to(device="cpu", dtype=torch.long).reshape(-1).clone()
+            if host_layout.numel() != self.ep_size * self.slots_per_rank:
+                raise ValueError("A batched slot_to_logical does not match ep_size * slots_per_rank.")
+            if bool((host_layout < 0).any().item()):
+                raise ValueError("plan_layers currently requires initialized steady-state layouts.")
+            if isinstance(raw_source, int):
+                uniform_source_rank = int(raw_source)
+                sources = torch.full(
+                    (selected.shape[0],),
+                    uniform_source_rank,
+                    dtype=torch.long,
+                    device=device,
+                )
+            else:
+                uniform_source_rank = None
+                sources = raw_source.to(device=device, dtype=torch.long, non_blocking=True).reshape(-1)
+            if sources.numel() != selected.shape[0]:
+                raise ValueError("A batched source_ranks tensor does not match its local token count.")
+            ordinals = torch.arange(selected.shape[0], dtype=torch.long, device=device)
+            all_slots = torch.arange(host_layout.numel(), dtype=torch.long)
+            owner_mask = torch.zeros((host_layout.numel(),), dtype=torch.bool)
+            owner_mask.scatter_(0, host_owners, True)
+            rows_by_kind = []
+            if max(0, int(max_swaps)) > 0:
+                rows_by_kind.append(self._swap_rows(host_layout, host_owners))
+            if max(0, int(max_replicas)) > 0:
+                cover_slots = all_slots[(~owner_mask) & (host_layout >= 0)]
+                rows_by_kind.append(self._cover_rows(host_layout, host_owners, cover_slots))
+            nonempty_rows = [value for value in rows_by_kind if value.numel()]
+            host_rows = torch.cat(nonempty_rows, dim=0) if nonempty_rows else torch.empty((0, 5), dtype=torch.long)
+            host_copy_slots = self._copy_table(host_layout, int(host_owners.numel()))
+            contexts.append(
+                {
+                    "selected": selected,
+                    "original_selected_ndim": original_selected_ndim,
+                    "host_layout": host_layout,
+                    "host_owners": host_owners,
+                    "layout": host_layout.to(device=device, non_blocking=True),
+                    "owners": host_owners.to(device=device, non_blocking=True),
+                    "host_rows": host_rows,
+                    "rows": host_rows.to(device=device, non_blocking=True),
+                    "copy_slots": host_copy_slots.to(device=device, non_blocking=True),
+                    "sources": sources,
+                    "uniform_source_rank": uniform_source_rank,
+                    "ordinals": ordinals,
+                    "layer_seed": int(layer_seed),
+                }
+            )
+        route_stats_ms = (time.perf_counter() - candidate_started) * 1000.0
+
+        score_started = time.perf_counter()
+        prepared_layers = self._prepare_independent_layers(
+            contexts,
+            step=step,
+            include_assignment_counts=include_assignments,
+            include_pair_interactions=not self.adaptive_topk,
+            include_pair_bounds=self.adaptive_topk and self.adaptive_topk_strict_certificate,
+        )
+        adaptive_available = self.adaptive_topk and self._adaptive_fast_path_available_on_all_ranks(prepared_layers)
+        if adaptive_available:
+            scored_layers, candidate_index_maps, adaptive_stats = self._adaptive_score_layers(
+                prepared_layers,
+                contexts,
+                communication_scales=scales,
+                forward_compute_per_assignment=compute_slopes,
+                forward_compute_constant=compute_constants,
+            )
+            self.last_adaptive_topk_stats = adaptive_stats
+        else:
+            if self.adaptive_topk:
+                prepared_layers = self._prepare_independent_layers(
+                    contexts,
+                    step=step,
+                    include_assignment_counts=include_assignments,
+                    include_pair_interactions=True,
+                    include_pair_bounds=False,
+                )
+            scored_layers = self._score_prepared_layers(
+                prepared_layers,
+                communication_scales=scales,
+                forward_compute_per_assignment=compute_slopes,
+                forward_compute_constant=compute_constants,
+            )
+            candidate_index_maps = [
+                torch.arange(
+                    context["rows"].shape[0],
+                    dtype=torch.long,
+                    device=context["rows"].device,
+                )
+                for context in contexts
+            ]
+            self.last_adaptive_topk_stats = (
+                {
+                    "enabled": False,
+                    "reason": "statistical unary fast path unavailable on at least one EP rank",
+                }
+                if self.adaptive_topk
+                else {"enabled": False}
+            )
+        score_ms = (time.perf_counter() - score_started) * 1000.0
+
+        decision_started = time.perf_counter()
+        candidate_counts = [int(scored.total.numel()) - 1 for scored in scored_layers]
+        maximum_candidates = max(1, max(candidate_counts))
+        device = scored_layers[0].communication.device
+        padded_total = torch.full(
+            (layer_count, maximum_candidates),
+            torch.inf,
+            dtype=scored_layers[0].communication.dtype,
+            device=device,
+        )
+        for layer_index, (scored, candidate_count) in enumerate(zip(scored_layers, candidate_counts, strict=True)):
+            if candidate_count:
+                padded_total[layer_index, :candidate_count] = scored.total[1:]
+        best_positions = padded_total.argmin(dim=1)
+        best_indices = torch.stack(
+            [
+                candidate_index_maps[layer_index][best_positions[layer_index]]
+                if candidate_counts[layer_index]
+                else torch.full((), -1, dtype=torch.long, device=device)
+                for layer_index in range(layer_count)
+            ]
+        )
+        has_candidate = torch.tensor(
+            [count > 0 for count in candidate_counts],
+            dtype=torch.bool,
+            device=device,
+        )
+        baseline_metrics = []
+        candidate_metrics = []
+        for layer_index, scored in enumerate(scored_layers):
+            metrics = torch.stack(
+                (
+                    scored.communication,
+                    scored.compute,
+                    scored.communication_model_units,
+                    scored.peak_rank.to(scored.communication.dtype),
+                    scored.peak_compute_rank.to(scored.communication.dtype),
+                    scored.selected_dim.to(scored.communication.dtype),
+                ),
+                dim=1,
+            )
+            baseline_metrics.append(metrics[0])
+            candidate_metrics.append(
+                metrics[best_positions[layer_index] + 1] if candidate_counts[layer_index] else metrics[0]
+            )
+        decision = torch.cat(
+            (
+                torch.where(has_candidate, best_indices, torch.full_like(best_indices, -1))
+                .to(scored_layers[0].communication.dtype)
+                .view(-1, 1),
+                torch.stack(baseline_metrics),
+                torch.stack(candidate_metrics),
+            ),
+            dim=1,
+        )
+        decision_rows = decision.detach().to(device="cpu").tolist()
+        decision_sync_ms = (time.perf_counter() - decision_started) * 1000.0
+
+        finalization_started = time.perf_counter()
+        plans: list[PlacementPlan] = []
+        per_layer_planning_ms = (time.perf_counter() - started) * 1000.0 / layer_count
+        for context, prepared, decision_row in zip(
+            contexts,
+            prepared_layers,
+            decision_rows,
+            strict=True,
+        ):
+            winner_index = int(decision_row[0])
+            baseline_cost = self._placement_cost_from_values(decision_row[1:7])
+            candidate_cost = self._placement_cost_from_values(decision_row[7:13])
+            final_cost = baseline_cost
+            host_layout = context["host_layout"]
+            host_owners = context["host_owners"]
+            final_host_layout = host_layout.clone()
+            final_host_owners = host_owners.clone()
+            actions: tuple[PlacementAction, ...] = ()
+            final_physical = None
+            if winner_index >= 0 and candidate_cost.total < baseline_cost.total:
+                host_row = context["host_rows"][winner_index]
+                action = self._placement_action(host_row.tolist())
+                actions = (action,)
+                final_cost = candidate_cost
+                if action.kind == "swap":
+                    final_host_layout[action.src_slot] = action.dst_logical
+                    final_host_layout[action.dst_slot] = action.src_logical
+                    final_host_owners[action.src_logical], final_host_owners[action.dst_logical] = (
+                        host_owners[action.dst_logical],
+                        host_owners[action.src_logical],
+                    )
+                else:
+                    final_host_layout[action.dst_slot] = action.src_logical
+                if not skip_final_route_update:
+                    row = context["rows"][winner_index]
+                    if prepared.route_tables is not None:
+                        final_physical = self._apply_statistical_action_routes(
+                            context["selected"],
+                            row,
+                            winner_index,
+                            prepared.baseline_physical_routes,
+                            prepared.route_hashes,
+                            prepared.route_tables,
+                        )
+                    else:
+                        final_physical = self._apply_action_routes(
+                            context["selected"],
+                            context["layout"],
+                            row,
+                            prepared.baseline_physical_routes,
+                            source_ranks=context["sources"],
+                            token_ordinals=context["ordinals"],
+                            route_hashes=prepared.route_hashes,
+                            step=step,
+                            layer_seed=context["layer_seed"],
+                            num_experts=int(context["owners"].numel()),
+                        )
+            if not skip_final_route_update and final_physical is None:
+                final_physical = prepared.baseline_physical_routes
+            if final_physical is not None and int(context["original_selected_ndim"]) == 1:
+                final_physical = final_physical.squeeze(-1)
+            chose_swap = bool(actions) and actions[0].kind == "swap"
+            chose_cover = bool(actions) and not chose_swap
+            plans.append(
+                PlacementPlan(
+                    actions=actions,
+                    initial_layout=tuple(int(value) for value in host_layout.tolist()),
+                    final_layout=tuple(int(value) for value in final_host_layout.tolist()),
+                    baseline_cost=baseline_cost,
+                    final_cost=final_cost,
+                    swap_rounds=int(chose_swap),
+                    replica_rounds=int(chose_cover),
+                    planning_ms=per_layer_planning_ms,
+                    route_stats_ms=route_stats_ms / layer_count,
+                    swap_ms=score_ms / layer_count if chose_swap else 0.0,
+                    replica_ms=score_ms / layer_count if chose_cover else 0.0,
+                    swap_score_ms=score_ms / layer_count,
+                    swap_update_ms=0.0,
+                    swap_collective_ms=0.0,
+                    replica_score_ms=0.0,
+                    replica_update_ms=0.0,
+                    replica_collective_ms=0.0,
+                    decision_sync_ms=decision_sync_ms / layer_count,
+                    finalization_ms=0.0,
+                    algorithm_version=GREEDY_COVER_ALGORITHM_VERSION,
+                    local_physical_routes=final_physical,
+                    final_owner_slots=tuple(int(value) for value in final_host_owners.tolist()),
+                )
+            )
+        finalization_ms = (time.perf_counter() - finalization_started) * 1000.0
+        if finalization_ms > 0.0:
+            replacement = []
+            for plan in plans:
+                values = vars(plan).copy()
+                values["finalization_ms"] = finalization_ms / layer_count
+                replacement.append(PlacementPlan(**values))
+            plans = replacement
+        return plans
 
     def plan(
         self,
@@ -909,8 +2477,10 @@ class GreedyCommunicationPlanner:
         if host_layout.numel() != self.ep_size * self.slots_per_rank:
             raise ValueError("slot_to_logical does not match hierarchy.ep_size * slots_per_rank.")
         if isinstance(source_ranks, int):
-            sources = torch.full((selected.shape[0],), int(source_ranks), dtype=torch.long, device=device)
+            uniform_source_rank = int(source_ranks)
+            sources = torch.full((selected.shape[0],), uniform_source_rank, dtype=torch.long, device=device)
         else:
+            uniform_source_rank = None
             sources = source_ranks.to(device=device, dtype=torch.long, non_blocking=True).reshape(-1)
         ordinals = (
             torch.arange(selected.shape[0], dtype=torch.long, device=device)
@@ -930,8 +2500,14 @@ class GreedyCommunicationPlanner:
         owner_mask.scatter_(0, host_owners, True)
         empty_slots = torch.nonzero(host_layout < 0, as_tuple=False).flatten()
         initializing = empty_slots.numel() > 0 and max(0, int(max_replicas)) > 0
+        fill_limit = min(int(empty_slots.numel()), max(0, int(max_replicas))) if initializing else 0
         if initializing:
             host_rows = self._cover_rows(host_layout, host_owners, empty_slots)
+            if host_rows.numel() == 0 or not self._can_complete_empty_initialization(host_layout, fill_limit):
+                raise ValueError(
+                    "Empty expert slots cannot be initialized under the current max_copies and rank-local "
+                    "duplicate constraints."
+                )
         else:
             rows_by_kind = []
             if max(0, int(max_swaps)) > 0:
@@ -940,100 +2516,258 @@ class GreedyCommunicationPlanner:
                 cover_slots = all_slots[(~owner_mask) & (host_layout >= 0)]
                 rows_by_kind.append(self._cover_rows(host_layout, host_owners, cover_slots))
             nonempty_rows = [value for value in rows_by_kind if value.numel()]
-            host_rows = (
-                torch.cat(nonempty_rows, dim=0)
-                if nonempty_rows
-                else torch.empty((0, 5), dtype=torch.long)
-            )
+            host_rows = torch.cat(nonempty_rows, dim=0) if nonempty_rows else torch.empty((0, 5), dtype=torch.long)
+
+        host_copy_slots = self._copy_table(host_layout, int(host_owners.numel()))
+        copy_slots = host_copy_slots.to(device=device, non_blocking=True)
         layout = host_layout.to(device=device, non_blocking=True)
         owners = host_owners.to(device=device, non_blocking=True)
         rows = host_rows.to(device=device, non_blocking=True)
+        affected_groups = (
+            self._candidate_affected_groups(copy_slots, rows)
+            if self.compact_candidate_collective and self.reducer is not None
+            else None
+        )
         route_stats_ms = (time.perf_counter() - candidate_started) * 1000.0
 
         score_started = time.perf_counter()
-        scored = self._score_actions(
-            selected,
-            layout,
-            rows,
-            source_ranks=sources,
-            token_ordinals=ordinals,
-            step=step,
-            layer_seed=layer_seed,
-            num_experts=int(owners.numel()),
-        )
-        score_ms = (time.perf_counter() - score_started) * 1000.0
-        baseline_cost = self._placement_cost(scored, 0)
-        actions: tuple[PlacementAction, ...] = ()
-        final_layout_tensor = layout
-        final_owners = owners
-        final_cost = baseline_cost
-        final_physical = scored.baseline_physical_routes
-        finalization_started = time.perf_counter()
-
-        if initializing and rows.numel():
-            fill_limit = min(int(empty_slots.numel()), max(0, int(max_replicas)))
-            actions = self._select_empty_actions(rows, scored.communication[1:], layout, fill_limit)
-            if actions:
-                final_layout_tensor = layout.clone()
-                for action in actions:
-                    final_layout_tensor[action.dst_slot] = action.src_logical
-                candidate_physical = assign_tokens_to_copies_greedy(
-                    selected,
-                    final_layout_tensor,
-                    slots_per_rank=self.slots_per_rank,
-                    source_ranks=sources,
-                    hierarchy_group_sizes=self.hierarchy.group_sizes,
-                    num_experts=int(owners.numel()),
-                    token_ordinals=ordinals,
-                    step=step,
-                    layer_seed=layer_seed,
-                    max_copies=self.max_copies,
+        candidate_index_map = torch.arange(rows.shape[0], dtype=torch.long, device=device)
+        if self.adaptive_topk and not initializing and rows.numel():
+            prepared = self._prepare_action_counts(
+                selected,
+                layout,
+                rows,
+                source_ranks=sources,
+                uniform_source_rank=uniform_source_rank,
+                copy_slots=copy_slots,
+                affected_groups=affected_groups,
+                token_ordinals=ordinals,
+                step=step,
+                layer_seed=layer_seed,
+                num_experts=int(owners.numel()),
+                include_pair_interactions=False,
+                include_pair_bounds=self.adaptive_topk_strict_certificate,
+            )
+            context = {
+                "rows": rows,
+            }
+            adaptive_available = self._adaptive_fast_path_available_on_all_ranks([prepared])
+            if adaptive_available:
+                adaptive_scored, candidate_maps, adaptive_stats = self._adaptive_score_layers(
+                    [prepared],
+                    [context],
+                    communication_scales=[self.communication_scale],
+                    forward_compute_per_assignment=[self.forward_compute_per_assignment],
+                    forward_compute_constant=[self.forward_compute_constant],
                 )
-                candidate_counts = _reduce_sum(self._local_packed_counts(candidate_physical), self.reducer)
-                candidate_comm, candidate_peak, candidate_dim = self._communication_cost(candidate_counts)
-                candidate_scored = _ScoredLayouts(
-                    communication=candidate_comm,
-                    peak_rank=candidate_peak,
-                    selected_dim=candidate_dim,
-                    baseline_physical_routes=candidate_physical,
-                )
-                candidate_cost = self._placement_cost(candidate_scored, 0)
-                if candidate_cost.communication <= baseline_cost.communication:
-                    final_cost = candidate_cost
-                    final_physical = candidate_physical
-        elif rows.numel():
-            candidate_costs = scored.communication[1:]
-            best_index = candidate_costs.argmin()
-            best_cost = candidate_costs.index_select(0, best_index.view(1))[0]
-            if bool((best_cost < scored.communication[0]).item()):
-                row = rows.index_select(0, best_index.view(1))[0]
-                action = self._placement_action(row.detach().to(device="cpu").tolist())
-                actions = (action,)
-                final_layout_tensor = self._apply_rows(layout, row.view(1, -1))[0]
-                if action.kind == "swap":
-                    final_owners = owners.clone()
-                    logical_pair = torch.tensor(
-                        (action.src_logical, action.dst_logical), dtype=torch.long, device=device
-                    )
-                    final_owners.scatter_(0, logical_pair, owners.index_select(0, logical_pair).flip(0))
-                final_cost = self._placement_cost(scored, int(best_index.item()) + 1)
-                final_physical = self._apply_action_routes(
+                scored = adaptive_scored[0]
+                candidate_index_map = candidate_maps[0]
+                self.last_adaptive_topk_stats = adaptive_stats
+            else:
+                prepared = self._prepare_action_counts(
                     selected,
                     layout,
-                    row,
-                    scored.baseline_physical_routes,
+                    rows,
                     source_ranks=sources,
+                    uniform_source_rank=uniform_source_rank,
+                    copy_slots=copy_slots,
+                    affected_groups=affected_groups,
                     token_ordinals=ordinals,
                     step=step,
                     layer_seed=layer_seed,
                     num_experts=int(owners.numel()),
+                    include_pair_interactions=True,
+                    include_pair_bounds=False,
                 )
+                scored = self._score_prepared_layers(
+                    [prepared],
+                    communication_scales=[self.communication_scale],
+                    forward_compute_per_assignment=[self.forward_compute_per_assignment],
+                    forward_compute_constant=[self.forward_compute_constant],
+                )[0]
+                self.last_adaptive_topk_stats = {
+                    "enabled": False,
+                    "reason": "statistical unary fast path unavailable on at least one EP rank",
+                }
+        else:
+            scored = self._score_actions(
+                selected,
+                layout,
+                rows,
+                source_ranks=sources,
+                uniform_source_rank=uniform_source_rank,
+                copy_slots=copy_slots,
+                affected_groups=affected_groups,
+                token_ordinals=ordinals,
+                step=step,
+                layer_seed=layer_seed,
+                num_experts=int(owners.numel()),
+            )
+            self.last_adaptive_topk_stats = {"enabled": False}
+        score_ms = (time.perf_counter() - score_started) * 1000.0
+        baseline_cost = self._placement_cost(scored, 0) if initializing or rows.numel() == 0 else None
+        actions: tuple[PlacementAction, ...] = ()
+        final_layout_tensor = layout
+        final_cost = baseline_cost
+        final_physical = scored.baseline_physical_routes
+        final_host_layout = host_layout.clone()
+        final_host_owners = host_owners.clone()
+        finalization_started = time.perf_counter()
 
+        if initializing:
+            fill_actions: list[PlacementAction] = []
+            working_host_layout = host_layout.clone()
+            for round_index in range(fill_limit):
+                if round_index:
+                    candidate_started = time.perf_counter()
+                    remaining_slots = torch.nonzero(working_host_layout < 0, as_tuple=False).flatten()
+                    host_rows = self._cover_rows(working_host_layout, host_owners, remaining_slots)
+                    host_copy_slots = self._copy_table(working_host_layout, int(host_owners.numel()))
+                    copy_slots = host_copy_slots.to(device=device, non_blocking=True)
+                    rows = host_rows.to(device=device, non_blocking=True)
+                    affected_groups = (
+                        self._candidate_affected_groups(copy_slots, rows)
+                        if self.compact_candidate_collective and self.reducer is not None
+                        else None
+                    )
+                    route_stats_ms += (time.perf_counter() - candidate_started) * 1000.0
+                    score_started = time.perf_counter()
+                    scored = self._score_actions(
+                        selected,
+                        layout,
+                        rows,
+                        source_ranks=sources,
+                        uniform_source_rank=uniform_source_rank,
+                        copy_slots=copy_slots,
+                        affected_groups=affected_groups,
+                        token_ordinals=ordinals,
+                        step=step,
+                        layer_seed=layer_seed,
+                        num_experts=int(owners.numel()),
+                    )
+                    score_ms += (time.perf_counter() - score_started) * 1000.0
+                if rows.numel() == 0:
+                    break
+                best_index = None
+                next_host_layout = None
+                ordered_indices = torch.argsort(scored.total[1:], stable=True).detach().to(device="cpu").tolist()
+                remaining_fills = fill_limit - round_index - 1
+                for candidate_index in ordered_indices:
+                    candidate = host_rows[int(candidate_index)]
+                    proposal = working_host_layout.clone()
+                    proposal[int(candidate[2])] = int(candidate[3])
+                    if self._can_complete_empty_initialization(proposal, remaining_fills):
+                        best_index = int(candidate_index)
+                        next_host_layout = proposal
+                        break
+                if best_index is None or next_host_layout is None:
+                    break
+                row = rows[best_index]
+                action = self._placement_action(row.detach().to(device="cpu").tolist())
+                fill_actions.append(action)
+                final_cost = self._placement_cost(scored, best_index + 1)
+                if scored.route_tables is not None and scored.route_hashes is not None:
+                    final_physical = self._apply_statistical_action_routes(
+                        selected,
+                        row,
+                        best_index,
+                        scored.baseline_physical_routes,
+                        scored.route_hashes,
+                        scored.route_tables,
+                    )
+                else:
+                    final_physical = self._apply_action_routes(
+                        selected,
+                        layout,
+                        row,
+                        scored.baseline_physical_routes,
+                        source_ranks=sources,
+                        token_ordinals=ordinals,
+                        route_hashes=scored.route_hashes,
+                        step=step,
+                        layer_seed=layer_seed,
+                        num_experts=int(owners.numel()),
+                    )
+                final_layout_tensor = self._apply_rows(layout, row.view(1, -1))[0]
+                layout = final_layout_tensor
+                working_host_layout = next_host_layout
+            actions = tuple(fill_actions)
+            if len(actions) != fill_limit:
+                raise RuntimeError(
+                    f"Greedy replica initialization filled {len(actions)} of {fill_limit} requested empty slots."
+                )
+            final_host_layout = working_host_layout
+        elif rows.numel():
+            candidate_costs = scored.total[1:]
+            best_position = candidate_costs.argmin()
+            best_index = candidate_index_map.index_select(0, best_position.view(1))[0]
+            metrics = torch.stack(
+                (
+                    scored.communication,
+                    scored.compute,
+                    scored.communication_model_units,
+                    scored.peak_rank.to(scored.communication.dtype),
+                    scored.peak_compute_rank.to(scored.communication.dtype),
+                    scored.selected_dim.to(scored.communication.dtype),
+                ),
+                dim=1,
+            )
+            metric_indices = torch.stack((torch.zeros_like(best_position), best_position + 1))
+            decision = torch.cat(
+                (
+                    best_index.to(scored.communication.dtype).view(1),
+                    metrics.index_select(0, metric_indices).reshape(-1),
+                )
+            )
+            decision_values = decision.detach().to(device="cpu").tolist()
+            winner_index = int(decision_values[0])
+            baseline_cost = self._placement_cost_from_values(decision_values[1:7])
+            candidate_cost = self._placement_cost_from_values(decision_values[7:13])
+            final_cost = baseline_cost
+            if candidate_cost.total < baseline_cost.total:
+                row = rows.index_select(0, best_index.view(1))[0]
+                host_row = host_rows[winner_index]
+                action = self._placement_action(host_row.tolist())
+                actions = (action,)
+                final_cost = candidate_cost
+                if action.kind == "swap":
+                    final_host_layout[action.src_slot] = action.dst_logical
+                    final_host_layout[action.dst_slot] = action.src_logical
+                    final_host_owners[action.src_logical], final_host_owners[action.dst_logical] = (
+                        host_owners[action.dst_logical],
+                        host_owners[action.src_logical],
+                    )
+                else:
+                    final_host_layout[action.dst_slot] = action.src_logical
+                if scored.route_tables is not None and scored.route_hashes is not None:
+                    final_physical = self._apply_statistical_action_routes(
+                        selected,
+                        row,
+                        winner_index,
+                        scored.baseline_physical_routes,
+                        scored.route_hashes,
+                        scored.route_tables,
+                    )
+                else:
+                    final_physical = self._apply_action_routes(
+                        selected,
+                        layout,
+                        row,
+                        scored.baseline_physical_routes,
+                        source_ranks=sources,
+                        token_ordinals=ordinals,
+                        route_hashes=scored.route_hashes,
+                        step=step,
+                        layer_seed=layer_seed,
+                        num_experts=int(owners.numel()),
+                    )
+
+        assert baseline_cost is not None and final_cost is not None
         if original_selected_ndim == 1:
             final_physical = final_physical.squeeze(-1)
-        initial_layout = tuple(int(value) for value in layout.detach().to(device="cpu").tolist())
-        final_layout = tuple(int(value) for value in final_layout_tensor.detach().to(device="cpu").tolist())
-        final_owner_slots = tuple(int(value) for value in final_owners.detach().to(device="cpu").tolist())
+        initial_layout = tuple(int(value) for value in host_layout.tolist())
+        final_layout = tuple(int(value) for value in final_host_layout.tolist())
+        final_owner_slots = tuple(int(value) for value in final_host_owners.tolist())
         finalization_ms = (time.perf_counter() - finalization_started) * 1000.0
         planning_ms = (time.perf_counter() - started) * 1000.0
         chose_swap = bool(actions) and actions[0].kind == "swap"
@@ -1065,6 +2799,8 @@ class GreedyCommunicationPlanner:
 
 
 __all__ = [
+    "GREEDY_COMMUNICATION_PHASE_MULTIPLIER",
+    "GREEDY_COMPUTE_PHASE_MULTIPLIER",
     "GREEDY_COVER_ALGORITHM_VERSION",
     "GreedyCommunicationPlanner",
     "assign_tokens_to_copies_greedy",

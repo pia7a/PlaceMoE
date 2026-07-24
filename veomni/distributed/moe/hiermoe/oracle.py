@@ -33,6 +33,8 @@ from .topology import Hierarchy
 
 _SNAPSHOT_FORMAT = "veomni.hiermoe.route_snapshot"
 _SNAPSHOT_VERSION = 1
+_LOCAL_SNAPSHOT_FORMAT = "veomni.hiermoe.local_route"
+_LOCAL_SNAPSHOT_VERSION = 1
 _CAPTURE_PATH_TEMPLATE = os.environ.get("VEOMNI_HIERMOE_ORACLE_CAPTURE_PATH", "").strip()
 _CAPTURE_CALLS: dict[tuple[int, str], int] = {}
 _CAPTURED: set[tuple[int, str, int]] = set()
@@ -241,6 +243,91 @@ def route_capture_enabled() -> bool:
     return bool(_CAPTURE_PATH_TEMPLATE)
 
 
+def route_capture_mode() -> str:
+    """Return the configured route capture mode."""
+
+    mode = os.environ.get("VEOMNI_HIERMOE_ORACLE_CAPTURE_MODE", "global").strip().lower()
+    if mode not in {"global", "local"}:
+        raise ValueError(f"VEOMNI_HIERMOE_ORACLE_CAPTURE_MODE must be either 'global' or 'local', got {mode!r}.")
+    return mode
+
+
+def _layer_index(layer_key: str) -> int:
+    matches = re.findall(r"(?:layers?|layer)\.(\d+)(?:\.|$)", layer_key)
+    return int(matches[-1]) if matches else -1
+
+
+def _capture_output_path(
+    raw_path: str,
+    *,
+    step: int,
+    layer_key: str,
+    call_index: int,
+    global_rank: int,
+    ep_rank: int,
+) -> Path:
+    return Path(
+        raw_path.format(
+            step=int(step),
+            layer=re.sub(r"[^A-Za-z0-9_.-]+", "_", layer_key),
+            layer_index=_layer_index(layer_key),
+            call=int(call_index),
+            rank=int(global_rank),
+            ep_rank=int(ep_rank),
+        )
+    )
+
+
+def _save_local_route_snapshot(
+    *,
+    routes: torch.Tensor,
+    path: Path,
+    global_rank: int,
+    ep_rank: int,
+    ep_size: int,
+    num_experts: int,
+    hidden_size: int,
+    bytes_per_element: int,
+    hierarchy: Hierarchy,
+    logical_to_physical: torch.Tensor,
+    slot_to_logical: torch.Tensor | None,
+    layer_key: str,
+    step: int,
+    call_index: int,
+    smooth_max_gamma: float,
+    selected_dim: int,
+) -> Path:
+    output = path.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "format": _LOCAL_SNAPSHOT_FORMAT,
+            "version": _LOCAL_SNAPSHOT_VERSION,
+            "routes": _normalize_routes(routes).to(torch.int32),
+            "global_rank": int(global_rank),
+            "ep_rank": int(ep_rank),
+            "ep_size": int(ep_size),
+            "num_experts": int(num_experts),
+            "hidden_size": int(hidden_size),
+            "bytes_per_element": int(bytes_per_element),
+            "hierarchy_group_sizes": list(hierarchy.group_sizes),
+            "hierarchy_source": hierarchy.source,
+            "logical_to_physical": logical_to_physical.detach().to(device="cpu", dtype=torch.long),
+            "slot_to_logical": (
+                None if slot_to_logical is None else slot_to_logical.detach().to(device="cpu", dtype=torch.long)
+            ),
+            "layer": _layer_index(layer_key),
+            "layer_key": layer_key,
+            "step": int(step),
+            "call_index": int(call_index),
+            "smooth_max_gamma": float(smooth_max_gamma),
+            "selected_dim": int(selected_dim),
+        },
+        output,
+    )
+    return output
+
+
 def maybe_capture_route_snapshot(
     *,
     selected_experts: torch.Tensor,
@@ -252,6 +339,7 @@ def maybe_capture_route_snapshot(
     layer_key: str | None,
     step: int,
     logical_to_physical: torch.Tensor | None = None,
+    slot_to_logical: torch.Tensor | None = None,
     smooth_max_gamma: float = 10.0,
     selected_dim: int = 1,
 ) -> Path | None:
@@ -288,6 +376,51 @@ def maybe_capture_route_snapshot(
     initialized = dist.is_initialized()
     ep_size = dist.get_world_size(ep_group) if ep_group is not None and initialized else 1
     global_rank = dist.get_rank() if initialized else 0
+    ep_rank = dist.get_rank(ep_group) if ep_group is not None and initialized else 0
+    mapping = (
+        logical_to_physical.detach().to(device="cpu", dtype=torch.long)
+        if logical_to_physical is not None
+        else torch.arange(num_experts, dtype=torch.long)
+    )
+    mode = route_capture_mode()
+    if mode == "local":
+        if "{rank" not in raw_path and "{ep_rank" not in raw_path:
+            raise ValueError(
+                "Local HierMoE route capture path must contain a {rank} or {ep_rank} field "
+                "so ranks on the same host do not overwrite each other."
+            )
+        output = _capture_output_path(
+            raw_path,
+            step=step,
+            layer_key=layer_key,
+            call_index=call_index,
+            global_rank=global_rank,
+            ep_rank=ep_rank,
+        )
+        return _save_local_route_snapshot(
+            routes=local_routes,
+            path=output,
+            global_rank=global_rank,
+            ep_rank=ep_rank,
+            ep_size=ep_size,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            bytes_per_element=bytes_per_element,
+            hierarchy=hierarchy,
+            logical_to_physical=mapping,
+            slot_to_logical=slot_to_logical,
+            layer_key=layer_key,
+            step=step,
+            call_index=call_index,
+            smooth_max_gamma=smooth_max_gamma,
+            selected_dim=selected_dim,
+        )
+
+    if slot_to_logical is not None:
+        raise RuntimeError(
+            "Global HierMoE route capture does not support redundant expert slots; "
+            "use VEOMNI_HIERMOE_ORACLE_CAPTURE_MODE=local."
+        )
     if ep_size == 1:
         routes_by_rank = (local_routes.cpu(),)
     else:
@@ -316,17 +449,13 @@ def maybe_capture_route_snapshot(
 
     if global_rank != 0:
         return None
-    mapping = (
-        logical_to_physical.detach().to(device="cpu", dtype=torch.long)
-        if logical_to_physical is not None
-        else torch.arange(num_experts, dtype=torch.long)
-    )
-    output = Path(
-        raw_path.format(
-            step=int(step),
-            layer=re.sub(r"[^A-Za-z0-9_.-]+", "_", layer_key),
-            call=call_index,
-        )
+    output = _capture_output_path(
+        raw_path,
+        step=step,
+        layer_key=layer_key,
+        call_index=call_index,
+        global_rank=global_rank,
+        ep_rank=ep_rank,
     )
     return save_route_snapshot(
         RouteSnapshot(

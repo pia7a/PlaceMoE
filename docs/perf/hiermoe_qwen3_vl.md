@@ -60,6 +60,9 @@ setting as `HIERMOE_COMMUNICATION_MODE`.
 - `hiermoe_exact_p1` evaluates every expert pair with the paper-exact,
   duplicate-free hierarchical communication objective, and applies the globally
   best pair only when its cost is strictly lower.
+- `hiermoe_greedy_cover_p1` evaluates all swap and occupied-cover actions from
+  exact compact route statistics in layer mode, then applies the single action
+  with the lowest strictly improving communication-plus-compute cost.
 - `legacy_batched` keeps the historical batched P1/P4 estimator while scoring
   the complete `C(num_experts, 2)` pair set. P4 then greedily chooses at most
   four disjoint improving pairs.
@@ -166,6 +169,72 @@ dispatch and therefore requires `gradient_accumulation_steps == 1`. Step 0
 collects the raw communication and expert-compute calibration sample without
 changing placement; later decisions use the most recent completed sample and
 do not smooth it.
+
+### Exact greedy swap/cover joint cost
+
+The redundant-expert selector uses
+
+`T = 4 * communication_scale * Tcomm_model + 3 * (compute_slope * peak_assignments + compute_constant)`.
+
+`Tcomm_model` is the predicted cost of one dispatch-or-combine phase.
+The explicit factor four represents forward dispatch/combine and backward
+dispatch/combine. First-step calibration keeps only a residual model correction:
+
+`communication_scale = (forward_dispatch + forward_combine) / (2 * Tcomm_model)`.
+
+`peak_assignments` is the largest non-deduplicated token-expert assignment
+count on any EP rank. Top-k duplicates therefore count multiple times for
+compute even though communication statistics count each token-group demand
+once. The first completed step profiles every ready MoE layer. It fits one
+non-negative affine compute model across those layers and calibrates the
+communication scale per layer; the initial empty-slot fill then uses the
+calibrated joint objective.
+
+Candidate computation does not remap every token. The exact hash-state tables
+already built for communication provide the old and new physical rank of each
+affected logical expert. An expert-by-hash-state multiplicity table converts
+those ranks into four scatter-add assignment deltas for swap or cover. The
+candidate communication columns and rank-assignment columns share one
+all-reduce (or one reduce-scatter/all-gather candidate collective). All
+candidates remain independent and parallel, and only the winning action
+updates the physical token routes.
+
+On the EP32 48-layer route replay, full candidate collectives, 11,744 actions
+per layer, two warmups, and seven measured iterations, communication-only v6
+had a 1,749.03 ms median. Enabling exact assignment cost had a 1,922.45 ms
+median, or 40.05 ms/layer. The incremental cost was 173.42 ms for all 48
+layers (3.61 ms/layer, 9.92%). The explicit phase multiplier made the modeled
+baseline and final communication costs exactly four times their v5 values
+without changing communication-only actions or speedup. The nonzero compute
+test coefficient changed 8 of 48 tie-sensitive joint decisions.
+
+Route capture supports `global` and `local` modes through
+`VEOMNI_HIERMOE_ORACLE_CAPTURE_MODE`. The default `global` mode gathers all EP
+routes and writes one combined snapshot. The `local` mode issues no route
+collective and writes one file per rank, so it is suitable for collecting
+consecutive steps from a large EP job. A local capture path must contain
+`{rank}` or `{ep_rank}` and may also contain `{step}`, `{layer}`,
+`{layer_index}`, and `{call}`. Local snapshots include the logical top-k
+routes, owner mapping, redundant slot layout when present, and step/layer/rank
+metadata.
+
+The four-node EP32 launcher enables consecutive local capture without changing
+the default training path:
+
+```bash
+E2E_VARIANT=dedup \
+HIERMOE_CAPTURE_ROUTES=1 \
+MAX_STEPS_OVERRIDE=8 \
+RUN_SUFFIX=route_history_8step \
+MASTER_PORT=29977 \
+bash scripts/profile/launch_hiermoe_greedy_e2e_4node.sh
+```
+
+This writes
+`route_captures/<run-name>/stepXXXX/layerYY_call0_rankZZ.pt` on each host.
+Use a dedicated capture run because the device-to-host copies and filesystem
+writes intentionally perturb end-to-end timing even though local mode adds no
+HCCL route collective.
 
 Redundant-gradient synchronization writes the same summed logical gradient to
 every physical copy so replicas stay identical after the optimizer update.

@@ -22,7 +22,7 @@ from ....utils.device import get_device_id, get_device_type
 from ....utils.import_utils import is_torch_npu_available
 from ..comm import all_to_all, all_to_all_pair
 from ..timing import current_moe_timing_context, moe_timing_event, record_moe_timing_span
-from .oracle import maybe_capture_route_snapshot, route_capture_enabled
+from .oracle import maybe_capture_route_snapshot, route_capture_enabled, route_capture_mode
 from .state import get_hiermoe_state
 
 
@@ -1689,14 +1689,16 @@ def rank_dedup_dispatch(
         and route_capture_enabled()
     ):
         capture_mapping = None
+        capture_slot_layout = None
         if state.expert_swap_manager is not None and layer_key is not None:
             layer = state.expert_swap_manager.layers.get(layer_key)
-            if layer is not None and layer.slot_layout_enabled:
+            if layer is not None and layer.slot_layout_enabled and route_capture_mode() != "local":
                 raise RuntimeError(
-                    "HierMoE route-oracle capture requires a baseline run without redundant expert slots."
+                    "Global HierMoE route-oracle capture requires a baseline run without redundant expert slots."
                 )
             if layer is not None:
                 capture_mapping = layer.logical_to_physical
+                capture_slot_layout = layer.slot_to_logical
         maybe_capture_route_snapshot(
             selected_experts=selected_experts,
             num_experts=num_experts,
@@ -1707,6 +1709,7 @@ def rank_dedup_dispatch(
             layer_key=layer_key,
             step=state.current_step,
             logical_to_physical=capture_mapping,
+            slot_to_logical=capture_slot_layout,
             smooth_max_gamma=(
                 state.expert_swap_manager.smooth_max_gamma if state.expert_swap_manager is not None else 10.0
             ),

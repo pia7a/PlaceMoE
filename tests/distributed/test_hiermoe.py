@@ -363,6 +363,133 @@ def test_current_planner_disables_collective_digest(monkeypatch):
     assert not hasattr(manager, "_layer_has_accumulated_grad")
 
 
+def test_compute_calibration_fits_nonnegative_affine_model():
+    samples = [(100.0, 7.0), (200.0, 12.0), (300.0, 17.0), (400.0, 22.0)]
+
+    slope, constant = expert_swap_module.ExpertSwapManager._fit_nonnegative_compute_model(samples)
+
+    assert slope == pytest.approx(0.05)
+    assert constant == pytest.approx(2.0)
+
+
+def test_greedy_calibration_uses_first_step_peak_assignment_profile(monkeypatch):
+    manager = expert_swap_module.ExpertSwapManager(
+        ep_group=None,
+        ep_size=2,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=1,
+        redundant_slot_increment_per_device=1,
+        max_replica_rounds=1,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=2, group_sizes=(2,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="layer",
+        expert_swap_selector="hiermoe_greedy_cover_p1",
+    )
+
+    class _TimingEvent:
+        event = None
+
+        def __init__(self, elapsed_ms):
+            self.elapsed_ms = elapsed_ms
+
+        def elapsed_time(self, _end):
+            return self.elapsed_ms
+
+    for layer_index, (peak_assignments, compute_ms) in enumerate(((100.0, 7.0), (200.0, 12.0))):
+        key = f"layers.{layer_index}.mlp.experts"
+        manager.register_layer(
+            key,
+            _FakeExperts(num_experts=4, local_start=0, local_experts=3, hidden_size=2),
+        )
+        layer = manager.layers[key]
+        layer.latest_hidden_size = 2
+        layer.latest_bytes_per_element = 2
+        layer.pending_timing = expert_swap_module._PendingLayerTiming(
+            step=0,
+            selected_experts=torch.tensor([[0, 1], [2, 3]], dtype=torch.long),
+            slot_to_logical=layer.slot_to_logical.clone(),
+            local_assignment_count=torch.tensor(peak_assignments),
+            dispatch_start=_TimingEvent(2.0),
+            dispatch_end=_TimingEvent(0.0),
+            compute_start=_TimingEvent(compute_ms),
+            compute_end=_TimingEvent(0.0),
+            combine_start=_TimingEvent(3.0),
+            combine_end=_TimingEvent(0.0),
+        )
+
+    fake_planner = SimpleNamespace(
+        score_layout=lambda *_args, **_kwargs: SimpleNamespace(communication_model_units=100.0)
+    )
+    monkeypatch.setattr(manager, "_planner_for_layer", lambda *_args, **_kwargs: fake_planner)
+    monkeypatch.setattr(manager, "_events_ready", lambda _timing: True)
+
+    manager.prepare_calibrations(step=0)
+
+    calibrations = [layer.planner_calibration for layer in manager.layers.values()]
+    assert all(calibration is not None for calibration in calibrations)
+    assert all(calibration.source_step == 0 for calibration in calibrations)
+    assert all(calibration.communication_scale == pytest.approx(0.025) for calibration in calibrations)
+    assert 4.0 * calibrations[0].communication_scale * 100.0 == pytest.approx(10.0)
+    assert all(calibration.forward_compute_per_assignment == pytest.approx(0.05) for calibration in calibrations)
+    assert all(calibration.forward_compute_constant == pytest.approx(2.0) for calibration in calibrations)
+    assert all(layer.pending_timing is None for layer in manager.layers.values())
+    assert not manager.layer_calibration_enabled()
+
+
+def test_greedy_calibration_defers_until_every_ep_rank_is_ready(monkeypatch):
+    manager = expert_swap_module.ExpertSwapManager(
+        ep_group=object(),
+        ep_size=2,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=1,
+        redundant_slot_increment_per_device=1,
+        max_replica_rounds=1,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=2, group_sizes=(2,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="layer",
+        expert_swap_selector="hiermoe_greedy_cover_p1",
+    )
+    key = "layers.0.mlp.experts"
+    manager.register_layer(
+        key,
+        _FakeExperts(num_experts=4, local_start=0, local_experts=3, hidden_size=2),
+    )
+    layer = manager.layers[key]
+    event = SimpleNamespace(event=None)
+    layer.pending_timing = expert_swap_module._PendingLayerTiming(
+        step=0,
+        selected_experts=torch.tensor([[0, 1], [2, 3]], dtype=torch.long),
+        slot_to_logical=layer.slot_to_logical.clone(),
+        local_assignment_count=torch.tensor(4.0),
+        dispatch_start=event,
+        dispatch_end=event,
+        compute_start=event,
+        compute_end=event,
+        combine_start=event,
+        combine_end=event,
+    )
+    consensus_results = iter(((True, True), (False, False)))
+    monkeypatch.setattr(
+        expert_swap_module,
+        "_placement_group_boolean_consensus",
+        lambda *_args, **_kwargs: next(consensus_results),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_planner_for_layer",
+        lambda *_args, **_kwargs: pytest.fail("calibration scoring must wait for every EP rank"),
+    )
+
+    manager.prepare_calibrations(step=0)
+
+    assert layer.planner_calibration is None
+    assert layer.pending_timing is not None
+
+
 def test_hiermoe_env_int_allows_negative_minimum(monkeypatch):
     monkeypatch.setenv("VEOMNI_TEST_ENV_INT", "-1")
     assert expert_swap_module._env_int("VEOMNI_TEST_ENV_INT", 1, minimum=-1) == -1
@@ -1790,7 +1917,8 @@ def test_redundant_slot_mapping_uses_parallel_owner_rank_priority():
     torch.testing.assert_close(mapped, torch.tensor([[2, 5]], dtype=torch.long))
 
 
-def test_greedy_cover_runtime_mapping_matches_planner_nearest_copy_policy():
+@pytest.mark.parametrize("mode", ("layer", "step"))
+def test_greedy_cover_runtime_mapping_matches_planner_nearest_copy_policy(mode):
     manager = expert_swap_module.ExpertSwapManager(
         ep_group=None,
         ep_size=4,
@@ -1802,7 +1930,7 @@ def test_greedy_cover_runtime_mapping_matches_planner_nearest_copy_policy():
         smooth_max_gamma=10.0,
         hierarchy=Hierarchy(ep_size=4, group_sizes=(2, 4), source="test"),
         perf_model=HierMoEPerfModel.default(),
-        expert_swap_mode="layer",
+        expert_swap_mode=mode,
         expert_swap_selector="hiermoe_greedy_cover_p1",
         greedy_max_copies_per_expert=3,
     )
@@ -1835,6 +1963,68 @@ def test_greedy_cover_runtime_mapping_matches_planner_nearest_copy_policy():
         forward_compute_per_assignment=1.0,
     )
     assert planner.max_copies == 3
+
+
+def test_greedy_step_plans_all_historical_layers_before_any_layout_commit(monkeypatch):
+    manager = expert_swap_module.ExpertSwapManager(
+        ep_group=None,
+        ep_size=1,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=1,
+        redundant_slot_increment_per_device=1,
+        max_replica_rounds=1,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=1, group_sizes=(1,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="step",
+        expert_swap_selector="hiermoe_greedy_cover_p1",
+    )
+    layers = []
+    for layer_index in range(3):
+        key = f"layers.{layer_index}.mlp.experts"
+        manager.register_layer(
+            key,
+            _FakeExperts(num_experts=4, local_start=0, local_experts=5, hidden_size=2),
+        )
+        layer = manager.layers[key]
+        layer.slot_to_logical = torch.tensor([0, 1, 2, 3, layer_index % 4], dtype=torch.long)
+        manager._refresh_layer_mapping_from_slots(layer)
+        layer.latest_selected_experts = (
+            torch.empty((0, 2), dtype=torch.long)
+            if layer_index == 2
+            else torch.tensor([[0, 1], [2, 3]], dtype=torch.long)
+        )
+        layer.latest_hidden_size = 2
+        layer.latest_bytes_per_element = 4
+        layers.append(layer)
+
+    events = []
+
+    def fake_plan_layers(_planner, selected, layouts, owners, **kwargs):
+        events.append(("plan", len(selected), kwargs["skip_final_route_update"]))
+        return [
+            SimpleNamespace(
+                local_physical_routes=None,
+                final_layout=tuple(layout.tolist()),
+                final_owner_slots=tuple(owner.tolist()),
+            )
+            for layout, owner in zip(layouts, owners, strict=True)
+        ]
+
+    monkeypatch.setattr(expert_swap_module.GreedyCommunicationPlanner, "plan_layers", fake_plan_layers)
+    monkeypatch.setattr(manager, "_record_plan_metrics", lambda _plan: events.append(("record",)))
+    monkeypatch.setattr(
+        manager,
+        "_execute_placement_plan",
+        lambda layer, _plan, **_kwargs: events.append(("execute", layer.key)) or [],
+    )
+
+    assert manager._plan_historical_layers(layers, step=1) == []
+    assert events[0] == ("plan", 3, True)
+    assert events[1:4] == [("record",)] * 3
+    assert [event[0] for event in events[4:]] == ["execute"] * 3
+    assert all(layer.pending_physical_routes is None for layer in layers)
 
 
 def test_redundant_copy_groups_cache_invalidates_with_layout():

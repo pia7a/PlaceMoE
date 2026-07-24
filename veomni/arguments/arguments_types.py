@@ -600,10 +600,6 @@ class HierMoEConfig:
                     "train.hiermoe.expert_swap_selector=hiermoe_exact_p1 does not support redundant slots."
                 )
         if self.expert_swap_selector == "hiermoe_greedy_cover_p1":
-            if self.expert_swap_mode != "layer":
-                raise ValueError(
-                    "train.hiermoe.expert_swap_selector=hiermoe_greedy_cover_p1 requires expert_swap_mode=layer."
-                )
             if self.expert_swap_max_pairs_per_layer > 1:
                 raise ValueError(
                     "train.hiermoe.expert_swap_selector=hiermoe_greedy_cover_p1 supports at most one "

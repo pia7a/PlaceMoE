@@ -21,7 +21,7 @@ import zlib
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 import torch
 import torch.distributed as dist
@@ -94,6 +94,8 @@ _MAX_SWAP_WAVE_BYTES = _env_int("VEOMNI_HIERMOE_SWAP_WAVE_MIB", 2048) * 1024 * 1
 _EXACT_SINGLE_SWAP_MAX_EXPERTS = 256
 _EXACT_SINGLE_SWAP_MAX_STATS_BYTES = 64 * 1024 * 1024
 _SWAP_COST_CHUNK_CANDIDATES = _env_int("VEOMNI_HIERMOE_SWAP_COST_CHUNK_CANDIDATES", 96)
+_GREEDY_LAYER_PARALLEL_STREAMS = _env_int("VEOMNI_HIERMOE_GREEDY_LAYER_STREAMS", 8)
+_GREEDY_ADAPTIVE_TOPK_INITIAL = _env_int("VEOMNI_HIERMOE_GREEDY_ADAPTIVE_TOPK_INITIAL", 32)
 _ALL_CANDIDATE_PAIR_CACHE: dict[tuple[str, int], torch.Tensor] = {}
 
 
@@ -109,6 +111,8 @@ _SWAP_CANDIDATE_SHARDS = _env_candidate_shards("VEOMNI_HIERMOE_SWAP_CANDIDATE_SH
 _DEBUG_REDUNDANT_COPY_STATS = _env_flag("VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STATS")
 _DEBUG_REDUNDANT_COPY_STATS_MAX_LAYERS = _env_int("VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STATS_MAX_LAYERS", 2)
 _FIXED_R2_LAYOUT = _env_flag("VEOMNI_HIERMOE_FIXED_R2_LAYOUT")
+_GREEDY_ADAPTIVE_TOPK = _env_flag("VEOMNI_HIERMOE_GREEDY_ADAPTIVE_TOPK")
+_GREEDY_ADAPTIVE_TOPK_STRICT = _env_flag("VEOMNI_HIERMOE_GREEDY_ADAPTIVE_TOPK_STRICT")
 
 
 def _full_timing_range(section: str):
@@ -175,6 +179,7 @@ class _PendingLayerTiming:
     step: int
     selected_experts: torch.Tensor
     slot_to_logical: torch.Tensor
+    local_assignment_count: torch.Tensor
     dispatch_start: AcceleratorEvent
     dispatch_end: AcceleratorEvent
     compute_start: AcceleratorEvent
@@ -188,6 +193,7 @@ class _PlannerCalibration:
     source_step: int
     communication_scale: float
     forward_compute_per_assignment: float
+    forward_compute_constant: float = 0.0
 
 
 @dataclass
@@ -887,6 +893,45 @@ def _placement_group_succeeded(
     status = torch.tensor([int(local_success)], dtype=torch.int32, device=status_device)
     dist.all_reduce(status, op=dist.ReduceOp.MIN, group=ep_group)
     return bool(status.item())
+
+
+@torch.no_grad()
+def _placement_group_boolean_consensus(
+    local_value: bool,
+    *,
+    device: torch.device,
+    ep_size: int,
+    ep_group: dist.ProcessGroup | None,
+) -> tuple[bool, bool]:
+    """Return whether every rank is true and whether all ranks agree."""
+
+    if ep_size <= 1 or ep_group is None:
+        return bool(local_value), True
+    backend = str(dist.get_backend(ep_group)).lower().rsplit(".", maxsplit=1)[-1]
+    status_device = torch.device("cpu") if backend == "gloo" else device
+    status = torch.tensor([int(local_value)], dtype=torch.int32, device=status_device)
+    dist.all_reduce(status, op=dist.ReduceOp.SUM, group=ep_group)
+    true_count = int(status.item())
+    return true_count == ep_size, true_count in (0, ep_size)
+
+
+@torch.no_grad()
+def _placement_group_all_true_mask(
+    local_values: Sequence[bool],
+    *,
+    device: torch.device,
+    ep_size: int,
+    ep_group: dist.ProcessGroup | None,
+) -> tuple[bool, ...]:
+    """Return a rank-consistent mask that is true only when every rank is ready."""
+
+    if ep_size <= 1 or ep_group is None:
+        return tuple(bool(value) for value in local_values)
+    backend = str(dist.get_backend(ep_group)).lower().rsplit(".", maxsplit=1)[-1]
+    status_device = torch.device("cpu") if backend == "gloo" else device
+    status = torch.tensor(local_values, dtype=torch.int32, device=status_device)
+    dist.all_reduce(status, op=dist.ReduceOp.MIN, group=ep_group)
+    return tuple(bool(value) for value in status.to(device="cpu").tolist())
 
 
 @torch.no_grad()
@@ -2379,8 +2424,6 @@ class ExpertSwapManager:
             if self.expert_swap_mode != "step":
                 raise ValueError("legacy_batched requires expert_swap_mode=step.")
         if self.expert_swap_selector == "hiermoe_greedy_cover_p1":
-            if self.expert_swap_mode != "layer":
-                raise ValueError("hiermoe_greedy_cover_p1 requires expert_swap_mode=layer.")
             if self.expert_swap_max_pairs_per_layer > 1:
                 raise ValueError("hiermoe_greedy_cover_p1 supports at most one steady-state swap per layer.")
             if self.redundant_slot_increment_per_device <= 0:
@@ -2415,7 +2458,11 @@ class ExpertSwapManager:
         return self.expert_swap_max_pairs_per_layer > 0 or self.redundant_slot_increment_per_device > 0
 
     def layer_calibration_enabled(self) -> bool:
-        return self.expert_swap_selector == "current_joint"
+        if self.expert_swap_selector == "current_joint":
+            return True
+        if self.expert_swap_selector == "hiermoe_greedy_cover_p1":
+            return any(layer.planner_calibration is None for layer in self.layers.values())
+        return False
 
     def placement_metrics(self) -> dict[str, float | int | str]:
         return dict(self._placement_metrics)
@@ -2956,9 +3003,9 @@ class ExpertSwapManager:
         combine_end: AcceleratorEvent,
         selected_dim: int | None = None,
     ) -> None:
-        del selected_dim, tokens_per_local_expert
+        del selected_dim
         layer = self.layers.get(layer_key)
-        if layer is None or not self.placement_planning_enabled():
+        if layer is None or not self.placement_planning_enabled() or not self.layer_calibration_enabled():
             return
         if layer.slot_to_logical is None:
             layout = torch.full((layer.num_experts,), -1, dtype=torch.long)
@@ -2970,6 +3017,7 @@ class ExpertSwapManager:
             step=int(step),
             selected_experts=selected_experts.detach(),
             slot_to_logical=layout,
+            local_assignment_count=tokens_per_local_expert.detach().sum().to(dtype=torch.float32),
             dispatch_start=dispatch_start,
             dispatch_end=dispatch_end,
             compute_start=compute_start,
@@ -3974,6 +4022,7 @@ class ExpertSwapManager:
         *,
         communication_scale: float,
         forward_compute_per_assignment: float,
+        forward_compute_constant: float = 0.0,
     ) -> CurrentRoutePlanner | GreedyCommunicationPlanner:
         if self.expert_swap_selector == "hiermoe_greedy_cover_p1":
             return GreedyCommunicationPlanner(
@@ -3982,11 +4031,19 @@ class ExpertSwapManager:
                 hidden_size=layer.latest_hidden_size,
                 bytes_per_element=layer.latest_bytes_per_element,
                 slots_per_rank=layer.num_local_experts,
+                communication_scale=communication_scale,
+                forward_compute_per_assignment=forward_compute_per_assignment,
+                forward_compute_constant=forward_compute_constant,
                 smooth_max_gamma=self.smooth_max_gamma,
                 reducer=self._planner_reduce_sum,
                 candidate_chunk_size=_SWAP_COST_CHUNK_CANDIDATES,
                 process_group=self.ep_group,
                 max_copies=self.greedy_max_copies_per_expert,
+                assume_unique_routes=True,
+                layer_parallel_streams=_GREEDY_LAYER_PARALLEL_STREAMS,
+                adaptive_topk=_GREEDY_ADAPTIVE_TOPK,
+                adaptive_topk_initial=_GREEDY_ADAPTIVE_TOPK_INITIAL,
+                adaptive_topk_strict_certificate=_GREEDY_ADAPTIVE_TOPK_STRICT,
             )
         if self.expert_swap_mode != "layer":
             return CurrentRoutePlanner(
@@ -4034,12 +4091,72 @@ class ExpertSwapManager:
                     return False
         return True
 
+    @staticmethod
+    def _fit_nonnegative_compute_model(samples: list[tuple[float, float]]) -> tuple[float, float]:
+        """Fit y = slope * x + intercept with both parameters constrained non-negative."""
+
+        finite = [(x, y) for x, y in samples if math.isfinite(x) and math.isfinite(y) and x >= 0.0 and y >= 0.0]
+        if not finite:
+            return 0.0, 0.0
+        x = torch.tensor([row[0] for row in finite], dtype=torch.float64)
+        y = torch.tensor([row[1] for row in finite], dtype=torch.float64)
+        candidates: list[tuple[float, float]] = []
+        design = torch.stack((x, torch.ones_like(x)), dim=1)
+        solution = torch.linalg.lstsq(design, y).solution
+        unconstrained = (float(solution[0].item()), float(solution[1].item()))
+        if unconstrained[0] >= 0.0 and unconstrained[1] >= 0.0:
+            candidates.append(unconstrained)
+        x_square_sum = float(torch.dot(x, x).item())
+        if x_square_sum > 0.0:
+            candidates.append((max(0.0, float(torch.dot(x, y).item()) / x_square_sum), 0.0))
+        else:
+            candidates.append((0.0, 0.0))
+        candidates.append((0.0, max(0.0, float(y.mean().item()))))
+        return min(
+            candidates,
+            key=lambda row: float(torch.square(row[0] * x + row[1] - y).sum().item()),
+        )
+
     @torch.no_grad()
     def prepare_calibrations(self, step: int) -> None:
-        if not self.layer_calibration_enabled():
-            return
         started = time.perf_counter()
+        if self.expert_swap_selector == "hiermoe_greedy_cover_p1":
+            uncalibrated = [layer for layer in self.layers.values() if layer.planner_calibration is None]
+            if not self.layers:
+                return
+            consensus_device = _local_tensor_view(next(iter(self.layers.values())).gate_up_proj).device
+            all_need_calibration, need_state_agrees = _placement_group_boolean_consensus(
+                bool(uncalibrated),
+                device=consensus_device,
+                ep_size=self.ep_size,
+                ep_group=self.ep_group,
+            )
+            if not need_state_agrees:
+                raise RuntimeError("HierMoE planner calibration state differs across the EP group.")
+            if not all_need_calibration:
+                return
+            local_ready = not any(
+                layer.pending_timing is None
+                or layer.pending_timing.step > int(step)
+                or not self._events_ready(layer.pending_timing)
+                for layer in uncalibrated
+            )
+            all_ready, _ready_state_agrees = _placement_group_boolean_consensus(
+                local_ready,
+                device=consensus_device,
+                ep_size=self.ep_size,
+                ep_group=self.ep_group,
+            )
+            if not all_ready:
+                self._accumulate_metric(
+                    "hiermoe/placement_calibration_ms",
+                    (time.perf_counter() - started) * 1000.0,
+                )
+                return
+        elif not self.layer_calibration_enabled():
+            return
         updated = 0
+        greedy_records: list[tuple[ExpertLayerState, _PendingLayerTiming, float, float, float]] = []
         for layer_key in sorted(self.layers):
             layer = self.layers[layer_key]
             timing = layer.pending_timing
@@ -4050,6 +4167,7 @@ class ExpertSwapManager:
                 layer,
                 communication_scale=1.0,
                 forward_compute_per_assignment=1.0,
+                forward_compute_constant=0.0,
             )
             copy_slots, _copy_mask = layer.copy_slots_for_device(selected.device)
             reference = planner.score_layout(
@@ -4066,6 +4184,7 @@ class ExpertSwapManager:
                     timing.dispatch_start.elapsed_time(timing.dispatch_end)
                     + timing.combine_start.elapsed_time(timing.combine_end),
                     timing.compute_start.elapsed_time(timing.compute_end),
+                    timing.local_assignment_count,
                 ],
                 dtype=torch.float32,
                 device=selected.device,
@@ -4073,14 +4192,27 @@ class ExpertSwapManager:
             if self.ep_group is not None and self.ep_size > 1:
                 dist.all_reduce(values, op=dist.ReduceOp.MAX, group=self.ep_group)
             communication_units = reference.communication_model_units
-            peak_assignments = reference.compute / 3.0
+            peak_assignments = float(values[2].item())
             forward_communication_ms = float(values[0].item())
             forward_compute_ms = float(values[1].item())
             if communication_units <= 0.0 or peak_assignments <= 0.0:
                 continue
-            communication_scale = (2.0 * forward_communication_ms) / communication_units
+            if self.expert_swap_selector == "hiermoe_greedy_cover_p1":
+                # The greedy planner explicitly accounts for four communication
+                # phases. Normalize the measured forward dispatch+combine pair
+                # to the residual scale of one modeled phase.
+                communication_scale = forward_communication_ms / (2.0 * communication_units)
+            else:
+                # CurrentRoutePlanner.communication_model_units already includes
+                # all four communication phases.
+                communication_scale = (2.0 * forward_communication_ms) / communication_units
+            if not math.isfinite(communication_scale):
+                continue
+            if self.expert_swap_selector == "hiermoe_greedy_cover_p1":
+                greedy_records.append((layer, timing, communication_scale, peak_assignments, forward_compute_ms))
+                continue
             compute_scale = forward_compute_ms / peak_assignments
-            if not math.isfinite(communication_scale) or not math.isfinite(compute_scale):
+            if not math.isfinite(compute_scale):
                 continue
             layer.planner_calibration = _PlannerCalibration(
                 source_step=timing.step,
@@ -4089,6 +4221,24 @@ class ExpertSwapManager:
             )
             layer.pending_timing = None
             updated += 1
+        if greedy_records:
+            compute_scale, compute_constant = self._fit_nonnegative_compute_model(
+                [
+                    (peak_assignments, forward_compute_ms)
+                    for _, _, _, peak_assignments, forward_compute_ms in greedy_records
+                ]
+            )
+            for layer, timing, communication_scale, _peak_assignments, _forward_compute_ms in greedy_records:
+                layer.planner_calibration = _PlannerCalibration(
+                    source_step=timing.step,
+                    communication_scale=communication_scale,
+                    forward_compute_per_assignment=compute_scale,
+                    forward_compute_constant=compute_constant,
+                )
+                layer.pending_timing = None
+                updated += 1
+            self._accumulate_metric("hiermoe/placement_compute_ms_per_assignment", compute_scale)
+            self._accumulate_metric("hiermoe/placement_compute_constant_ms", compute_constant)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         self._accumulate_metric("hiermoe/placement_calibration_ms", elapsed_ms)
         self._accumulate_metric("hiermoe/placement_calibrated_layers", updated)
@@ -4620,12 +4770,17 @@ class ExpertSwapManager:
         calibration = layer.planner_calibration
         selected = layer.latest_selected_experts
         greedy_cover = self.expert_swap_selector == "hiermoe_greedy_cover_p1"
-        if selected is None or selected.numel() == 0 or (calibration is None and not greedy_cover):
+        if (
+            selected is None
+            or (selected.numel() == 0 and not greedy_cover)
+            or (calibration is None and not greedy_cover)
+        ):
             return []
         planner = self._planner_for_layer(
             layer,
             communication_scale=1.0 if calibration is None else calibration.communication_scale,
             forward_compute_per_assignment=0.0 if calibration is None else calibration.forward_compute_per_assignment,
+            forward_compute_constant=0.0 if calibration is None else calibration.forward_compute_constant,
         )
         with _full_timing_range("hiermoe_placement_planning"):
             plan = planner.plan(
@@ -4644,6 +4799,97 @@ class ExpertSwapManager:
         if self.expert_swap_mode == "layer" and plan.local_physical_routes is not None:
             layer.pending_physical_routes = plan.local_physical_routes
             layer.pending_route_data_ptr = selected.data_ptr()
+        return committed
+
+    @torch.no_grad()
+    def _plan_historical_layers(self, layers: list[ExpertLayerState], step: int) -> list[str]:
+        """Plan all initialized layers from the previous forward routes as one batch."""
+
+        if not layers:
+            return []
+        consensus_device = _local_tensor_view(layers[0].gate_up_proj).device
+        globally_ready = _placement_group_all_true_mask(
+            [layer.latest_selected_experts is not None for layer in layers],
+            device=consensus_device,
+            ep_size=self.ep_size,
+            ep_group=self.ep_group,
+        )
+        ready = [layer for layer, is_ready in zip(layers, globally_ready, strict=True) if is_ready]
+        if not ready:
+            return []
+        if any(bool((self._layer_layout(layer) < 0).any().item()) for layer in ready):
+            # Empty-slot initialization has sequential marginal dependencies
+            # within each layer. It is excluded from steady-state timing.
+            committed: list[str] = []
+            for layer in ready:
+                committed.extend(self._plan_current_layer(layer, step))
+            return committed
+        structural_signature = {
+            (
+                layer.latest_hidden_size,
+                layer.latest_bytes_per_element,
+                layer.num_local_experts,
+                layer.num_experts,
+            )
+            for layer in ready
+        }
+        if len(structural_signature) != 1:
+            committed = []
+            for layer in ready:
+                committed.extend(self._plan_current_layer(layer, step))
+            return committed
+
+        calibrations = [layer.planner_calibration for layer in ready]
+        communication_scales = [
+            1.0 if calibration is None else calibration.communication_scale for calibration in calibrations
+        ]
+        compute_slopes = [
+            0.0 if calibration is None else calibration.forward_compute_per_assignment for calibration in calibrations
+        ]
+        compute_constants = [
+            0.0 if calibration is None else calibration.forward_compute_constant for calibration in calibrations
+        ]
+        planner = self._planner_for_layer(
+            ready[0],
+            communication_scale=communication_scales[0],
+            forward_compute_per_assignment=compute_slopes[0],
+            forward_compute_constant=compute_constants[0],
+        )
+        if not isinstance(planner, GreedyCommunicationPlanner):
+            raise RuntimeError("Historical batched planning requires GreedyCommunicationPlanner.")
+
+        started = time.perf_counter()
+        with _full_timing_range("hiermoe_historical_route_batch_plan"):
+            plans = planner.plan_layers(
+                [layer.latest_selected_experts for layer in ready],
+                [self._layer_layout(layer) for layer in ready],
+                [layer.logical_to_physical for layer in ready],
+                source_ranks=self.ep_rank,
+                max_swaps=self.expert_swap_max_pairs_per_layer,
+                max_replicas=self.max_replica_rounds,
+                layer_seeds=[zlib.crc32(layer.key.encode("utf-8")) for layer in ready],
+                step=step,
+                communication_scales=communication_scales,
+                forward_compute_per_assignment=compute_slopes,
+                forward_compute_constant=compute_constants,
+                skip_final_route_update=True,
+            )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self._accumulate_metric("hiermoe/placement_step_batch_planning_ms", elapsed_ms)
+        self._accumulate_metric("hiermoe/placement_step_batch_layers", len(ready))
+
+        for layer, plan in zip(ready, plans, strict=True):
+            layer.last_plan = plan
+            self._record_plan_metrics(plan)
+        committed: list[str] = []
+        for layer, plan in zip(ready, plans, strict=True):
+            committed.extend(
+                self._execute_placement_plan(
+                    layer,
+                    plan,
+                    timing_prefix="hiermoe_historical_placement",
+                )
+            )
         return committed
 
     @torch.no_grad()
@@ -4731,8 +4977,12 @@ class ExpertSwapManager:
                 return self.latest_pair
             committed = []
             with _full_timing_range("hiermoe_current_route_plan"):
-                for layer_key in sorted(self.layers):
-                    committed.extend(self._plan_current_layer(self.layers[layer_key], int(step)))
+                layers = [self.layers[layer_key] for layer_key in sorted(self.layers)]
+                if self.expert_swap_selector == "hiermoe_greedy_cover_p1" and self.expert_swap_mode == "step":
+                    committed.extend(self._plan_historical_layers(layers, int(step)))
+                else:
+                    for layer in layers:
+                        committed.extend(self._plan_current_layer(layer, int(step)))
         self.latest_pair = ",".join(committed) if committed else "none"
         return self.latest_pair
 

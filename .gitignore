@@ -8,10 +8,13 @@ build/
 dist/
 *.egg-info/
 log.txt
+*.md
 profile/runs/
 profile/figures/
 profile/processed/
 pretrain_runs/
+/export_only_prof_dir/
+/route_captures/
 veomni/ops/platform/npu/hiermoe_planner_ops/build/
 
 /results/
