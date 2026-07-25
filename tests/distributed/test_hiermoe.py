@@ -18,6 +18,7 @@ import math
 import sys
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from threading import Barrier, Event, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -5013,6 +5014,7 @@ def test_exact_p1_direct_executor_validates_full_layout_only_in_debug(monkeypatc
 def test_exact_p1_batches_layer_statistics_into_one_collective(monkeypatch):
     manager = expert_swap_module.ExpertSwapManager(
         ep_group=object(),
+
         ep_size=4,
         ep_rank=0,
         expert_swap_interval=1,
@@ -5066,3 +5068,497 @@ def test_exact_p1_batches_layer_statistics_into_one_collective(monkeypatch):
     assert collective_shapes[0][0] == 3
     assert len(direct_calls) == 3
     assert manager.placement_metrics()["hiermoe/exact_p1_candidate_count"] == 3 * 24
+
+
+def test_fixed_pipeline_requires_step_greedy_cover_configuration():
+    with pytest.raises(ValueError, match="requires expert_swap_mode=step"):
+        HierMoEConfig(
+            fixed_pipeline_overlap=True,
+            expert_swap_mode="layer",
+            expert_swap_selector="hiermoe_greedy_cover_p1",
+            redundant_slot_increment_per_device=1,
+        )
+    with pytest.raises(ValueError, match="requires expert_swap=true"):
+        HierMoEConfig(
+            fixed_pipeline_overlap=True,
+            expert_swap=False,
+            expert_swap_mode="step",
+            expert_swap_selector="hiermoe_greedy_cover_p1",
+            redundant_slot_increment_per_device=1,
+        )
+    with pytest.raises(ValueError, match="requires redundant"):
+        HierMoEConfig(
+            fixed_pipeline_overlap=True,
+            expert_swap_mode="step",
+            expert_swap_selector="hiermoe_greedy_cover_p1",
+            redundant_slot_increment_per_device=0,
+        )
+    with pytest.raises(ValueError, match="requires expert_swap_selector=hiermoe_greedy_cover_p1"):
+        HierMoEConfig(
+            fixed_pipeline_overlap=True,
+            expert_swap_mode="step",
+            expert_swap_selector="current_joint",
+            redundant_slot_increment_per_device=1,
+        )
+
+
+def test_fixed_pipeline_plans_current_step_and_migrates_next_step_in_layer_order(monkeypatch):
+    manager = expert_swap_module.ExpertSwapManager(
+        ep_group=None,
+        ep_size=1,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=1,
+        redundant_slot_increment_per_device=1,
+        max_replica_rounds=1,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=1, group_sizes=(1,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="step",
+        expert_swap_selector="hiermoe_greedy_cover_p1",
+        fixed_pipeline_overlap=True,
+    )
+    keys = []
+    for layer_index in range(2):
+        key = f"layers.{layer_index}.mlp.experts"
+        manager.register_layer(key, _FakeExperts(num_experts=4, local_start=0, local_experts=5, hidden_size=2))
+        layer = manager.layers[key]
+        layer.slot_to_logical = torch.tensor([0, 1, 2, 3, layer_index], dtype=torch.long)
+        manager._refresh_layer_mapping_from_slots(layer)
+        keys.append(key)
+
+    def fake_plan_worker(
+        layer_key,
+        _selected,
+        _layout,
+        _owners,
+        placement_version,
+        source_step,
+        _ready_event,
+        _submitted_at,
+    ):
+        windows = manager._pipeline_planner_windows[layer_key]
+        assert windows.collective_gate.wait(timeout=2.0)
+        windows.collective_done.set()
+        assert windows.score_gate.wait(timeout=2.0)
+        victim = int(manager.layers[layer_key].slot_to_logical[4])
+        plan = SimpleNamespace(actions=(PlacementAction("replica", 0, 4, 0, victim),))
+        return expert_swap_module._PipelinePlanResult(
+            layer_key=layer_key,
+            source_step=source_step,
+            placement_version=placement_version,
+            plan=plan,
+            raw_ms=10.0,
+            latency_ms=20.0,
+        )
+
+    migrated = []
+    monkeypatch.setattr(manager, "_pipeline_plan_worker", fake_plan_worker)
+    monkeypatch.setattr(manager, "_record_plan_metrics", lambda _plan: None)
+    monkeypatch.setattr(
+        manager,
+        "_execute_placement_plan",
+        lambda layer, _plan, **_kwargs: migrated.append(layer.key) or [layer.key],
+    )
+
+    manager.configure_pipeline_microstep(step=0, micro_step=0, num_micro_steps=1)
+    for key in keys:
+        manager.record_routing(
+            layer_key=key,
+            selected_experts=torch.tensor([[0, 1], [2, 3]], dtype=torch.long),
+            hidden_size=2,
+            bytes_per_element=4,
+            step=0,
+        )
+        manager.open_pipeline_planner_collective_window(key)
+        manager.open_pipeline_planner_score_window(key)
+        manager.advance_pipeline_after_combine(key)
+    result = manager.maybe_swap(0)
+    assert result != "none"
+    assert migrated == []
+    assert tuple(manager._pipeline_pending_plans) == tuple(keys)
+    assert manager.placement_metrics()["hiermoe/pipeline_planner_jobs"] == 2
+
+    manager.configure_pipeline_microstep(step=1, micro_step=0, num_micro_steps=1)
+    manager.wait_pipeline_migration_before_layer(keys[0])
+    assert migrated == [keys[0]]
+    assert manager._pipeline_migration_futures == {}
+    manager.advance_pipeline_after_combine(keys[0])
+    manager.wait_pipeline_migration_before_layer(keys[1])
+    assert migrated == keys
+    assert manager._pipeline_pending_plans == {}
+    assert manager.placement_metrics()["hiermoe/pipeline_migration_jobs"] == 2
+    manager.shutdown_pipeline()
+
+
+def test_fixed_pipeline_planner_score_continues_after_same_layer_combine(monkeypatch):
+    manager = expert_swap_module.ExpertSwapManager(
+        ep_group=None,
+        ep_size=1,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=1,
+        redundant_slot_increment_per_device=1,
+        max_replica_rounds=1,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=1, group_sizes=(1,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="step",
+        expert_swap_selector="hiermoe_greedy_cover_p1",
+        fixed_pipeline_overlap=True,
+    )
+    key = "layers.0.mlp.experts"
+    manager.register_layer(key, _FakeExperts(num_experts=4, local_start=0, local_experts=5, hidden_size=2))
+    layer = manager.layers[key]
+    layer.slot_to_logical = torch.tensor([0, 1, 2, 3, 0], dtype=torch.long)
+    manager._refresh_layer_mapping_from_slots(layer)
+    score_started = Event()
+    score_release = Event()
+
+    def fake_plan_worker(
+        layer_key,
+        _selected,
+        _layout,
+        _owners,
+        placement_version,
+        source_step,
+        _ready_event,
+        _submitted_at,
+    ):
+        windows = manager._pipeline_planner_windows[layer_key]
+        assert windows.collective_gate.wait(timeout=2.0)
+        windows.collective_done.set()
+        assert windows.score_gate.wait(timeout=2.0)
+        score_started.set()
+        assert score_release.wait(timeout=2.0)
+        plan = SimpleNamespace(actions=())
+        return expert_swap_module._PipelinePlanResult(
+            layer_key=layer_key,
+            source_step=source_step,
+            placement_version=placement_version,
+            plan=plan,
+            raw_ms=10.0,
+            latency_ms=20.0,
+        )
+
+    monkeypatch.setattr(manager, "_pipeline_plan_worker", fake_plan_worker)
+    monkeypatch.setattr(manager, "_record_plan_metrics", lambda _plan: None)
+    manager.configure_pipeline_microstep(step=0, micro_step=0, num_micro_steps=1)
+    manager.record_routing(
+        layer_key=key,
+        selected_experts=torch.tensor([[0, 1], [2, 3]], dtype=torch.long),
+        hidden_size=2,
+        bytes_per_element=4,
+        step=0,
+    )
+    manager.open_pipeline_planner_collective_window(key)
+    manager.open_pipeline_planner_score_window(key)
+    assert score_started.wait(timeout=2.0)
+
+    manager.advance_pipeline_after_combine(key)
+    assert not manager._pipeline_plan_futures[key].done()
+
+    score_release.set()
+    assert manager.maybe_swap(0) == "none"
+    metrics = manager.placement_metrics()
+    assert metrics["hiermoe/pipeline_planner_jobs"] == 1
+    assert metrics["hiermoe/pipeline_planner_deadline_exposed_ms"] >= 0.0
+    manager.shutdown_pipeline()
+
+
+def test_fixed_pipeline_reuses_one_background_process_group(monkeypatch):
+    created = []
+    background_group = object()
+
+    def create_group(_ep_group, _ep_size, group_desc="hiermoe_expert_swap"):
+        created.append(group_desc)
+        return background_group
+
+    monkeypatch.setattr(expert_swap_module, "_create_expert_swap_process_group", create_group)
+    manager = expert_swap_module.ExpertSwapManager(
+        ep_group=background_group,
+        ep_size=4,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=1,
+        redundant_slot_increment_per_device=1,
+        max_replica_rounds=1,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=4, group_sizes=(4,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="step",
+        expert_swap_selector="hiermoe_greedy_cover_p1",
+        fixed_pipeline_overlap=True,
+    )
+
+    assert created == []
+    assert manager._swap_group is None
+    assert manager._pipeline_planner_group is background_group
+    assert manager._pipeline_migration_group is background_group
+    assert manager._pipeline_grad_group is background_group
+    manager.shutdown_pipeline()
+
+
+def _fixed_pipeline_gradient_overlap_worker():
+    rank = dist.get_rank()
+    configure_hiermoe(
+        _profiled_hiermoe_config(
+            enable=True,
+            token_dedup=True,
+            expert_swap=True,
+            expert_swap_interval=1,
+            expert_swap_selector="hiermoe_greedy_cover_p1",
+            expert_swap_mode="step",
+            fixed_pipeline_overlap=True,
+            hierarchy_group_sizes=[2],
+            redundant_slot_increment_per_device=2,
+        ),
+        dist.group.WORLD,
+        ep_fsdp_size=1,
+    )
+    state = get_hiermoe_state()
+    assert state is not None and state.expert_swap_manager is not None
+    manager = state.expert_swap_manager
+    module = _FakeExperts(num_experts=4, local_start=rank * 2, local_experts=4, hidden_size=2)
+    manager.register_layer("layers.0.mlp.experts", module)
+    layer = manager.layers["layers.0.mlp.experts"]
+    layer.slot_to_logical = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3], dtype=torch.long)
+    manager._refresh_layer_mapping_from_slots(layer, (0, 1, 6, 7))
+    layer.accumulated_tokens_per_local_expert = torch.ones((4,), dtype=torch.long)
+
+    manager.configure_pipeline_microstep(step=0, micro_step=0, num_micro_steps=1)
+    (module.gate_up_proj.sum() + module.down_proj.sum()).backward()
+    assert manager._pipeline_grad_futures == {}
+    manager.open_pipeline_gradient_window_after_dispatch("layers.0.mlp.experts")
+    manager.sync_redundant_gradients()
+
+    torch.testing.assert_close(module.gate_up_proj.grad, torch.full_like(module.gate_up_proj.grad, 2.0))
+    torch.testing.assert_close(module.down_proj.grad, torch.full_like(module.down_proj.grad, 2.0))
+    metrics = manager.placement_metrics()
+    assert metrics["hiermoe/pipeline_grad_sync_jobs"] == 1
+    assert metrics["hiermoe/pipeline_grad_sync_raw_ms"] >= metrics["hiermoe/pipeline_grad_sync_exposed_ms"]
+    manager.shutdown_pipeline()
+
+
+def test_fixed_pipeline_gradient_sync_waits_for_dispatch_backward_boundary():
+    torchrun(_fixed_pipeline_gradient_overlap_worker, world_size=2, backend="gloo")
+
+
+def test_fixed_pipeline_autograd_markers_bracket_dispatch_backward(monkeypatch):
+    events = []
+    manager = SimpleNamespace(
+        close_pipeline_gradient_window_before_dispatch=lambda key: events.append(("close", key)),
+        open_pipeline_gradient_window_after_dispatch=lambda key: events.append(("open", key)),
+    )
+    monkeypatch.setattr(hiermoe_all_to_all, "_fixed_pipeline_manager", lambda _key: manager)
+    key = "layers.0.mlp.experts"
+    source = torch.ones((2, 3), requires_grad=True)
+    dispatch_input = hiermoe_all_to_all._mark_fixed_pipeline_dispatch_input(source, key)
+    dispatched = dispatch_input * 2.0
+    marked, _ctx, _counts = hiermoe_all_to_all._mark_fixed_pipeline_dispatch_output(
+        (dispatched, SimpleNamespace(), torch.ones((1,), dtype=torch.long)),
+        key,
+    )
+
+    marked.sum().backward()
+
+    assert events == [("close", key), ("open", key)]
+    torch.testing.assert_close(source.grad, torch.full_like(source, 2.0))
+
+
+def _fixed_pipeline_planner_window_worker():
+    rank = dist.get_rank()
+    configure_hiermoe(
+        _profiled_hiermoe_config(
+            enable=True,
+            token_dedup=True,
+            expert_swap=True,
+            expert_swap_interval=1,
+            expert_swap_max_pairs_per_layer=1,
+            expert_swap_selector="hiermoe_greedy_cover_p1",
+            expert_swap_mode="step",
+            fixed_pipeline_overlap=True,
+            hierarchy_group_sizes=[2],
+            redundant_slot_increment_per_device=2,
+            max_slot_op_search_rounds=1,
+        ),
+        dist.group.WORLD,
+        ep_fsdp_size=1,
+    )
+    state = get_hiermoe_state()
+    assert state is not None and state.expert_swap_manager is not None
+    manager = state.expert_swap_manager
+    key = "layers.0.mlp.experts"
+    module = _FakeExperts(num_experts=4, local_start=rank * 2, local_experts=4, hidden_size=2)
+    manager.register_layer(key, module)
+    layer = manager.layers[key]
+    layer.slot_to_logical = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3], dtype=torch.long)
+    manager._refresh_layer_mapping_from_slots(layer, (0, 1, 6, 7))
+    selected = torch.tensor([[rank, 2 + rank], [1 - rank, 3 - rank]], dtype=torch.long)
+
+    manager.configure_pipeline_microstep(step=0, micro_step=0, num_micro_steps=1)
+    manager.record_routing(
+        layer_key=key,
+        selected_experts=selected,
+        hidden_size=2,
+        bytes_per_element=4,
+        step=0,
+    )
+    manager.open_pipeline_planner_collective_window(key)
+    manager.open_pipeline_planner_score_window(key)
+    manager.advance_pipeline_after_combine(key)
+    manager.maybe_swap(0)
+
+    metrics = manager.placement_metrics()
+    assert metrics["hiermoe/pipeline_planner_jobs"] == 1
+    assert metrics["hiermoe/pipeline_planner_raw_ms"] >= metrics["hiermoe/pipeline_planner_exposed_ms"]
+    manager.shutdown_pipeline()
+
+
+def test_fixed_pipeline_planner_uses_explicit_compute_and_communication_windows():
+    torchrun(_fixed_pipeline_planner_window_worker, world_size=2, backend="gloo")
+
+
+def test_fixed_pipeline_gradient_hooks_submit_in_reverse_layer_order(monkeypatch):
+    manager = expert_swap_module.ExpertSwapManager(
+        ep_group=None,
+        ep_size=1,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=0,
+        redundant_slot_increment_per_device=1,
+        max_replica_rounds=0,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=1, group_sizes=(1,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="step",
+        expert_swap_selector="hiermoe_greedy_cover_p1",
+        fixed_pipeline_overlap=True,
+    )
+    keys = []
+    for layer_index in range(3):
+        key = f"layers.{layer_index}.mlp.experts"
+        manager.register_layer(key, _FakeExperts(num_experts=4, local_start=0, local_experts=5, hidden_size=2))
+        keys.append(key)
+    submitted = []
+    monkeypatch.setattr(manager, "_submit_pipeline_gradient_sync", submitted.append)
+    manager.configure_pipeline_microstep(step=0, micro_step=0, num_micro_steps=1)
+
+    ready_events = {}
+    for key in keys:
+        ready_events[key] = (object(), object())
+        manager._pipeline_on_gradient_ready(key, 0, ready_events[key][0])
+        manager._pipeline_on_gradient_ready(key, 1, ready_events[key][1])
+    assert submitted == []
+    assert all(
+        manager._pipeline_grad_ready_events[key] == {0: events[0], 1: events[1]}
+        for key, events in ready_events.items()
+    )
+
+    for expected_count, key in enumerate(reversed(keys), start=1):
+        manager.open_pipeline_gradient_window_after_dispatch(key)
+        assert submitted == list(reversed(keys))[:expected_count]
+    manager.shutdown_pipeline()
+
+
+def test_fixed_pipeline_concurrent_gradient_queue_keeps_reverse_order_once(monkeypatch):
+    manager = expert_swap_module.ExpertSwapManager(
+        ep_group=None,
+        ep_size=1,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=0,
+        redundant_slot_increment_per_device=1,
+        max_replica_rounds=0,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=1, group_sizes=(1,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="step",
+        expert_swap_selector="hiermoe_greedy_cover_p1",
+        fixed_pipeline_overlap=True,
+    )
+    keys = []
+    for layer_index in range(3):
+        key = f"layers.{layer_index}.mlp.experts"
+        manager.register_layer(key, _FakeExperts(num_experts=4, local_start=0, local_experts=5, hidden_size=2))
+        keys.append(key)
+    submitted = []
+    monkeypatch.setattr(manager, "_submit_pipeline_gradient_sync", submitted.append)
+    manager.configure_pipeline_microstep(step=0, micro_step=0, num_micro_steps=1)
+    with manager._pipeline_lock:
+        for key in keys:
+            manager._pipeline_grad_ready[key].update((0, 1))
+            manager._pipeline_grad_dispatch_complete.add(key)
+
+    barrier = Barrier(3)
+
+    def advance() -> None:
+        barrier.wait()
+        manager._advance_pipeline_gradient_queue()
+
+    threads = [Thread(target=advance), Thread(target=advance)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+
+    assert submitted == list(reversed(keys))
+    manager.shutdown_pipeline()
+
+
+def test_fixed_pipeline_shutdown_releases_unopened_planner_windows(monkeypatch):
+    manager = expert_swap_module.ExpertSwapManager(
+        ep_group=None,
+        ep_size=1,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=1,
+        redundant_slot_increment_per_device=1,
+        max_replica_rounds=1,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=1, group_sizes=(1,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="step",
+        expert_swap_selector="hiermoe_greedy_cover_p1",
+        fixed_pipeline_overlap=True,
+    )
+    key = "layers.0.mlp.experts"
+    manager.register_layer(key, _FakeExperts(num_experts=4, local_start=0, local_experts=5, hidden_size=2))
+
+    def fake_plan_worker(
+        layer_key,
+        _selected,
+        _layout,
+        _owners,
+        placement_version,
+        source_step,
+        _ready_event,
+        _submitted_at,
+    ):
+        windows = manager._pipeline_planner_windows[layer_key]
+        assert windows.collective_gate.wait(timeout=2.0)
+        windows.collective_done.set()
+        assert windows.score_gate.wait(timeout=2.0)
+        return expert_swap_module._PipelinePlanResult(
+            layer_key=layer_key,
+            source_step=source_step,
+            placement_version=placement_version,
+            plan=SimpleNamespace(actions=()),
+            raw_ms=0.0,
+            latency_ms=0.0,
+        )
+
+    monkeypatch.setattr(manager, "_pipeline_plan_worker", fake_plan_worker)
+    manager.configure_pipeline_microstep(step=0, micro_step=0, num_micro_steps=1)
+    manager.record_routing(
+        layer_key=key,
+        selected_experts=torch.tensor([[0, 1], [2, 3]], dtype=torch.long),
+        hidden_size=2,
+        bytes_per_element=4,
+        step=0,
+    )
+
+    manager.shutdown_pipeline()
+    assert all(future.done() for future in manager._pipeline_plan_futures.values())

@@ -15,11 +15,13 @@
 from .all_to_all import RankDedupDispatchContext, rank_dedup_combine, rank_dedup_dispatch
 from .metrics import flush_hiermoe_metrics, peek_hiermoe_metrics, record_hiermoe_metrics
 from .state import (
+    advance_hiermoe_pipeline_after_combine,
     assert_hiermoe_checkpoint_layout_compatible,
     assert_hiermoe_trainable_only_checkpoint_safe,
     bind_hiermoe_model,
     bind_hiermoe_optimizer,
     configure_hiermoe,
+    configure_hiermoe_pipeline_microstep,
     disable_hiermoe_placement,
     get_hiermoe_expert_layer_key,
     get_hiermoe_expert_layer_key_from_params,
@@ -35,16 +37,20 @@ from .state import (
     set_hiermoe_layer_swap_forward_enabled,
     set_hiermoe_route_capture_forward_enabled,
     set_hiermoe_step,
+    shutdown_hiermoe_pipeline,
     sync_hiermoe_redundant_gradients,
+    wait_hiermoe_pipeline_migration,
 )
 
 
 __all__ = [
     "RankDedupDispatchContext",
+    "advance_hiermoe_pipeline_after_combine",
     "assert_hiermoe_checkpoint_layout_compatible",
     "assert_hiermoe_trainable_only_checkpoint_safe",
     "bind_hiermoe_model",
     "bind_hiermoe_optimizer",
+    "configure_hiermoe_pipeline_microstep",
     "configure_hiermoe",
     "disable_hiermoe_placement",
     "flush_hiermoe_metrics",
@@ -66,5 +72,7 @@ __all__ = [
     "set_hiermoe_layer_swap_forward_enabled",
     "set_hiermoe_route_capture_forward_enabled",
     "set_hiermoe_step",
+    "shutdown_hiermoe_pipeline",
+    "wait_hiermoe_pipeline_migration",
     "sync_hiermoe_redundant_gradients",
 ]

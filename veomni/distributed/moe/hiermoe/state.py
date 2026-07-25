@@ -47,6 +47,7 @@ class HierMoEState:
     active: bool
     communication_mode: str = "hierarchical"
     planner_route_sample_size: int = 1024
+    fixed_pipeline_overlap: bool = False
     greedy_max_copies_per_expert: int = 4
     expert_swap_selector: str = "current_joint"
     activation_checkpointing_enabled: bool = False
@@ -97,8 +98,7 @@ def configure_hiermoe(
         and (int(config.expert_swap_max_pairs_per_layer) > 0 or int(config.redundant_slot_increment_per_device) > 0)
     )
     placement_planning_enabled = bool(
-        config.expert_swap
-        and (int(config.expert_swap_max_pairs_per_layer) > 0 or max_replica_rounds > 0)
+        config.expert_swap and (int(config.expert_swap_max_pairs_per_layer) > 0 or max_replica_rounds > 0)
     )
 
     if config.enable and ep_size <= 1:
@@ -147,6 +147,7 @@ def configure_hiermoe(
             redundant_slot_increment_per_device=int(config.redundant_slot_increment_per_device),
             max_replica_rounds=max_replica_rounds,
             smooth_max_gamma=float(config.smooth_max_gamma),
+            fixed_pipeline_overlap=bool(config.fixed_pipeline_overlap),
             hierarchy=hierarchy,
             perf_model=perf_model,
             expert_swap_mode=str(config.expert_swap_mode),
@@ -177,6 +178,7 @@ def configure_hiermoe(
         log_interval=max(1, int(config.log_interval)),
         hierarchy=hierarchy,
         perf_model=perf_model,
+        fixed_pipeline_overlap=bool(config.fixed_pipeline_overlap),
         activation_checkpointing_enabled=bool(activation_checkpointing_enabled),
         active=active,
         communication_mode=str(config.communication_mode),
@@ -190,6 +192,7 @@ def configure_hiermoe(
             "HierMoE configured: active=%s ep_size=%s hierarchy=%s communication_mode=%s "
             "perf_model_source=%s expert_swap=%s "
             "expert_swap_max_pairs_per_layer=%s expert_swap_mode=%s expert_swap_selector=%s "
+            "fixed_pipeline_overlap=%s "
             "redundant_slot_increment_per_device=%s "
             "max_slot_op_search_rounds=%s replica_slot_capacity=%s max_replica_rounds=%s "
             "planner_route_sample_size=%s greedy_max_copies_per_expert=%s runtime_cost_model=%s",
@@ -202,6 +205,7 @@ def configure_hiermoe(
             config.expert_swap_max_pairs_per_layer,
             config.expert_swap_mode,
             config.expert_swap_selector,
+            config.fixed_pipeline_overlap,
             config.redundant_slot_increment_per_device,
             config.max_slot_op_search_rounds,
             int(config.redundant_slot_increment_per_device) * ep_size,
@@ -301,6 +305,35 @@ def sync_hiermoe_redundant_gradients() -> None:
     state = _STATE
     if state is not None and state.expert_swap_manager is not None:
         state.expert_swap_manager.sync_redundant_gradients()
+
+
+def configure_hiermoe_pipeline_microstep(micro_step: int, num_micro_steps: int) -> None:
+    state = _STATE
+    if state is None or state.expert_swap_manager is None:
+        return
+    state.expert_swap_manager.configure_pipeline_microstep(
+        state.current_step,
+        int(micro_step),
+        int(num_micro_steps),
+    )
+
+
+def wait_hiermoe_pipeline_migration(layer_key: str) -> None:
+    state = _STATE
+    if state is not None and state.expert_swap_manager is not None:
+        state.expert_swap_manager.wait_pipeline_migration_before_layer(layer_key)
+
+
+def advance_hiermoe_pipeline_after_combine(layer_key: str) -> None:
+    state = _STATE
+    if state is not None and state.expert_swap_manager is not None:
+        state.expert_swap_manager.advance_pipeline_after_combine(layer_key)
+
+
+def shutdown_hiermoe_pipeline() -> None:
+    state = _STATE
+    if state is not None and state.expert_swap_manager is not None:
+        state.expert_swap_manager.shutdown_pipeline()
 
 
 def get_hiermoe_redundant_grad_norm_masks() -> dict[int, Any]:

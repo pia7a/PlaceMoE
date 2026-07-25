@@ -530,6 +530,16 @@ class HierMoEConfig:
             )
         },
     )
+    fixed_pipeline_overlap: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable the fixed cross-step HierMoE overlap pipeline. In step mode, each layer plans from its "
+                "current route on a dedicated ordered worker, redundant gradients synchronize as layer gradients "
+                "become ready, and accepted swap/cover migrations prefetch before the next use of that layer."
+            )
+        },
+    )
     use_from_step: int = field(
         default=0,
         metadata={"help": "Must be 0. HierMoE starts from formal training step 0 when enabled."},
@@ -614,6 +624,21 @@ class HierMoEConfig:
                 raise ValueError("train.hiermoe.expert_swap_selector=legacy_batched does not support redundant slots.")
             if self.expert_swap_mode != "step":
                 raise ValueError("train.hiermoe.expert_swap_selector=legacy_batched requires expert_swap_mode=step.")
+        if self.fixed_pipeline_overlap:
+            if self.expert_swap_mode != "step":
+                raise ValueError("train.hiermoe.fixed_pipeline_overlap requires expert_swap_mode=step.")
+            if not self.expert_swap:
+                raise ValueError("train.hiermoe.fixed_pipeline_overlap requires expert_swap=true.")
+            if self.redundant_slot_increment_per_device <= 0:
+                raise ValueError(
+                    "train.hiermoe.fixed_pipeline_overlap requires redundant_slot_increment_per_device>0."
+                )
+            if self.expert_swap_selector != "hiermoe_greedy_cover_p1":
+                raise ValueError(
+                    "train.hiermoe.fixed_pipeline_overlap currently requires "
+                    "expert_swap_selector=hiermoe_greedy_cover_p1."
+                )
+
         if self.redundant_slot_increment_per_device < 0:
             raise ValueError("train.hiermoe.redundant_slot_increment_per_device must be >= 0.")
         if not 1 <= self.greedy_max_copies_per_expert <= 8:

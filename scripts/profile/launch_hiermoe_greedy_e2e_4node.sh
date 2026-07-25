@@ -23,6 +23,9 @@ capture_mode=${HIERMOE_CAPTURE_MODE_OVERRIDE:-local}
 capture_step=${HIERMOE_CAPTURE_STEP_OVERRIDE:--1}
 capture_layer=${HIERMOE_CAPTURE_LAYER_OVERRIDE:-}
 capture_call=${HIERMOE_CAPTURE_CALL_OVERRIDE:-0}
+debug_copy_stats=${HIERMOE_DEBUG_COPY_STATS_OVERRIDE:-0}
+debug_copy_layers=${HIERMOE_DEBUG_COPY_LAYERS_OVERRIDE:-1}
+debug_copy_groups=${HIERMOE_DEBUG_COPY_GROUPS_OVERRIDE:-2}
 key=/home/tzq/KeyPair-3bce.pem
 
 hiermoe_enable=false
@@ -33,6 +36,7 @@ max_pairs=0
 redundant_slots=0
 replica_rounds=0
 fixed_r2=0
+fixed_pipeline=false
 swap_mode=step
 swap_selector=current_joint
 
@@ -50,6 +54,37 @@ case "${variant}" in
     expert_swap=true
     redundant_slots=4
     fixed_r2=1
+    ;;
+  fixed_r2_greedy_sync)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    redundant_slots=4
+    fixed_r2=1
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    ;;
+  fixed_r2_pipeline_grad)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    redundant_slots=4
+    fixed_r2=1
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    ;;
+  r2_pipeline)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    max_pairs=1
+    redundant_slots=4
+    replica_rounds=1
+    fixed_r2=1
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
     ;;
   r2_planner)
     hiermoe_enable=true
@@ -111,6 +146,7 @@ common_env=(
   -e "HIERMOE_GREEDY_MAX_COPIES_PER_EXPERT=${greedy_copy_cap}"
   -e "HIERMOE_MAX_SLOT_OP_SEARCH_ROUNDS=${replica_rounds}"
   -e "HIERMOE_EXPERT_SWAP_MODE=${swap_mode}"
+  -e "HIERMOE_FIXED_PIPELINE_OVERLAP=${fixed_pipeline}"
   -e "HIERMOE_FIT_PERF_MODEL_ON_STARTUP=0"
   -e "HIERMOE_PERF_MODEL_PATH=${perf_model_path}"
   -e "VEOMNI_HIERMOE_FIXED_R2_LAYOUT=${fixed_r2}"
@@ -123,6 +159,9 @@ common_env=(
   -e "VEOMNI_FULL_PROFILE_EVERY_N=1"
   -e "VEOMNI_FULL_PROFILE_RANKS=0"
   -e "VEOMNI_HIERMOE_INTERNAL_TIMING=0"
+  -e "VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STATS=${debug_copy_stats}"
+  -e "VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STATS_MAX_LAYERS=${debug_copy_layers}"
+  -e "VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STATS_MAX_GROUPS=${debug_copy_groups}"
   -e "VEOMNI_TORCH_PROFILE_ENABLE=0"
   -e "VEOMNI_MOE_TIMING_SYNC_EVENTS=0"
 )

@@ -106,6 +106,68 @@ def _env_flag(name: str) -> bool:
 _HIERMOE_INTERNAL_TIMING = _env_flag("VEOMNI_HIERMOE_INTERNAL_TIMING")
 
 
+def _fixed_pipeline_manager(layer_key: str | None):
+    if layer_key is None:
+        return None
+    state = get_hiermoe_state()
+    if (
+        state is None
+        or not state.fixed_pipeline_overlap
+        or state.expert_swap_manager is None
+        or not state.expert_swap_manager.has_layer(layer_key)
+    ):
+        return None
+    return state.expert_swap_manager
+
+
+class _BeforeDispatchBackward(torch.autograd.Function):
+    """Close the background-gradient window before dispatch backward A2A."""
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, layer_key: str) -> torch.Tensor:
+        ctx.layer_key = layer_key
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor) -> tuple[torch.Tensor, None]:
+        manager = _fixed_pipeline_manager(ctx.layer_key)
+        if manager is not None:
+            manager.close_pipeline_gradient_window_before_dispatch(ctx.layer_key)
+        return grad, None
+
+
+class _AfterDispatchBackward(torch.autograd.Function):
+    """Open the layer gradient-sync window after dispatch backward A2A."""
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, layer_key: str) -> torch.Tensor:
+        ctx.layer_key = layer_key
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor) -> tuple[torch.Tensor, None]:
+        manager = _fixed_pipeline_manager(ctx.layer_key)
+        if manager is not None:
+            manager.open_pipeline_gradient_window_after_dispatch(ctx.layer_key)
+        return grad, None
+
+
+def _mark_fixed_pipeline_dispatch_input(hidden_states: torch.Tensor, layer_key: str | None) -> torch.Tensor:
+    if hidden_states.requires_grad and _fixed_pipeline_manager(layer_key) is not None:
+        return _AfterDispatchBackward.apply(hidden_states, layer_key)
+    return hidden_states
+
+
+def _mark_fixed_pipeline_dispatch_output(
+    result: tuple[torch.Tensor, RankDedupDispatchContext, torch.Tensor],
+    layer_key: str | None,
+) -> tuple[torch.Tensor, RankDedupDispatchContext, torch.Tensor]:
+    hidden_states, ctx, tokens_per_local_expert = result
+    if hidden_states.requires_grad and _fixed_pipeline_manager(layer_key) is not None:
+        hidden_states = _BeforeDispatchBackward.apply(hidden_states, layer_key)
+    return hidden_states, ctx, tokens_per_local_expert
+
+
 def _begin_internal_span(section: str) -> tuple[dict, str, object] | None:
     if not _HIERMOE_INTERNAL_TIMING:
         return None
@@ -1630,6 +1692,7 @@ def rank_dedup_dispatch(
     placement_already_applied: bool = False,
 ) -> tuple[torch.Tensor, RankDedupDispatchContext, torch.Tensor]:
     hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+    hidden_states = _mark_fixed_pipeline_dispatch_input(hidden_states, layer_key)
     ep_size = dist.get_world_size(ep_group) if ep_group is not None else 1
     ep_rank = dist.get_rank(ep_group) if ep_group is not None else 0
     if num_experts % ep_size != 0:
@@ -1655,6 +1718,8 @@ def rank_dedup_dispatch(
                 f"train.hiermoe.expert_swap=true received unregistered MoE layer_key={layer_key!r}. "
                 "Expert Swap cannot safely map logical experts to physical placement for this layer."
             )
+        if state.fixed_pipeline_overlap:
+            state.expert_swap_manager.wait_pipeline_migration_before_layer(layer_key)
         if state.expert_swap_mode == "layer" and state.layer_swap_forward_enabled and not placement_already_applied:
             state.expert_swap_pair = state.expert_swap_manager.maybe_swap_layer_on_routing(
                 layer_key=layer_key,
@@ -1734,7 +1799,7 @@ def rank_dedup_dispatch(
         )
         if state is not None and state.expert_swap_manager is not None and layer_key is not None:
             state.expert_swap_manager.record_local_expert_token_counts(layer_key, result[2])
-        return result
+        return _mark_fixed_pipeline_dispatch_output(result, layer_key)
 
     intra_size = _hierarchical_intra_size(ep_size, selected_dim)
     if intra_size is not None:
@@ -1753,7 +1818,7 @@ def rank_dedup_dispatch(
         )
         if state is not None and state.expert_swap_manager is not None and layer_key is not None:
             state.expert_swap_manager.record_local_expert_token_counts(layer_key, result[2])
-        return result
+        return _mark_fixed_pipeline_dispatch_output(result, layer_key)
 
     (
         send_hidden,
@@ -1834,7 +1899,7 @@ def rank_dedup_dispatch(
     )
     if state is not None and state.expert_swap_manager is not None and layer_key is not None:
         state.expert_swap_manager.record_local_expert_token_counts(layer_key, tokens_per_local_expert)
-    return permuted_tokens, ctx, tokens_per_local_expert
+    return _mark_fixed_pipeline_dispatch_output((permuted_tokens, ctx, tokens_per_local_expert), layer_key)
 
 
 def _aggregate_weighted_outputs(

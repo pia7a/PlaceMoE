@@ -59,12 +59,14 @@ from ..distributed.moe.hiermoe import (
     bind_hiermoe_model,
     bind_hiermoe_optimizer,
     configure_hiermoe,
+    configure_hiermoe_pipeline_microstep,
     disable_hiermoe_placement,
     maybe_log_hiermoe_metrics,
     maybe_run_hiermoe_expert_swap,
     set_hiermoe_layer_swap_forward_enabled,
     set_hiermoe_route_capture_forward_enabled,
     set_hiermoe_step,
+    shutdown_hiermoe_pipeline,
     sync_hiermoe_redundant_gradients,
 )
 from ..distributed.offloading import build_activation_offloading_context
@@ -669,6 +671,7 @@ class BaseTrainer(Stateful, ABC):
 
     def model_reshard(self, micro_step: int, num_micro_steps: int):
         """Reshard model after backward pass."""
+        configure_hiermoe_pipeline_microstep(micro_step, num_micro_steps)
         args: VeOmniArguments = self.args
         if (
             args.train.accelerator.fsdp_config.fsdp_mode == "fsdp2"
@@ -751,6 +754,7 @@ class BaseTrainer(Stateful, ABC):
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 
     def destroy_distributed(self):
+        shutdown_hiermoe_pipeline()
         helper.empty_cache()
         dist.barrier()
         dist.destroy_process_group()

@@ -19,8 +19,10 @@ import os
 import time
 import zlib
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from threading import Event, Lock
 from typing import Any, Iterable, Sequence
 
 import torch
@@ -110,6 +112,7 @@ _USE_GLOBAL_HIERARCHY_SELECTOR = not _env_flag("VEOMNI_HIERMOE_SWAP_DISABLE_GLOB
 _SWAP_CANDIDATE_SHARDS = _env_candidate_shards("VEOMNI_HIERMOE_SWAP_CANDIDATE_SHARDS")
 _DEBUG_REDUNDANT_COPY_STATS = _env_flag("VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STATS")
 _DEBUG_REDUNDANT_COPY_STATS_MAX_LAYERS = _env_int("VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STATS_MAX_LAYERS", 2)
+_DEBUG_REDUNDANT_COPY_STATS_MAX_GROUPS = _env_int("VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STATS_MAX_GROUPS", 4)
 _FIXED_R2_LAYOUT = _env_flag("VEOMNI_HIERMOE_FIXED_R2_LAYOUT")
 _GREEDY_ADAPTIVE_TOPK = _env_flag("VEOMNI_HIERMOE_GREEDY_ADAPTIVE_TOPK")
 _GREEDY_ADAPTIVE_TOPK_STRICT = _env_flag("VEOMNI_HIERMOE_GREEDY_ADAPTIVE_TOPK_STRICT")
@@ -222,6 +225,7 @@ class ExpertLayerState:
     )
     _redundant_copy_groups_cache: tuple[tuple[int, tuple[int, ...]], ...] | None = None
     _replica_grad_schedule_cache: _ReplicaGradSchedule | None = None
+    placement_version: int = 0
     pending_timing: _PendingLayerTiming | None = None
     planner_calibration: _PlannerCalibration | None = None
     last_plan: PlacementPlan | None = None
@@ -385,6 +389,44 @@ class _PendingLayerSwap:
 
 
 @dataclass(frozen=True)
+class _PipelinePlanResult:
+    layer_key: str
+    source_step: int
+    placement_version: int
+    plan: PlacementPlan
+    raw_ms: float
+    latency_ms: float
+
+
+@dataclass(frozen=True)
+class _PipelineMigrationResult:
+    layer_key: str
+    source_step: int
+    committed: tuple[str, ...]
+    raw_ms: float
+
+
+@dataclass(frozen=True)
+class _PipelineGradResult:
+    layer_key: str
+    raw_ms: float
+
+
+@dataclass(frozen=True)
+class _PendingPipelinePlan:
+    plan: PlacementPlan
+    source_step: int
+    placement_version: int
+
+
+@dataclass(frozen=True)
+class _PipelinePlannerWindows:
+    collective_gate: Event = field(default_factory=Event)
+    collective_done: Event = field(default_factory=Event)
+    score_gate: Event = field(default_factory=Event)
+
+
+@dataclass(frozen=True)
 class _OptimizerParamBinding:
     optimizer: Any
     group: dict[str, Any]
@@ -542,6 +584,7 @@ def _ep_global_rank(ep_group: dist.ProcessGroup | None, ep_rank: int) -> int:
 def _create_expert_swap_process_group(
     ep_group: dist.ProcessGroup | None,
     ep_size: int,
+    group_desc: str = "hiermoe_expert_swap",
 ) -> dist.ProcessGroup | None:
     if ep_group is None or ep_size <= 1 or not dist.is_available() or not dist.is_initialized():
         return None
@@ -551,7 +594,7 @@ def _create_expert_swap_process_group(
             ranks=global_ranks,
             backend=dist.get_backend(ep_group),
             use_local_synchronization=True,
-            group_desc="hiermoe_expert_swap",
+            group_desc=group_desc,
         )
     except TypeError as error:
         raise RuntimeError(
@@ -2374,6 +2417,7 @@ class ExpertSwapManager:
         configured_max_replica_rounds: int | None = None,
         replica_slot_capacity: int | None = None,
         planner_route_sample_size: int = 1024,
+        fixed_pipeline_overlap: bool = False,
         greedy_max_copies_per_expert: int = 4,
         debug_validate: bool = False,
     ) -> None:
@@ -2428,12 +2472,26 @@ class ExpertSwapManager:
                 raise ValueError("hiermoe_greedy_cover_p1 supports at most one steady-state swap per layer.")
             if self.redundant_slot_increment_per_device <= 0:
                 raise ValueError("hiermoe_greedy_cover_p1 requires redundant expert slots.")
+        self.fixed_pipeline_overlap = bool(fixed_pipeline_overlap)
+        if self.fixed_pipeline_overlap and (
+            self.expert_swap_mode != "step" or self.expert_swap_selector != "hiermoe_greedy_cover_p1"
+        ):
+            raise ValueError("fixed_pipeline_overlap requires step mode with the hiermoe_greedy_cover_p1 selector.")
+
         self.activation_checkpointing_enabled = bool(activation_checkpointing_enabled)
         self._swap_group = (
             _create_expert_swap_process_group(ep_group, self.ep_size)
-            if self.expert_swap_max_pairs_per_layer > 0
+            if self.expert_swap_max_pairs_per_layer > 0 and not self.fixed_pipeline_overlap
             else None
         )
+        # Planner collectives, staged migration, and redundant-gradient sync
+        # occupy disjoint fixed windows, so the existing EP communicator can be
+        # reused without conflicting collective order or reserving another EP32
+        # HCCL workspace.
+        self._pipeline_background_group = ep_group if self.fixed_pipeline_overlap else None
+        self._pipeline_planner_group = self._pipeline_background_group
+        self._pipeline_migration_group = self._pipeline_background_group
+        self._pipeline_grad_group = self._pipeline_background_group
         self.gradient_bytes_per_element = max(1, int(gradient_bytes_per_element))
         self.debug_validate = bool(debug_validate)
         self.layers: dict[str, ExpertLayerState] = {}
@@ -2453,6 +2511,46 @@ class ExpertSwapManager:
         self._pending_state: dict[str, Any] | None = None
         self._placement_metrics: dict[str, float | int | str] = {}
         self._metrics_step = -1
+
+        self._pipeline_lock = Lock()
+        self._pipeline_grad_submit_lock = Lock()
+        self._pipeline_plan_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="hiermoe-plan")
+            if self.fixed_pipeline_overlap
+            else None
+        )
+        self._pipeline_migration_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="hiermoe-move")
+            if self.fixed_pipeline_overlap
+            else None
+        )
+        self._pipeline_grad_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="hiermoe-grad")
+            if self.fixed_pipeline_overlap
+            else None
+        )
+        self._pipeline_streams: dict[tuple[str, torch.device], Any] = {}
+        self._pipeline_plan_futures: dict[str, Future[_PipelinePlanResult]] = {}
+        self._pipeline_planner_windows: dict[str, _PipelinePlannerWindows] = {}
+        self._pipeline_planner_dispatch_events: dict[str, Any] = {}
+        self._pipeline_pending_plans: dict[str, _PendingPipelinePlan] = {}
+        self._pipeline_migration_futures: dict[str, Future[_PipelineMigrationResult]] = {}
+        self._pipeline_grad_futures: dict[str, Future[_PipelineGradResult]] = {}
+        self._pipeline_grad_ready: dict[str, set[int]] = defaultdict(set)
+        self._pipeline_grad_ready_events: dict[str, dict[int, Any]] = defaultdict(dict)
+        self._pipeline_grad_dispatch_complete: set[str] = set()
+        self._pipeline_grad_window_waited: set[str] = set()
+        self._pipeline_grad_comm_blocked = False
+        self._pipeline_grad_window_exposed_ms = 0.0
+        self._pipeline_grad_hook_handles: list[Any] = []
+        self._pipeline_grad_hook_params: set[int] = set()
+        self._pipeline_step = -1
+        self._pipeline_micro_step = 0
+        self._pipeline_num_micro_steps = 1
+        self._pipeline_next_migration_index = 0
+        self._pipeline_next_grad_index = 0
+        self._pipeline_layer_order: tuple[str, ...] = ()
+        self._pipeline_shutdown = False
 
     def placement_planning_enabled(self) -> bool:
         return self.expert_swap_max_pairs_per_layer > 0 or self.redundant_slot_increment_per_device > 0
@@ -2480,6 +2578,7 @@ class ExpertSwapManager:
             "hiermoe/placement_route_sample_size": self.planner_route_sample_size,
             "hiermoe/placement_runtime_cost_model": self.perf_model.runtime_cost_status,
             "hiermoe/expert_swap_selector": self.expert_swap_selector,
+            "hiermoe/fixed_pipeline_overlap": int(self.fixed_pipeline_overlap),
         }
 
     def _accumulate_metric(self, key: str, value: float | int | str) -> None:
@@ -2489,6 +2588,655 @@ class ExpertSwapManager:
             self._placement_metrics[key] = int(self._placement_metrics.get(key, 0)) + value
         else:
             self._placement_metrics[key] = float(self._placement_metrics.get(key, 0.0)) + float(value)
+
+    def _pipeline_device(self, layer: ExpertLayerState) -> torch.device:
+        return _local_tensor_view(layer.gate_up_proj).device
+
+    def _pipeline_stream(self, kind: str, device: torch.device) -> Any | None:
+        if device.type == "cpu":
+            return None
+        key = (str(kind), device)
+        cached = self._pipeline_streams.get(key)
+        if cached is not None:
+            return cached
+        device_api = get_torch_device()
+        device_api.set_device(device)
+        try:
+            cached = device_api.Stream(device=device)
+        except TypeError:
+            cached = device_api.Stream()
+        self._pipeline_streams[key] = cached
+        return cached
+
+    @staticmethod
+    def _pipeline_ready_event(device: torch.device) -> Any | None:
+        if device.type == "cpu":
+            return None
+        device_api = get_torch_device()
+        try:
+            current_stream = device_api.current_stream(device)
+        except TypeError:
+            current_stream = device_api.current_stream()
+        event = device_api.Event()
+        event.record(current_stream)
+        return event
+
+    def _run_pipeline_stream_task(
+        self,
+        kind: str,
+        device: torch.device,
+        ready_event: Any | None,
+        task: Any,
+    ) -> Any:
+        if device.type == "cpu":
+            return task()
+        device_api = get_torch_device()
+        device_api.set_device(device)
+        stream = self._pipeline_stream(kind, device)
+        assert stream is not None
+        with device_api.stream(stream):
+            if ready_event is not None:
+                ready_events = ready_event if isinstance(ready_event, tuple) else (ready_event,)
+                for event in ready_events:
+                    if event is not None:
+                        stream.wait_event(event)
+            result = task()
+        stream.synchronize()
+        return result
+
+    def configure_pipeline_microstep(self, step: int, micro_step: int, num_micro_steps: int) -> None:
+        """Advance the fixed pipeline at a deterministic microbatch boundary."""
+
+        if not self.fixed_pipeline_overlap:
+            return
+        self._pipeline_step = int(step)
+        self._pipeline_micro_step = int(micro_step)
+        self._pipeline_num_micro_steps = max(1, int(num_micro_steps))
+        if int(micro_step) != 0:
+            return
+        self._debug_log_redundant_copy_stats("step_begin", include_grads=False)
+        self._begin_metrics_step(step)
+        with self._pipeline_lock:
+            if self._pipeline_grad_futures:
+                raise RuntimeError("HierMoE started a new step before redundant gradient synchronization completed.")
+            self._pipeline_grad_ready.clear()
+            self._pipeline_grad_ready_events.clear()
+            self._pipeline_grad_dispatch_complete.clear()
+            self._pipeline_grad_window_waited.clear()
+            self._pipeline_grad_comm_blocked = False
+            self._pipeline_grad_window_exposed_ms = 0.0
+            self._pipeline_layer_order = tuple(self.layers)
+            self._pipeline_next_migration_index = 0
+            self._pipeline_next_grad_index = 0
+        self._launch_next_pipeline_migration()
+
+    def _pipeline_is_final_microstep(self) -> bool:
+        return self._pipeline_micro_step + 1 >= self._pipeline_num_micro_steps
+
+    def _submit_pipeline_plan(
+        self,
+        layer: ExpertLayerState,
+        selected_experts: torch.Tensor,
+        step: int,
+    ) -> None:
+        executor = self._pipeline_plan_executor
+        if executor is None or self._pipeline_shutdown:
+            return
+        if self.expert_swap_max_pairs_per_layer <= 0 and self.max_replica_rounds <= 0:
+            return
+        if not self._pipeline_is_final_microstep():
+            return
+        if self.expert_swap_interval <= 0 or int(step) % self.expert_swap_interval != 0:
+            return
+        layout = self._layer_layout(layer)
+        if bool((layout < 0).any().item()):
+            return
+        with self._pipeline_lock:
+            if layer.key in self._pipeline_plan_futures or layer.last_planned_step == int(step):
+                return
+            layer.last_planned_step = int(step)
+            windows = _PipelinePlannerWindows()
+            self._pipeline_planner_windows[layer.key] = windows
+        device = selected_experts.device
+        ready_event = self._pipeline_ready_event(device)
+        submitted_at = time.perf_counter()
+        route = selected_experts.detach()
+        owners = layer.logical_to_physical.detach().cpu().clone()
+        placement_version = int(layer.placement_version)
+        future = executor.submit(
+            self._pipeline_plan_worker,
+            layer.key,
+            route,
+            layout,
+            owners,
+            placement_version,
+            int(step),
+            ready_event,
+            submitted_at,
+        )
+        with self._pipeline_lock:
+            self._pipeline_plan_futures[layer.key] = future
+
+    @torch.no_grad()
+    def _pipeline_plan_worker(
+        self,
+        layer_key: str,
+        selected_experts: torch.Tensor,
+        layout: torch.Tensor,
+        owners: torch.Tensor,
+        placement_version: int,
+        source_step: int,
+        ready_event: Any | None,
+        submitted_at: float,
+    ) -> _PipelinePlanResult:
+        layer = self.layers[layer_key]
+        device = selected_experts.device
+        started = time.perf_counter()
+
+        def run() -> PlacementPlan:
+            planner = self._planner_for_layer(
+                layer,
+                communication_scale=1.0,
+                forward_compute_per_assignment=0.0,
+                forward_compute_constant=0.0,
+                process_group=self._pipeline_planner_group,
+            )
+            if not isinstance(planner, GreedyCommunicationPlanner):
+                raise RuntimeError("The fixed pipeline requires GreedyCommunicationPlanner.")
+            planner.reducer = lambda tensor: self._pipeline_planner_reduce_sum(
+                layer_key, tensor, device
+            )
+            return planner.plan_layers(
+                [selected_experts],
+                [layout],
+                [owners],
+                source_ranks=self.ep_rank,
+                max_swaps=self.expert_swap_max_pairs_per_layer,
+                max_replicas=self.max_replica_rounds,
+                layer_seeds=[zlib.crc32(layer_key.encode("utf-8"))],
+                step=source_step,
+                communication_scales=[1.0],
+                forward_compute_per_assignment=[0.0],
+                forward_compute_constant=[0.0],
+                skip_final_route_update=True,
+            )[0]
+
+        plan = self._run_pipeline_stream_task("planner", device, ready_event, run)
+        finished = time.perf_counter()
+        return _PipelinePlanResult(
+            layer_key=layer_key,
+            source_step=source_step,
+            placement_version=placement_version,
+            plan=plan,
+            raw_ms=(finished - started) * 1000.0,
+            latency_ms=(finished - submitted_at) * 1000.0,
+        )
+
+    def _pipeline_planner_reduce_sum(
+        self,
+        layer_key: str,
+        tensor: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Confine the planner collective to the layer's expert-compute window."""
+
+        with self._pipeline_lock:
+            windows = self._pipeline_planner_windows[layer_key]
+        windows.collective_gate.wait()
+        with self._pipeline_lock:
+            dispatch_done = self._pipeline_planner_dispatch_events.get(layer_key)
+        stream = self._pipeline_stream("planner", device)
+        if stream is not None and dispatch_done is not None:
+            stream.wait_event(dispatch_done)
+        try:
+            reduced = self._planner_reduce_sum(tensor, self._pipeline_planner_group)
+            if stream is not None:
+                stream.synchronize()
+        except BaseException:
+            windows.collective_done.set()
+            raise
+        windows.collective_done.set()
+        windows.score_gate.wait()
+        return reduced
+
+    @staticmethod
+    def _wait_pipeline_stage(event: Event, future: Future[Any]) -> None:
+        while not event.wait(timeout=0.001):
+            if future.done():
+                future.result()
+
+    def open_pipeline_planner_collective_window(self, layer_key: str) -> None:
+        """Allow the layer planner collective after training dispatch finishes."""
+
+        if not self.fixed_pipeline_overlap:
+            return
+        layer = self.layers.get(layer_key)
+        dispatch_done = None if layer is None else self._pipeline_ready_event(self._pipeline_device(layer))
+        with self._pipeline_lock:
+            windows = self._pipeline_planner_windows.get(layer_key)
+            if windows is not None:
+                self._pipeline_planner_dispatch_events[layer_key] = dispatch_done
+        if windows is not None:
+            windows.collective_gate.set()
+
+    def open_pipeline_planner_score_window(self, layer_key: str) -> None:
+        """End the collective window and admit scoring before training combine."""
+
+        if not self.fixed_pipeline_overlap:
+            return
+        with self._pipeline_lock:
+            windows = self._pipeline_planner_windows.get(layer_key)
+            future = self._pipeline_plan_futures.get(layer_key)
+        if windows is None or future is None:
+            return
+        windows.collective_gate.set()
+        wait_started = time.perf_counter()
+        self._wait_pipeline_stage(windows.collective_done, future)
+        exposed_ms = (time.perf_counter() - wait_started) * 1000.0
+        self._accumulate_metric("hiermoe/pipeline_planner_collective_exposed_ms", exposed_ms)
+        self._accumulate_metric("hiermoe/pipeline_planner_exposed_ms", exposed_ms)
+        if exposed_ms > 0.01:
+            self._accumulate_metric("hiermoe/pipeline_planner_collective_window_miss", 1)
+        windows.score_gate.set()
+
+    def _collect_pipeline_plans(self, step: int) -> str:
+        with self._pipeline_lock:
+            futures = [
+                (key, self._pipeline_plan_futures[key])
+                for key in self._pipeline_layer_order
+                if key in self._pipeline_plan_futures
+            ]
+        committed: list[str] = []
+        raw_ms = 0.0
+        exposed_ms = 0.0
+        deadline_misses = 0
+        latency_ms = 0.0
+        accepted = 0
+        for layer_key, future in futures:
+            wait_started = time.perf_counter()
+            result = future.result()
+            layer_exposed_ms = (time.perf_counter() - wait_started) * 1000.0
+            exposed_ms += layer_exposed_ms
+            if layer_exposed_ms > 0.01:
+                deadline_misses += 1
+            raw_ms += result.raw_ms
+            latency_ms += result.latency_ms
+            layer = self.layers[layer_key]
+            layer.last_plan = result.plan
+            self._record_plan_metrics(result.plan)
+            if result.source_step != int(step) or result.placement_version != int(layer.placement_version):
+                self._accumulate_metric("hiermoe/pipeline_planner_stale", 1)
+            elif result.plan.actions:
+                self._pipeline_pending_plans[layer_key] = _PendingPipelinePlan(
+                    source_step=result.source_step,
+                    placement_version=result.placement_version,
+                    plan=result.plan,
+                )
+                committed.extend(f"{layer_key}:{action.format()}" for action in result.plan.actions)
+                accepted += 1
+            with self._pipeline_lock:
+                self._pipeline_plan_futures.pop(layer_key, None)
+                self._pipeline_planner_windows.pop(layer_key, None)
+                self._pipeline_planner_dispatch_events.pop(layer_key, None)
+        self._accumulate_metric("hiermoe/pipeline_planner_jobs", len(futures))
+        self._accumulate_metric("hiermoe/pipeline_planner_accepted", accepted)
+        self._accumulate_metric("hiermoe/pipeline_planner_raw_ms", raw_ms)
+        self._accumulate_metric("hiermoe/pipeline_planner_latency_ms", latency_ms)
+        self._accumulate_metric("hiermoe/pipeline_planner_deadline_exposed_ms", exposed_ms)
+        self._accumulate_metric("hiermoe/pipeline_planner_deadline_miss", deadline_misses)
+        self._accumulate_metric("hiermoe/pipeline_planner_exposed_ms", exposed_ms)
+        exposed_total = float(self._placement_metrics.get("hiermoe/pipeline_planner_exposed_ms", 0.0))
+        if raw_ms > 0.0:
+            self._placement_metrics["hiermoe/pipeline_planner_hidden_ratio"] = max(
+                0.0,
+                min(1.0, 1.0 - exposed_total / raw_ms),
+            )
+        self.latest_pair = ",".join(committed) if committed else "none"
+        return self.latest_pair
+
+    def _launch_next_pipeline_migration(self) -> None:
+        executor = self._pipeline_migration_executor
+        if executor is None or self._pipeline_shutdown:
+            return
+        with self._pipeline_lock:
+            if self._pipeline_migration_futures:
+                return
+            while self._pipeline_next_migration_index < len(self._pipeline_layer_order):
+                layer_key = self._pipeline_layer_order[self._pipeline_next_migration_index]
+                self._pipeline_next_migration_index += 1
+                pending = self._pipeline_pending_plans.get(layer_key)
+                if pending is None:
+                    continue
+                layer = self.layers[layer_key]
+                if int(layer.placement_version) != pending.placement_version:
+                    self._pipeline_pending_plans.pop(layer_key, None)
+                    self._accumulate_metric("hiermoe/pipeline_migration_stale", 1)
+                    continue
+                device = self._pipeline_device(layer)
+                ready_event = self._pipeline_ready_event(device)
+                future = executor.submit(
+                    self._pipeline_migration_worker,
+                    layer_key,
+                    pending,
+                    ready_event,
+                )
+                self._pipeline_migration_futures[layer_key] = future
+                return
+
+    @torch.no_grad()
+    def _pipeline_migration_worker(
+        self,
+        layer_key: str,
+        pending: _PendingPipelinePlan,
+        ready_event: Any | None,
+    ) -> _PipelineMigrationResult:
+        layer = self.layers[layer_key]
+        device = self._pipeline_device(layer)
+        started = time.perf_counter()
+
+        def run() -> tuple[str, ...]:
+            committed = self._execute_placement_plan(
+                layer,
+                pending.plan,
+                timing_prefix="hiermoe_pipeline_migration",
+                transfer_group=self._pipeline_migration_group,
+                force_staged_transfer=True,
+            )
+            return tuple(committed)
+
+        committed = self._run_pipeline_stream_task("migration", device, ready_event, run)
+        return _PipelineMigrationResult(
+            layer_key=layer_key,
+            source_step=pending.source_step,
+            committed=committed,
+            raw_ms=(time.perf_counter() - started) * 1000.0,
+        )
+
+    def _finish_pipeline_migration(self, layer_key: str, *, wait: bool) -> bool:
+        with self._pipeline_lock:
+            future = self._pipeline_migration_futures.get(layer_key)
+        if future is None or (not wait and not future.done()):
+            return False
+        wait_started = time.perf_counter()
+        result = future.result()
+        exposed_ms = (time.perf_counter() - wait_started) * 1000.0 if wait else 0.0
+        with self._pipeline_lock:
+            self._pipeline_migration_futures.pop(layer_key, None)
+            self._pipeline_pending_plans.pop(layer_key, None)
+        self._accumulate_metric("hiermoe/pipeline_migration_jobs", 1)
+        self._accumulate_metric("hiermoe/pipeline_migration_raw_ms", result.raw_ms)
+        self._accumulate_metric("hiermoe/pipeline_migration_exposed_ms", exposed_ms)
+        raw_total = float(self._placement_metrics.get("hiermoe/pipeline_migration_raw_ms", 0.0))
+        exposed_total = float(self._placement_metrics.get("hiermoe/pipeline_migration_exposed_ms", 0.0))
+        if raw_total > 0.0:
+            self._placement_metrics["hiermoe/pipeline_migration_hidden_ratio"] = max(
+                0.0,
+                min(1.0, 1.0 - exposed_total / raw_total),
+            )
+        if exposed_ms > 0.01:
+            self._accumulate_metric("hiermoe/pipeline_migration_deadline_miss", 1)
+        return True
+
+    def advance_pipeline_after_combine(self, _layer_key: str) -> None:
+        if not self.fixed_pipeline_overlap:
+            return
+        # Candidate scoring is a compute-only stage whose deadline is the next
+        # step, not the end of the current layer. Let the single planner queue
+        # carry it diagonally across later layers and collect completed plans at
+        # the optimizer boundary.
+        with self._pipeline_lock:
+            active = tuple(self._pipeline_migration_futures)
+        if active and self._finish_pipeline_migration(active[0], wait=False):
+            self._launch_next_pipeline_migration()
+        elif not active:
+            self._launch_next_pipeline_migration()
+
+    def wait_pipeline_migration_before_layer(self, layer_key: str) -> None:
+        if not self.fixed_pipeline_overlap or layer_key not in self._pipeline_pending_plans:
+            return
+        while layer_key in self._pipeline_pending_plans:
+            with self._pipeline_lock:
+                active = tuple(self._pipeline_migration_futures)
+            if not active:
+                self._launch_next_pipeline_migration()
+                continue
+            self._finish_pipeline_migration(active[0], wait=True)
+
+    def _register_pipeline_gradient_hooks(self, layer: ExpertLayerState) -> None:
+        if not self.fixed_pipeline_overlap:
+            return
+        for param_index, param in enumerate((layer.gate_up_proj, layer.down_proj)):
+            if id(param) in self._pipeline_grad_hook_params:
+                continue
+            register = getattr(param, "register_post_accumulate_grad_hook", None)
+            if register is None:
+                logger.warning_rank0(
+                    "HierMoE fixed pipeline cannot register a post-accumulate hook for layer %s; "
+                    "that layer will synchronize at the optimizer deadline.",
+                    layer.key,
+                )
+                continue
+
+            def hook(_param: torch.Tensor, *, key: str = layer.key, index: int = param_index) -> None:
+                device = _local_tensor_view(_param).device
+                self._pipeline_on_gradient_ready(key, index, self._pipeline_ready_event(device))
+
+            try:
+                handle = register(hook)
+            except (RuntimeError, TypeError) as error:
+                logger.warning_rank0(
+                    "HierMoE fixed pipeline failed to register a gradient hook for layer %s: %s. "
+                    "The optimizer deadline fallback remains active.",
+                    layer.key,
+                    error,
+                )
+                continue
+            self._pipeline_grad_hook_handles.append(handle)
+            self._pipeline_grad_hook_params.add(id(param))
+
+    def _pipeline_on_gradient_ready(
+        self,
+        layer_key: str,
+        param_index: int,
+        ready_event: Any | None = None,
+    ) -> None:
+        if not self.fixed_pipeline_overlap or self._pipeline_shutdown or not self._pipeline_is_final_microstep():
+            return
+        with self._pipeline_lock:
+            index = int(param_index)
+            self._pipeline_grad_ready[layer_key].add(index)
+            if ready_event is not None:
+                self._pipeline_grad_ready_events[layer_key][index] = ready_event
+        self._advance_pipeline_gradient_queue()
+
+    def _advance_pipeline_gradient_queue(self) -> None:
+        """Submit ready layers after dispatch backward in deterministic order."""
+
+        order = tuple(reversed(self._pipeline_layer_order or tuple(self.layers)))
+        with self._pipeline_grad_submit_lock:
+            while True:
+                with self._pipeline_lock:
+                    if self._pipeline_grad_comm_blocked:
+                        return
+                    index = self._pipeline_next_grad_index
+                    if index >= len(order):
+                        return
+                    layer_key = order[index]
+                    if (
+                        len(self._pipeline_grad_ready[layer_key]) < 2
+                        or layer_key not in self._pipeline_grad_dispatch_complete
+                    ):
+                        return
+                    self._pipeline_next_grad_index += 1
+                self._submit_pipeline_gradient_sync(layer_key)
+
+    def close_pipeline_gradient_window_before_dispatch(self, _layer_key: str) -> None:
+        """Drain background gradient communication before training dispatch backward."""
+
+        if not self.fixed_pipeline_overlap or not self._pipeline_is_final_microstep():
+            return
+        with self._pipeline_grad_submit_lock:
+            with self._pipeline_lock:
+                self._pipeline_grad_comm_blocked = True
+                futures = [
+                    (layer_key, future)
+                    for layer_key, future in self._pipeline_grad_futures.items()
+                    if layer_key not in self._pipeline_grad_window_waited
+                ]
+        exposed_ms = 0.0
+        for layer_key, future in futures:
+            wait_started = time.perf_counter()
+            future.result()
+            exposed_ms += (time.perf_counter() - wait_started) * 1000.0
+            with self._pipeline_lock:
+                self._pipeline_grad_window_waited.add(layer_key)
+        self._pipeline_grad_window_exposed_ms += exposed_ms
+        self._accumulate_metric("hiermoe/pipeline_grad_sync_window_exposed_ms", exposed_ms)
+        if exposed_ms > 0.01:
+            self._accumulate_metric("hiermoe/pipeline_grad_sync_window_miss", 1)
+
+    def open_pipeline_gradient_window_after_dispatch(self, layer_key: str) -> None:
+        """Admit this layer's redundant-gradient sync after dispatch backward."""
+
+        if not self.fixed_pipeline_overlap or not self._pipeline_is_final_microstep():
+            return
+        with self._pipeline_grad_submit_lock:
+            with self._pipeline_lock:
+                self._pipeline_grad_dispatch_complete.add(layer_key)
+                self._pipeline_grad_comm_blocked = False
+        self._advance_pipeline_gradient_queue()
+
+    @torch.no_grad()
+    def _submit_pipeline_gradient_sync(self, layer_key: str) -> None:
+        executor = self._pipeline_grad_executor
+        if executor is None or self._pipeline_shutdown:
+            return
+        layer = self.layers[layer_key]
+        schedule = self._replica_grad_schedule_for_layer(layer)
+        if not schedule.groups:
+            return
+        with self._pipeline_lock:
+            if layer_key in self._pipeline_grad_futures:
+                return
+        device = self._pipeline_device(layer)
+        dispatch_event = self._pipeline_ready_event(device)
+        with self._pipeline_lock:
+            parameter_events = tuple(
+                self._pipeline_grad_ready_events[layer_key][index]
+                for index in sorted(self._pipeline_grad_ready_events[layer_key])
+            )
+        ready_events = parameter_events + ((dispatch_event,) if dispatch_event is not None else ())
+        future = executor.submit(
+            self._pipeline_gradient_worker,
+            layer_key,
+            schedule,
+            ready_events or None,
+        )
+        with self._pipeline_lock:
+            self._pipeline_grad_futures[layer_key] = future
+
+    @torch.no_grad()
+    def _pipeline_gradient_worker(
+        self,
+        layer_key: str,
+        schedule: _ReplicaGradSchedule,
+        ready_event: Any | None,
+    ) -> _PipelineGradResult:
+        layer = self.layers[layer_key]
+        device = self._pipeline_device(layer)
+        started = time.perf_counter()
+
+        def run() -> None:
+            self._zero_inactive_slot_grads_for_layer(layer)
+            contributions = self._replica_grad_contributions(layer, schedule)
+            if schedule.pairwise:
+                self._sync_pairwise_replica_gradients(
+                    schedule,
+                    contributions,
+                    process_group=self._pipeline_grad_group,
+                )
+            else:
+                self._sync_owner_replica_gradients(
+                    schedule,
+                    contributions,
+                    process_group=self._pipeline_grad_group,
+                )
+
+        self._run_pipeline_stream_task("gradient", device, ready_event, run)
+        return _PipelineGradResult(
+            layer_key=layer_key,
+            raw_ms=(time.perf_counter() - started) * 1000.0,
+        )
+
+    @torch.no_grad()
+    def _finish_pipeline_gradient_sync(self) -> None:
+        order = self._pipeline_layer_order or tuple(self.layers)
+        with self._pipeline_grad_submit_lock:
+            with self._pipeline_lock:
+                self._pipeline_grad_comm_blocked = False
+                self._pipeline_grad_dispatch_complete.update(order)
+            for layer_key in reversed(order):
+                self._submit_pipeline_gradient_sync(layer_key)
+        with self._pipeline_lock:
+            futures = [
+                (layer_key, self._pipeline_grad_futures[layer_key])
+                for layer_key in reversed(order)
+                if layer_key in self._pipeline_grad_futures
+            ]
+        raw_ms = 0.0
+        deadline_exposed_ms = 0.0
+        for layer_key, future in futures:
+            if layer_key in self._pipeline_grad_window_waited:
+                result = future.result()
+            else:
+                wait_started = time.perf_counter()
+                result = future.result()
+                deadline_exposed_ms += (time.perf_counter() - wait_started) * 1000.0
+            raw_ms += result.raw_ms
+            with self._pipeline_lock:
+                self._pipeline_grad_futures.pop(layer_key, None)
+        exposed_ms = self._pipeline_grad_window_exposed_ms + deadline_exposed_ms
+        self._accumulate_metric("hiermoe/pipeline_grad_sync_jobs", len(futures))
+        self._accumulate_metric("hiermoe/pipeline_grad_sync_raw_ms", raw_ms)
+        self._accumulate_metric("hiermoe/pipeline_grad_sync_deadline_exposed_ms", deadline_exposed_ms)
+        self._accumulate_metric("hiermoe/pipeline_grad_sync_exposed_ms", exposed_ms)
+        if raw_ms > 0.0:
+            self._placement_metrics["hiermoe/pipeline_grad_sync_hidden_ratio"] = max(
+                0.0,
+                min(1.0, 1.0 - exposed_ms / raw_ms),
+            )
+        if deadline_exposed_ms > 0.01:
+            self._accumulate_metric("hiermoe/pipeline_grad_sync_deadline_miss", 1)
+        with self._pipeline_lock:
+            self._pipeline_grad_window_waited.clear()
+            self._pipeline_grad_window_exposed_ms = 0.0
+        self._debug_log_redundant_copy_stats("after_grad_sync", include_grads=True)
+        self._clear_accumulated_token_counts()
+
+    def shutdown_pipeline(self) -> None:
+        if not self.fixed_pipeline_overlap or self._pipeline_shutdown:
+            return
+        self._pipeline_shutdown = True
+        with self._pipeline_lock:
+            windows = tuple(self._pipeline_planner_windows.values())
+        for window in windows:
+            window.collective_gate.set()
+            window.score_gate.set()
+        for future in tuple(self._pipeline_plan_futures.values()):
+            future.result()
+        for future in tuple(self._pipeline_migration_futures.values()):
+            future.result()
+        for future in tuple(self._pipeline_grad_futures.values()):
+            future.result()
+        for handle in self._pipeline_grad_hook_handles:
+            handle.remove()
+        for executor in (
+            self._pipeline_plan_executor,
+            self._pipeline_migration_executor,
+            self._pipeline_grad_executor,
+        ):
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=False)
 
     def bind_optimizer(self, optimizer: Any) -> None:
         self.optimizer = optimizer
@@ -2573,7 +3321,7 @@ class ExpertSwapManager:
             ]
 
         for key, candidate in items:
-            groups = candidate.redundant_copy_groups()
+            groups = candidate.redundant_copy_groups()[:_DEBUG_REDUNDANT_COPY_STATS_MAX_GROUPS]
             if not groups:
                 continue
             param_delta = 0.0
@@ -2784,6 +3532,7 @@ class ExpertSwapManager:
         self.module_id_to_key[id(module)] = key
         self.param_id_to_key[id(gate_up_proj)] = key
         self.param_id_to_key[id(down_proj)] = key
+        self._register_pipeline_gradient_hooks(self.layers[key])
 
     def get_layer_key(self, module: nn.Module) -> str | None:
         return self.module_id_to_key.get(id(module))
@@ -2967,6 +3716,8 @@ class ExpertSwapManager:
             layer.latest_route_step = int(step)
         layer.latest_hidden_size = int(hidden_size)
         layer.latest_bytes_per_element = int(bytes_per_element)
+        if self.fixed_pipeline_overlap and step is not None:
+            self._submit_pipeline_plan(layer, selected_experts, int(step))
 
     def mark_route_step(self, layer_key: str, step: int) -> None:
         layer = self.layers.get(layer_key)
@@ -3072,17 +3823,21 @@ class ExpertSwapManager:
     @torch.no_grad()
     def _zero_inactive_slot_grads(self) -> None:
         for layer in self.layers.values():
-            counts = layer.accumulated_tokens_per_local_expert
-            if counts is None or not layer.slot_layout_enabled:
-                continue
-            if counts.ndim != 1 or int(counts.numel()) != int(layer.num_local_experts):
-                layer.accumulated_tokens_per_local_expert = None
-                continue
-            zero_slots = counts <= 0
-            # NPU grouped-matmul backward may leave undefined weight gradients
-            # for zero-token groups. Those slots are mathematically inactive.
-            self._zero_grad_slots(layer.gate_up_proj, zero_slots)
-            self._zero_grad_slots(layer.down_proj, zero_slots)
+            self._zero_inactive_slot_grads_for_layer(layer)
+
+    @torch.no_grad()
+    def _zero_inactive_slot_grads_for_layer(self, layer: ExpertLayerState) -> None:
+        counts = layer.accumulated_tokens_per_local_expert
+        if counts is None or not layer.slot_layout_enabled:
+            return
+        if counts.ndim != 1 or int(counts.numel()) != int(layer.num_local_experts):
+            layer.accumulated_tokens_per_local_expert = None
+            return
+        zero_slots = counts <= 0
+        # NPU grouped-matmul backward may leave undefined weight gradients
+        # for zero-token groups. Those slots are mathematically inactive.
+        self._zero_grad_slots(layer.gate_up_proj, zero_slots)
+        self._zero_grad_slots(layer.down_proj, zero_slots)
 
     def _clear_accumulated_token_counts(self) -> None:
         for layer in self.layers.values():
@@ -3740,8 +4495,10 @@ class ExpertSwapManager:
         phase: str,
         send_buffers: dict[int, torch.Tensor],
         recv_specs: dict[int, tuple[int, torch.dtype, torch.device]],
+        process_group: dist.ProcessGroup | None = None,
     ) -> dict[int, torch.Tensor]:
-        if self.ep_group is None or self.ep_size <= 1:
+        process_group = self.ep_group if process_group is None else process_group
+        if process_group is None or self.ep_size <= 1:
             if send_buffers or recv_specs:
                 raise RuntimeError("HierMoE redundant gradient synchronization requires an EP process group.")
             return {}
@@ -3758,13 +4515,13 @@ class ExpertSwapManager:
         }
         ops: list[dist.P2POp] = []
         for peer_rank in sorted(set(send_buffers) | set(recv_buffers)):
-            peer_global_rank = _ep_global_rank(self.ep_group, peer_rank)
+            peer_global_rank = _ep_global_rank(process_group, peer_rank)
             send_buffer = send_buffers.get(peer_rank)
             if send_buffer is not None:
-                ops.append(dist.P2POp(dist.isend, send_buffer, peer_global_rank))
+                ops.append(dist.P2POp(dist.isend, send_buffer, peer_global_rank, process_group))
             recv_buffer = recv_buffers.get(peer_rank)
             if recv_buffer is not None:
-                ops.append(dist.P2POp(dist.irecv, recv_buffer, peer_global_rank))
+                ops.append(dist.P2POp(dist.irecv, recv_buffer, peer_global_rank, process_group))
         if ops:
             works = dist.batch_isend_irecv(ops)
             for work in works:
@@ -3778,6 +4535,7 @@ class ExpertSwapManager:
             tuple[torch.device, torch.dtype],
             dict[tuple[int, int], _ReplicaGradContribution],
         ],
+        process_group: dist.ProcessGroup | None = None,
     ) -> None:
         for bucket_key in sorted(contributions_by_bucket, key=self._replica_grad_bucket_sort_key):
             device, dtype = bucket_key
@@ -3814,6 +4572,7 @@ class ExpertSwapManager:
             recv_buffers = self._run_replica_grad_p2p_wave(
                 phase="pairwise",
                 send_buffers=send_buffers,
+                process_group=process_group,
                 recv_specs=recv_specs,
             )
             for peer_rank, items in peer_items.items():
@@ -3832,6 +4591,7 @@ class ExpertSwapManager:
             tuple[torch.device, torch.dtype],
             dict[tuple[int, int], _ReplicaGradContribution],
         ],
+        process_group: dist.ProcessGroup | None = None,
     ) -> None:
         for bucket_key in sorted(contributions_by_bucket, key=self._replica_grad_bucket_sort_key):
             device, dtype = bucket_key
@@ -3873,6 +4633,7 @@ class ExpertSwapManager:
             reduce_recv_buffers = self._run_replica_grad_p2p_wave(
                 phase="reduce",
                 send_buffers=reduce_send_buffers,
+                process_group=process_group,
                 recv_specs=reduce_recv_specs,
             )
             for peer_rank, items in reduce_recv_items.items():
@@ -3917,6 +4678,7 @@ class ExpertSwapManager:
             broadcast_recv_buffers = self._run_replica_grad_p2p_wave(
                 phase="broadcast",
                 send_buffers=broadcast_send_buffers,
+                process_group=process_group,
                 recv_specs=broadcast_recv_specs,
             )
 
@@ -3932,6 +4694,10 @@ class ExpertSwapManager:
 
     @torch.no_grad()
     def sync_redundant_gradients(self) -> None:
+        if self.fixed_pipeline_overlap:
+            with _full_timing_range("hiermoe_redundant_grad_sync_deadline"):
+                self._finish_pipeline_gradient_sync()
+            return
         with _full_timing_range("hiermoe_redundant_grad_sync"):
             self._zero_inactive_slot_grads()
             self._debug_log_redundant_copy_stats("before_grad_sync", include_grads=True)
@@ -3963,20 +4729,26 @@ class ExpertSwapManager:
                 masks[id(param)] = mask
         return masks
 
-    def _planner_collective_backend(self) -> str | None:
-        if self.ep_group is None or self.ep_size <= 1:
+    def _planner_collective_backend(self, process_group: dist.ProcessGroup | None = None) -> str | None:
+        process_group = self.ep_group if process_group is None else process_group
+        if process_group is None or self.ep_size <= 1:
             return None
-        return str(dist.get_backend(self.ep_group)).lower().rsplit(".", maxsplit=1)[-1]
+        return str(dist.get_backend(process_group)).lower().rsplit(".", maxsplit=1)[-1]
 
-    def _planner_reduce_sum(self, tensor: torch.Tensor) -> torch.Tensor:
-        if self.ep_group is not None and self.ep_size > 1:
-            backend = self._planner_collective_backend()
+    def _planner_reduce_sum(
+        self,
+        tensor: torch.Tensor,
+        process_group: dist.ProcessGroup | None = None,
+    ) -> torch.Tensor:
+        process_group = self.ep_group if process_group is None else process_group
+        if process_group is not None and self.ep_size > 1:
+            backend = self._planner_collective_backend(process_group)
             if backend == "gloo" and tensor.device.type != "cpu":
                 reduced = tensor.detach().to(device="cpu")
-                dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=self.ep_group)
+                dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=process_group)
                 tensor.copy_(reduced.to(device=tensor.device))
             else:
-                dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=self.ep_group)
+                dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=process_group)
         return tensor
 
     def _planner_gather_fixed(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -4023,7 +4795,9 @@ class ExpertSwapManager:
         communication_scale: float,
         forward_compute_per_assignment: float,
         forward_compute_constant: float = 0.0,
+        process_group: dist.ProcessGroup | None = None,
     ) -> CurrentRoutePlanner | GreedyCommunicationPlanner:
+        planner_group = self.ep_group if process_group is None else process_group
         if self.expert_swap_selector == "hiermoe_greedy_cover_p1":
             return GreedyCommunicationPlanner(
                 hierarchy=self.hierarchy,
@@ -4035,13 +4809,13 @@ class ExpertSwapManager:
                 forward_compute_per_assignment=forward_compute_per_assignment,
                 forward_compute_constant=forward_compute_constant,
                 smooth_max_gamma=self.smooth_max_gamma,
-                reducer=self._planner_reduce_sum,
+                reducer=lambda tensor: self._planner_reduce_sum(tensor, planner_group),
                 candidate_chunk_size=_SWAP_COST_CHUNK_CANDIDATES,
-                process_group=self.ep_group,
+                process_group=planner_group,
                 max_copies=self.greedy_max_copies_per_expert,
                 assume_unique_routes=True,
                 layer_parallel_streams=_GREEDY_LAYER_PARALLEL_STREAMS,
-                adaptive_topk=_GREEDY_ADAPTIVE_TOPK,
+                adaptive_topk=_GREEDY_ADAPTIVE_TOPK and not self.fixed_pipeline_overlap,
                 adaptive_topk_initial=_GREEDY_ADAPTIVE_TOPK_INITIAL,
                 adaptive_topk_strict_certificate=_GREEDY_ADAPTIVE_TOPK_STRICT,
             )
@@ -4276,6 +5050,8 @@ class ExpertSwapManager:
         plan: PlacementPlan,
         *,
         timing_prefix: str | None = None,
+        transfer_group: dist.ProcessGroup | None = None,
+        force_staged_transfer: bool = False,
     ) -> list[str]:
         quota_policy = tuple(QuotaPolicyEntry.from_tuple(row) for row in plan.quota_policy)
         final_owner_slots = tuple(int(value) for value in plan.final_owner_slots)
@@ -4431,6 +5207,7 @@ class ExpertSwapManager:
         swap_slots = tuple(slot for action in swap_actions for slot in (int(action.src_slot), int(action.dst_slot)))
         use_pure_swap_transport = (
             bool(swap_actions)
+            and not force_staged_transfer
             and len(swap_actions) == len(plan.actions)
             and len(set(swap_slots)) == len(swap_slots)
             and not zero_slots
@@ -4498,7 +5275,7 @@ class ExpertSwapManager:
                         grouped_entries,
                         self.ep_rank,
                         self.ep_size,
-                        self.ep_group,
+                        self.ep_group if transfer_group is None else transfer_group,
                         zero_entry_groups=(
                             (dst_slot // layer.num_local_experts, zero_entries[dst_slot]) for dst_slot in zero_slots
                         ),
@@ -4522,6 +5299,7 @@ class ExpertSwapManager:
                 layer.refresh_identity()
                 layer.invalidate_cache()
             layer.active_quota_policy = quota_policy
+            layer.placement_version += int(bool(plan.actions))
         return committed
 
     @staticmethod
@@ -4938,6 +5716,14 @@ class ExpertSwapManager:
     @torch.no_grad()
     def maybe_swap(self, step: int) -> str:
         self._begin_metrics_step(step)
+        if self.fixed_pipeline_overlap:
+            if any(bool((self._layer_layout(layer) < 0).any().item()) for layer in self.layers.values()):
+                layers = [self.layers[layer_key] for layer_key in self.layers]
+                committed = self._plan_historical_layers(layers, int(step))
+                self.latest_pair = ",".join(committed) if committed else "none"
+                return self.latest_pair
+            return self._collect_pipeline_plans(int(step))
+
         if (
             self.layers
             and self.expert_swap_max_pairs_per_layer == 0
