@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -37,6 +37,7 @@ _MAX_PAIR_EVENTS = 2 * 1024 * 1024
 _MAX_PAIR_OCCUPANCY_ELEMENTS = 64 * 1024 * 1024
 _MAX_DENSE_PAIR_STAT_ELEMENTS = 256 * 1024 * 1024
 _MAX_DENSE_ACTION_INTERACTION_ELEMENTS = 64 * 1024 * 1024
+_MAX_BATCHED_PAIR_LOOKUP_ELEMENTS = 64 * 1024 * 1024
 _UNIFORM_DISTANCE_ROWS: dict[tuple[int, int, tuple[int, ...]], torch.Tensor] = {}
 _DEVICE_DISTANCE_ROWS: dict[tuple[int, int, tuple[int, ...], str, int | None], torch.Tensor] = {}
 _DEVICE_LONG_RANGES: dict[tuple[str, int | None, int], torch.Tensor] = {}
@@ -117,6 +118,57 @@ class UniformStatisticalBaseline:
     route_states: torch.Tensor
     slots_by_state: torch.Tensor
     physical: torch.Tensor
+
+
+@dataclass(frozen=True)
+class StatisticalProxyResult:
+    """Cheap state-collapsed unary statistics used only for early pruning."""
+
+    candidate_delta: torch.Tensor
+    route_tables: StatisticalRouteTables
+    physical: torch.Tensor
+    route_hashes: torch.Tensor
+
+
+@dataclass(frozen=True)
+class StatisticalPrimitiveSpec:
+    """Layout-only deduplication of the two expert transitions in every action."""
+
+    experts: torch.Tensor
+    options: torch.Tensor
+    lhs_ids: torch.Tensor
+    rhs_ids: torch.Tensor
+    rhs_valid: torch.Tensor
+
+
+@dataclass(frozen=True)
+class StatisticalPrimitiveContext:
+    """Exact route-state data shared by unary primitives and Top-K pair reranking."""
+
+    spec: StatisticalPrimitiveSpec
+    selected: torch.Tensor
+    route_states: torch.Tensor
+    unique_routes: torch.Tensor | None
+    routes_are_unique: bool
+    occupancy: torch.Tensor
+    baseline_groups: torch.Tensor
+    primitive_groups: torch.Tensor
+    pair_events: _DensePairEvents | None
+    pair_absence: torch.Tensor | None
+    baseline_slots: torch.Tensor
+    primitive_slots: torch.Tensor
+    num_experts: int
+    state_count: int
+
+
+@dataclass(frozen=True)
+class StatisticalPrimitiveResult:
+    """Exact unary deltas keyed by unique layout transitions."""
+
+    primitive_delta: torch.Tensor
+    context: StatisticalPrimitiveContext
+    physical: torch.Tensor
+    route_hashes: torch.Tensor
 
 
 def _canonical_route_mask(selected: torch.Tensor) -> torch.Tensor:
@@ -245,6 +297,91 @@ def uniform_statistical_baseline_routes(
         route_states=route_states,
         slots_by_state=slots_by_state,
         physical=physical,
+    )
+
+
+def build_statistical_primitive_spec(
+    planner: GreedyCommunicationPlanner,
+    layout: torch.Tensor,
+    copy_slots: torch.Tensor,
+    rows: torch.Tensor,
+) -> StatisticalPrimitiveSpec:
+    """Deduplicate exact per-expert copy-set transitions on layout metadata."""
+
+    if rows.numel() == 0:
+        empty = rows.new_empty((0,), dtype=torch.long)
+        return StatisticalPrimitiveSpec(
+            experts=empty,
+            options=rows.new_empty((0, int(copy_slots.shape[1]) + 1)),
+            lhs_ids=empty,
+            rhs_ids=empty,
+            rhs_valid=rows.new_empty((0,), dtype=torch.bool),
+        )
+    lhs_options, rhs_options, rhs_valid = planner._candidate_copy_options(layout, copy_slots, rows)
+    action_count = int(rows.shape[0])
+    lhs_experts = rows[:, 3]
+    rhs_experts = rows[:, 4].clamp_min(0)
+    side_experts = torch.cat((lhs_experts, rhs_experts[rhs_valid]))
+    side_options = torch.cat((lhs_options, rhs_options[rhs_valid]), dim=0)
+    num_slots = int(layout.numel())
+    valid_options = side_options < num_slots
+    option_ranks = torch.div(
+        side_options.clamp(max=max(0, num_slots - 1)),
+        planner.slots_per_rank,
+        rounding_mode="floor",
+    )
+    option_ranks = torch.where(
+        valid_options,
+        option_ranks,
+        torch.full_like(option_ranks, planner.ep_size),
+    )
+    # torch.unique(..., dim=0) is disproportionately expensive on the CPU
+    # metadata path (about 100 ms for this EP32 layout).  Encode the exact
+    # expert + sorted-rank tuple as one mixed-radix int64 key whenever it fits;
+    # 1-D unique is an order of magnitude cheaper and remains collision-free.
+    radix = planner.ep_size + 1
+    option_width = int(option_ranks.shape[1])
+    rank_space = radix**option_width
+    maximum_key = (int(side_experts.max().item()) + 1) * rank_space - 1
+    if maximum_key <= torch.iinfo(torch.int64).max:
+        encoded = side_experts.clone()
+        for column in range(option_width):
+            encoded = encoded * radix + option_ranks[:, column]
+        unique_keys, inverse = torch.unique(encoded, sorted=True, return_inverse=True)
+        primitive_experts = torch.div(unique_keys, rank_space, rounding_mode="floor")
+        rank_payload = torch.remainder(unique_keys, rank_space)
+        powers = torch.tensor(
+            [radix ** (option_width - column - 1) for column in range(option_width)],
+            dtype=torch.long,
+            device=rows.device,
+        )
+        primitive_ranks = torch.remainder(
+            torch.div(rank_payload.view(-1, 1), powers.view(1, -1), rounding_mode="floor"),
+            radix,
+        )
+    else:
+        keys = torch.cat((side_experts.view(-1, 1), option_ranks), dim=1)
+        primitive_keys, inverse = torch.unique(keys, dim=0, sorted=True, return_inverse=True)
+        primitive_experts = primitive_keys[:, 0]
+        primitive_ranks = primitive_keys[:, 1:]
+    lhs_ids = inverse[:action_count]
+    rhs_ids = torch.full(
+        (action_count,),
+        -1,
+        dtype=torch.long,
+        device=rows.device,
+    )
+    rhs_ids[rhs_valid] = inverse[action_count:]
+    return StatisticalPrimitiveSpec(
+        experts=primitive_experts,
+        options=torch.where(
+            primitive_ranks < planner.ep_size,
+            primitive_ranks * planner.slots_per_rank,
+            torch.full_like(primitive_ranks, num_slots),
+        ),
+        lhs_ids=lhs_ids,
+        rhs_ids=rhs_ids,
+        rhs_valid=rhs_valid,
     )
 
 
@@ -881,6 +1018,8 @@ def _dense_uniform_source_candidate_local_deltas(
     layer_seed: int,
     num_experts: int,
     include_pair_interactions: bool = True,
+    include_pair_statistics: bool = True,
+    prepare_stage_callback: Callable[[str], None] | None = None,
 ) -> tuple[torch.Tensor, StatisticalRouteTables, StatisticalPairContext] | None:
     """Exact fixed-shape scorer used by the normal rank-local route sample."""
 
@@ -902,12 +1041,13 @@ def _dense_uniform_source_candidate_local_deltas(
         return None
     if pair_key_count * packed_width > _MAX_DENSE_PAIR_STAT_ELEMENTS:
         return None
-    interaction_elements = rows.shape[0] * state_count * state_count * len(widths) * 2
-    if interaction_elements > _MAX_DENSE_ACTION_INTERACTION_ELEMENTS:
-        return None
-    pair_events = selected.shape[0] * selected.shape[1] * max(0, selected.shape[1] - 1) // 2
-    if pair_events > _MAX_PAIR_EVENTS or pair_events * packed_width > _MAX_PAIR_OCCUPANCY_ELEMENTS:
-        return None
+    if include_pair_statistics:
+        interaction_elements = rows.shape[0] * state_count * state_count * len(widths) * 2
+        if interaction_elements > _MAX_DENSE_ACTION_INTERACTION_ELEMENTS:
+            return None
+        pair_events = selected.shape[0] * selected.shape[1] * max(0, selected.shape[1] - 1) // 2
+        if pair_events > _MAX_PAIR_EVENTS or pair_events * packed_width > _MAX_PAIR_OCCUPANCY_ELEMENTS:
+            return None
 
     if route_hashes is None:
         route_hashes = _route_hash(
@@ -964,14 +1104,20 @@ def _dense_uniform_source_candidate_local_deltas(
     rhs_new_slot_by_state = action_slots[action_count:]
     lhs_new_rank_by_state = torch.div(lhs_new_slot_by_state, planner.slots_per_rank, rounding_mode="floor")
     rhs_new_rank_by_state = torch.div(rhs_new_slot_by_state, planner.slots_per_rank, rounding_mode="floor")
-    pair_records = _build_dense_pair_events(
-        selected,
-        route_states,
-        unique_routes,
-        routes_are_unique=routes_are_unique,
-        num_experts=num_experts,
-        state_count=state_count,
-    )
+    if prepare_stage_callback is not None:
+        prepare_stage_callback("candidate_routes")
+    pair_records = None
+    if include_pair_statistics:
+        pair_records = _build_dense_pair_events(
+            selected,
+            route_states,
+            unique_routes,
+            routes_are_unique=routes_are_unique,
+            num_experts=num_experts,
+            state_count=state_count,
+        )
+        if prepare_stage_callback is not None:
+            prepare_stage_callback("pair_events")
 
     route_ranks_current = torch.div(physical, planner.slots_per_rank, rounding_mode="floor")
     level_sizes = (1,) + tuple(
@@ -1015,6 +1161,8 @@ def _dense_uniform_source_candidate_local_deltas(
         num_experts=num_experts,
         state_count=state_count,
     )
+    if prepare_stage_callback is not None:
+        prepare_stage_callback("unary_statistics")
     baseline_groups = torch.stack(
         tuple(
             torch.div(baseline_rank_by_state, size, rounding_mode="floor") + group_offset
@@ -1049,9 +1197,13 @@ def _dense_uniform_source_candidate_local_deltas(
         rhs_new_groups=rhs_new_groups,
         rhs_valid=rhs_valid,
     )
+    if prepare_stage_callback is not None:
+        prepare_stage_callback("unary_scoring")
     pair_absence = None
     if pair_records is not None:
         pair_absence = _dense_pair_absence_statistics(pair_records, occupancy, baseline_groups)
+        if prepare_stage_callback is not None:
+            prepare_stage_callback("pair_statistics")
         if include_pair_interactions:
             _add_dense_pair_deltas(
                 delta,
@@ -1062,6 +1214,8 @@ def _dense_uniform_source_candidate_local_deltas(
                 rhs_new_groups=rhs_new_groups,
                 rhs_valid=rhs_valid,
             )
+            if prepare_stage_callback is not None:
+                prepare_stage_callback("pair_interaction")
     route_tables = StatisticalRouteTables(
         state_count=state_count,
         baseline_slots=baseline_slots_by_state,
@@ -1104,6 +1258,7 @@ def statistical_unary_candidate_local_deltas(
     step: int,
     layer_seed: int,
     num_experts: int,
+    prepare_stage_callback: Callable[[str], None] | None = None,
 ) -> tuple[torch.Tensor, StatisticalRouteTables, StatisticalPairContext] | None:
     """Build all unary deltas and retain only data needed for sparse pair reranking."""
 
@@ -1127,6 +1282,371 @@ def statistical_unary_candidate_local_deltas(
         layer_seed=layer_seed,
         num_experts=num_experts,
         include_pair_interactions=False,
+        prepare_stage_callback=prepare_stage_callback,
+    )
+
+
+def statistical_primitive_fast_path_available(
+    planner: GreedyCommunicationPlanner,
+    selected: torch.Tensor,
+    *,
+    copy_slots: torch.Tensor,
+    num_experts: int,
+    defer_pair_statistics: bool,
+    batched_layer_count: int = 1,
+) -> bool:
+    """Check bounded-memory requirements before primitive preparation."""
+
+    reachable_copy_count = min(planner.max_copies, int(copy_slots.shape[1]) + 1)
+    state_count = _fixed_hash_modulus(reachable_copy_count)
+    if state_count is None:
+        return False
+    packed_width = sum(planner._count_widths())
+    if int(num_experts) * state_count * packed_width > _MAX_UNARY_STAT_ELEMENTS:
+        return False
+    pair_events = selected.shape[0] * selected.shape[1] * max(0, selected.shape[1] - 1) // 2
+    if pair_events > _MAX_PAIR_EVENTS or pair_events * packed_width > _MAX_PAIR_OCCUPANCY_ELEMENTS:
+        return False
+    pair_key_count = _pair_state_key_count(int(num_experts), state_count)
+    if pair_key_count > _MAX_DENSE_PAIR_KEYS:
+        return False
+    if pair_key_count * max(1, int(batched_layer_count)) > _MAX_BATCHED_PAIR_LOOKUP_ELEMENTS:
+        return False
+    if not defer_pair_statistics:
+        if pair_key_count * packed_width > _MAX_DENSE_PAIR_STAT_ELEMENTS:
+            return False
+    return True
+
+
+def statistical_primitive_unary_local_deltas(
+    planner: GreedyCommunicationPlanner,
+    selected: torch.Tensor,
+    primitive_spec: StatisticalPrimitiveSpec,
+    *,
+    copy_slots: torch.Tensor,
+    token_ordinals: torch.Tensor,
+    uniform_source_rank: int | None,
+    routes_are_unique: bool,
+    step: int,
+    layer_seed: int,
+    num_experts: int,
+    defer_pair_statistics: bool = False,
+    prepare_stage_callback: Callable[[str], None] | None = None,
+) -> StatisticalPrimitiveResult | None:
+    """Build exact full-state unary deltas once per unique expert transition."""
+
+    if uniform_source_rank is None or primitive_spec.experts.numel() == 0:
+        return None
+    if not statistical_primitive_fast_path_available(
+        planner,
+        selected,
+        copy_slots=copy_slots,
+        num_experts=num_experts,
+        defer_pair_statistics=defer_pair_statistics,
+    ):
+        return None
+    route_hashes = _route_hash(
+        selected,
+        token_ordinals=token_ordinals,
+        step=step,
+        layer_seed=layer_seed,
+    )
+    if prepare_stage_callback is not None:
+        prepare_stage_callback("route_hash")
+    baseline = uniform_statistical_baseline_routes(
+        planner,
+        selected,
+        copy_slots,
+        route_hashes,
+        source_rank=uniform_source_rank,
+    )
+    if baseline is None:
+        return None
+    physical = baseline.physical
+    if prepare_stage_callback is not None:
+        prepare_stage_callback("baseline_route")
+    unique_routes = None if routes_are_unique else _canonical_route_mask(selected)
+    occupancies = planner._token_level_occupancies(
+        physical,
+        route_weights=None if routes_are_unique else unique_routes,
+    )
+    occupancy = torch.cat(occupancies, dim=1)
+    if prepare_stage_callback is not None:
+        prepare_stage_callback("occupancy")
+
+    state_count = baseline.state_count
+    state_hashes = _long_range(state_count, selected.device)
+    primitive_slots = _uniform_candidate_route_slots(
+        planner,
+        primitive_spec.options,
+        state_hashes,
+        uniform_source_rank,
+        planner.ep_size * planner.slots_per_rank,
+    )
+    if prepare_stage_callback is not None:
+        prepare_stage_callback("candidate_routes")
+    primitive_ranks = torch.div(primitive_slots, planner.slots_per_rank, rounding_mode="floor")
+    baseline_ranks = torch.div(baseline.slots_by_state, planner.slots_per_rank, rounding_mode="floor")
+    route_ranks_current = torch.div(physical, planner.slots_per_rank, rounding_mode="floor")
+    level_sizes = (1,) + tuple(
+        int(size) for size in planner.hierarchy.group_sizes[: max(0, int(planner.hierarchy.selected_dim) - 1)]
+    )
+    widths = tuple(planner.ep_size // size for size in level_sizes)
+    offsets: list[int] = []
+    offset = 0
+    for width in widths:
+        offsets.append(offset)
+        offset += width
+    packed_width = sum(widths)
+    packed_groups = torch.stack(
+        tuple(
+            torch.div(route_ranks_current, size, rounding_mode="floor") + group_offset
+            for size, group_offset in zip(level_sizes, offsets, strict=True)
+        ),
+        dim=2,
+    )
+    pair_events = _build_dense_pair_events(
+        selected,
+        baseline.route_states,
+        unique_routes,
+        routes_are_unique=routes_are_unique,
+        num_experts=num_experts,
+        state_count=state_count,
+    )
+    if prepare_stage_callback is not None:
+        prepare_stage_callback("pair_events")
+    absence = _dense_unary_absence_statistics(
+        selected,
+        baseline.route_states,
+        unique_routes,
+        packed_groups,
+        occupancy,
+        routes_are_unique=routes_are_unique,
+        num_experts=num_experts,
+        state_count=state_count,
+    )
+    if prepare_stage_callback is not None:
+        prepare_stage_callback("unary_statistics")
+    baseline_groups = torch.stack(
+        tuple(
+            torch.div(baseline_ranks, size, rounding_mode="floor") + group_offset
+            for size, group_offset in zip(level_sizes, offsets, strict=True)
+        ),
+        dim=2,
+    )
+    primitive_groups = torch.stack(
+        tuple(
+            torch.div(primitive_ranks, size, rounding_mode="floor") + group_offset
+            for size, group_offset in zip(level_sizes, offsets, strict=True)
+        ),
+        dim=2,
+    )
+    primitive_delta = torch.zeros(
+        (primitive_spec.experts.numel(), packed_width),
+        dtype=torch.float32,
+        device=selected.device,
+    )
+    primitive_old_groups = baseline_groups.index_select(0, primitive_spec.experts)
+    _add_unary_deltas(
+        primitive_delta,
+        absence,
+        primitive_spec.experts,
+        primitive_old_groups,
+        primitive_groups,
+    )
+    if prepare_stage_callback is not None:
+        prepare_stage_callback("unary_scoring")
+
+    pair_absence = None
+    if pair_events is not None and not defer_pair_statistics:
+        pair_absence = _dense_pair_absence_statistics(pair_events, occupancy, baseline_groups)
+        if prepare_stage_callback is not None:
+            prepare_stage_callback("pair_statistics")
+    # When deferred, exact unary scoring retains only pair_events.  Top-K
+    # reranking then filters those events by selected expert pairs and builds
+    # the compact exact pair_absence table after shortlist selection.
+    context = StatisticalPrimitiveContext(
+        spec=primitive_spec,
+        selected=selected,
+        route_states=baseline.route_states,
+        unique_routes=unique_routes,
+        routes_are_unique=routes_are_unique,
+        occupancy=occupancy,
+        baseline_groups=baseline_groups,
+        primitive_groups=primitive_groups,
+        pair_events=pair_events,
+        pair_absence=pair_absence,
+        baseline_slots=baseline.slots_by_state,
+        primitive_slots=primitive_slots,
+        num_experts=num_experts,
+        state_count=state_count,
+    )
+    return StatisticalPrimitiveResult(
+        primitive_delta=primitive_delta,
+        context=context,
+        physical=physical,
+        route_hashes=route_hashes,
+    )
+
+
+def statistical_primitive_selected_pair_context(
+    planner: GreedyCommunicationPlanner,
+    context: StatisticalPrimitiveContext,
+    rows: torch.Tensor,
+    action_indices: torch.Tensor,
+    *,
+    layout: torch.Tensor,
+    copy_slots: torch.Tensor,
+    uniform_source_rank: int,
+    materialize_route_tables: bool = True,
+) -> tuple[StatisticalPairContext, torch.Tensor, StatisticalRouteTables | None]:
+    """Materialize exact pair groups and real physical routes for selected actions."""
+
+    selected_rows = rows.index_select(0, action_indices)
+    lhs_ids = context.spec.lhs_ids.index_select(0, action_indices)
+    rhs_ids = context.spec.rhs_ids.index_select(0, action_indices)
+    rhs_valid = rhs_ids >= 0
+    safe_rhs_ids = rhs_ids.clamp_min(0)
+    lhs_groups = context.primitive_groups.index_select(0, lhs_ids)
+    rhs_groups = context.primitive_groups.index_select(0, safe_rhs_ids)
+    rhs_groups = torch.where(
+        rhs_valid.view(-1, 1, 1),
+        rhs_groups,
+        context.baseline_groups.index_select(0, selected_rows[:, 4].clamp_min(0)),
+    )
+    pair_context = StatisticalPairContext(
+        selected=context.selected,
+        route_states=context.route_states,
+        unique_routes=context.unique_routes,
+        routes_are_unique=context.routes_are_unique,
+        occupancy=context.occupancy,
+        baseline_groups=context.baseline_groups,
+        lhs_new_groups=lhs_groups,
+        rhs_new_groups=rhs_groups,
+        rhs_valid=rhs_valid,
+        pair_events=context.pair_events,
+        pair_absence=context.pair_absence,
+        num_experts=context.num_experts,
+        state_count=context.state_count,
+    )
+    route_tables = None
+    if materialize_route_tables:
+        # Primitive identities deliberately collapse slots on the same rank
+        # because communication and assignment costs cannot distinguish their
+        # local slot offsets.  Winner remapping must nevertheless preserve the
+        # real physical slot selected by the action, so rebuild only these
+        # Top-K route tables when the caller actually requests a final route.
+        lhs_options, rhs_options, option_rhs_valid = planner._candidate_copy_options(
+            layout,
+            copy_slots,
+            selected_rows,
+        )
+        state_hashes = _long_range(context.state_count, selected_rows.device)
+        lhs_slots = _uniform_candidate_route_slots(
+            planner,
+            lhs_options,
+            state_hashes,
+            uniform_source_rank,
+            int(layout.numel()),
+        )
+        rhs_slots = _uniform_candidate_route_slots(
+            planner,
+            rhs_options,
+            state_hashes,
+            uniform_source_rank,
+            int(layout.numel()),
+        )
+        rhs_valid = rhs_valid & option_rhs_valid
+        rhs_slots = torch.where(
+            rhs_valid.view(-1, 1),
+            rhs_slots,
+            context.baseline_slots.index_select(0, selected_rows[:, 4].clamp_min(0)),
+        )
+        route_tables = StatisticalRouteTables(
+            state_count=context.state_count,
+            baseline_slots=context.baseline_slots,
+            lhs_slots=lhs_slots,
+            rhs_slots=rhs_slots,
+        )
+    return pair_context, selected_rows, route_tables
+
+
+def statistical_proxy_candidate_local_deltas(
+    planner: GreedyCommunicationPlanner,
+    selected: torch.Tensor,
+    rows: torch.Tensor,
+    *,
+    layout: torch.Tensor,
+    copy_slots: torch.Tensor,
+    uniform_source_rank: int | None,
+    routes_are_unique: bool,
+    token_ordinals: torch.Tensor,
+    step: int,
+    layer_seed: int,
+    num_experts: int,
+    prepare_stage_callback: Callable[[str], None] | None = None,
+) -> StatisticalProxyResult | None:
+    """Score every action with one deterministic route state and no pair table.
+
+    The proxy deliberately collapses hash-tie states to state zero.  It keeps
+    the exact unary presence/absence accounting for that collapsed route, but
+    skips all pair-event construction.  This makes it cheap enough to run
+    before candidate route tables for the exact scorer are materialized.
+    """
+
+    if uniform_source_rank is None or rows.numel() == 0:
+        return None
+    num_slots = int(layout.numel())
+    state_hashes = _long_range(1, selected.device)
+    baseline_slots = _uniform_candidate_route_slots(
+        planner,
+        copy_slots,
+        state_hashes,
+        uniform_source_rank,
+        num_slots,
+    )
+    proxy_hashes = torch.zeros_like(selected, dtype=torch.long)
+    physical = baseline_slots.reshape(-1).index_select(0, selected.reshape(-1)).view_as(selected)
+    baseline = UniformStatisticalBaseline(
+        state_count=1,
+        route_states=proxy_hashes,
+        slots_by_state=baseline_slots,
+        physical=physical,
+    )
+    unique_routes = None if routes_are_unique else _canonical_route_mask(selected)
+    occupancies = planner._token_level_occupancies(
+        physical,
+        route_weights=None if routes_are_unique else unique_routes,
+    )
+    result = _dense_uniform_source_candidate_local_deltas(
+        planner,
+        selected,
+        rows,
+        layout=layout,
+        copy_slots=copy_slots,
+        physical=physical,
+        occupancies=occupancies,
+        unique_routes=unique_routes,
+        routes_are_unique=routes_are_unique,
+        token_ordinals=token_ordinals,
+        route_hashes=proxy_hashes,
+        uniform_baseline=baseline,
+        uniform_source_rank=uniform_source_rank,
+        step=step,
+        layer_seed=layer_seed,
+        num_experts=num_experts,
+        include_pair_interactions=False,
+        include_pair_statistics=False,
+        prepare_stage_callback=prepare_stage_callback,
+    )
+    if result is None:
+        return None
+    candidate_delta, route_tables, _pair_context = result
+    return StatisticalProxyResult(
+        candidate_delta=candidate_delta,
+        route_tables=route_tables,
+        physical=physical,
+        route_hashes=proxy_hashes,
     )
 
 
@@ -1664,6 +2184,7 @@ def statistical_candidate_local_deltas(
     step: int,
     layer_seed: int,
     num_experts: int,
+    prepare_stage_callback: Callable[[str], None] | None = None,
 ) -> torch.Tensor | None | tuple[torch.Tensor | None, StatisticalRouteTables | None]:
     """Score all actions exactly from additive unary and pair-state statistics.
 
@@ -1697,6 +2218,7 @@ def statistical_candidate_local_deltas(
             step=step,
             layer_seed=layer_seed,
             num_experts=num_experts,
+            prepare_stage_callback=prepare_stage_callback,
         )
         if dense is not None:
             deltas, route_tables, _pair_context = dense
@@ -1800,11 +2322,20 @@ def statistical_candidate_local_deltas(
 
 __all__ = [
     "StatisticalPairContext",
+    "StatisticalPrimitiveContext",
+    "StatisticalPrimitiveResult",
+    "StatisticalPrimitiveSpec",
+    "StatisticalProxyResult",
     "StatisticalRouteTables",
     "UniformStatisticalBaseline",
+    "build_statistical_primitive_spec",
     "statistical_candidate_local_deltas",
     "statistical_batched_selected_pair_local_deltas",
     "statistical_pair_interaction_bound_local",
+    "statistical_primitive_fast_path_available",
+    "statistical_primitive_selected_pair_context",
+    "statistical_primitive_unary_local_deltas",
+    "statistical_proxy_candidate_local_deltas",
     "statistical_selected_pair_local_deltas",
     "statistical_unary_candidate_local_deltas",
     "uniform_statistical_baseline_routes",

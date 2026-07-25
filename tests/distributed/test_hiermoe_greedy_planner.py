@@ -12,13 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
+
 import pytest
 import torch
 import torch.distributed as dist
 
 from tests.tools.launch_utils import torchrun
 from veomni.arguments import HierMoEConfig
+from veomni.distributed.moe.hiermoe import expert_swap as expert_swap_module
 from veomni.distributed.moe.hiermoe import greedy_planner as greedy_planner_module
+from veomni.distributed.moe.hiermoe import statistical_scorer as statistical_scorer_module
 from veomni.distributed.moe.hiermoe.greedy_planner import (
     GREEDY_COMMUNICATION_PHASE_MULTIPLIER,
     GREEDY_COMPUTE_PHASE_MULTIPLIER,
@@ -33,6 +38,7 @@ from veomni.distributed.moe.hiermoe.statistical_scorer import (
     _pair_state_key_count,
     statistical_candidate_local_deltas,
     statistical_pair_interaction_bound_local,
+    statistical_primitive_fast_path_available,
     statistical_selected_pair_local_deltas,
     statistical_unary_candidate_local_deltas,
     uniform_statistical_baseline_routes,
@@ -50,6 +56,10 @@ def _planner(
     adaptive_topk: bool = False,
     adaptive_topk_initial: int = 16,
     adaptive_topk_strict_certificate: bool = False,
+    early_proxy_topk: int = 0,
+    exact_primitive_topk: int = 0,
+    post_shortlist_compact_pair: bool = False,
+    exact_primitive_max_only: bool = False,
 ) -> GreedyCommunicationPlanner:
     return GreedyCommunicationPlanner(
         hierarchy=Hierarchy(ep_size=4, group_sizes=(2, 4), source="test"),
@@ -65,6 +75,10 @@ def _planner(
         adaptive_topk=adaptive_topk,
         adaptive_topk_initial=adaptive_topk_initial,
         adaptive_topk_strict_certificate=adaptive_topk_strict_certificate,
+        early_proxy_topk=early_proxy_topk,
+        exact_primitive_topk=exact_primitive_topk,
+        post_shortlist_compact_pair=post_shortlist_compact_pair,
+        exact_primitive_max_only=exact_primitive_max_only,
     )
 
 
@@ -75,6 +89,26 @@ def _full_layout() -> tuple[torch.Tensor, torch.Tensor]:
         torch.tensor([0, 3, 1, 2, 2, 3, 3, 1], dtype=torch.long),
         torch.tensor([0, 2, 4, 6], dtype=torch.long),
     )
+
+
+def test_pipeline_plan_executor_has_one_worker_per_gate_blocked_layer(monkeypatch):
+    manager = object.__new__(expert_swap_module.ExpertSwapManager)
+    manager.fixed_pipeline_overlap = True
+    manager._pipeline_shutdown = False
+    manager._pipeline_lock = Lock()
+    manager._pipeline_plan_futures = {}
+    manager.layers = {f"layer.{index}": None for index in range(3)}
+    manager._pipeline_plan_worker_capacity = 1
+    manager._pipeline_plan_executor = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(expert_swap_module, "_PIPELINE_PLAN_WORKERS", 1)
+
+    manager._ensure_pipeline_plan_worker_capacity()
+
+    try:
+        assert manager._pipeline_plan_worker_capacity == len(manager.layers)
+        assert manager._pipeline_plan_executor.submit(lambda: 1).result(timeout=1.0) == 1
+    finally:
+        manager._pipeline_plan_executor.shutdown(wait=True, cancel_futures=False)
 
 
 def test_cost_model_uses_explicit_training_phase_multipliers():
@@ -527,6 +561,92 @@ def test_joint_cost_selects_compute_improving_cover_when_communication_is_disabl
     assert plan.final_cost.compute == pytest.approx(3.0 * (10.0 + 2.0))
 
 
+def test_early_proxy_full_shortlist_matches_exact_plan_and_route():
+    layout, owners = _full_layout()
+    routes = torch.tensor(
+        [[0, 0, 1], [2, 3, 2], [1, 3, 0], [0, 2, 3], [3, 3, 1], [2, 0, 1]] * 3,
+        dtype=torch.long,
+    )
+    exact = _planner(
+        communication_scale=0.5,
+        forward_compute_per_assignment=0.25,
+        forward_compute_constant=1.5,
+    ).plan(
+        routes,
+        layout,
+        owners,
+        source_ranks=0,
+        max_swaps=1,
+        max_replicas=1,
+        step=5,
+        layer_seed=11,
+    )
+    early_planner = _planner(
+        communication_scale=0.5,
+        forward_compute_per_assignment=0.25,
+        forward_compute_constant=1.5,
+        early_proxy_topk=1024,
+    )
+    early = early_planner.plan(
+        routes,
+        layout,
+        owners,
+        source_ranks=0,
+        max_swaps=1,
+        max_replicas=1,
+        step=5,
+        layer_seed=11,
+    )
+
+    assert early.actions == exact.actions
+    assert early.final_layout == exact.final_layout
+    assert early.final_owner_slots == exact.final_owner_slots
+    assert early.baseline_cost == exact.baseline_cost
+    assert early.final_cost == exact.final_cost
+    torch.testing.assert_close(early.local_physical_routes, exact.local_physical_routes, rtol=0, atol=0)
+    assert early_planner.last_early_proxy_stats["enabled"]
+    assert (
+        early_planner.last_early_proxy_stats["shortlist_counts"][0]
+        == early_planner.last_early_proxy_stats["candidate_counts"][0]
+    )
+
+
+def test_early_proxy_small_shortlist_keeps_exact_acceptance_and_valid_route():
+    layout, owners = _full_layout()
+    routes = torch.tensor(
+        [[0, 0, 1], [2, 3, 2], [1, 3, 0], [0, 2, 3], [3, 3, 1], [2, 0, 1]] * 3,
+        dtype=torch.long,
+    )
+    planner = _planner(
+        communication_scale=0.5,
+        forward_compute_per_assignment=0.25,
+        forward_compute_constant=1.5,
+        early_proxy_topk=2,
+    )
+    plan = planner.plan(
+        routes,
+        layout,
+        owners,
+        source_ranks=0,
+        max_swaps=1,
+        max_replicas=1,
+        step=5,
+        layer_seed=11,
+    )
+
+    assert planner.last_early_proxy_stats["shortlist_counts"] == [2]
+    assert plan.final_cost.total <= plan.baseline_cost.total
+    assert plan.local_physical_routes is not None
+    _assert_routes_match_layout(routes, plan.local_physical_routes, plan.final_layout)
+
+
+def test_early_proxy_and_adaptive_topk_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _planner(adaptive_topk=True, early_proxy_topk=16)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _planner(early_proxy_topk=16, exact_primitive_topk=16)
+
+
 def test_batched_layer_planner_matches_sequential_and_reduces_once():
     collective_calls = 0
 
@@ -638,6 +758,226 @@ def test_batched_layer_planner_matches_sequential_and_reduces_once():
         assert actual.baseline_cost == expected.baseline_cost
         assert actual.final_cost == expected.final_cost
         assert actual.local_physical_routes is None
+
+
+def test_exact_primitive_full_shortlist_matches_batched_full_exact():
+    layout, owners = _full_layout()
+    routes = [
+        torch.tensor([[0, 0, 1], [2, 3, 2], [1, 3, 0], [0, 2, 3]] * 3, dtype=torch.long),
+        torch.tensor([[3, 3, 0], [1, 2, 1], [0, 3, 2], [2, 1, 0]] * 3, dtype=torch.long),
+    ]
+    kwargs = dict(
+        source_ranks=0,
+        max_swaps=1,
+        max_replicas=1,
+        layer_seeds=(11, 17),
+        step=5,
+        skip_final_route_update=False,
+    )
+    exact = _planner(
+        communication_scale=0.5,
+        forward_compute_per_assignment=0.25,
+        forward_compute_constant=1.5,
+    ).plan_layers(routes, [layout, layout], [owners, owners], **kwargs)
+    primitive_planner = _planner(
+        communication_scale=0.5,
+        forward_compute_per_assignment=0.25,
+        forward_compute_constant=1.5,
+        exact_primitive_topk=1024,
+        post_shortlist_compact_pair=True,
+    )
+    primitive = primitive_planner.plan_layers(
+        routes,
+        [layout, layout],
+        [owners, owners],
+        **kwargs,
+    )
+
+    for actual, expected in zip(primitive, exact, strict=True):
+        assert actual.actions == expected.actions
+        assert actual.final_layout == expected.final_layout
+        assert actual.final_owner_slots == expected.final_owner_slots
+        assert actual.baseline_cost == expected.baseline_cost
+        assert actual.final_cost == expected.final_cost
+        torch.testing.assert_close(actual.local_physical_routes, expected.local_physical_routes, rtol=0, atol=0)
+    assert primitive_planner.last_exact_primitive_stats["enabled"]
+    assert primitive_planner.last_exact_primitive_stats["pair_statistics_mode"] == "post_shortlist_compact"
+    assert all(
+        primitive_count < 2 * candidate_count
+        for primitive_count, candidate_count in zip(
+            primitive_planner.last_exact_primitive_stats["primitive_counts"],
+            primitive_planner.last_exact_primitive_stats["candidate_counts"],
+            strict=True,
+        )
+    )
+    no_route = _planner(
+        communication_scale=0.5,
+        forward_compute_per_assignment=0.25,
+        forward_compute_constant=1.5,
+        exact_primitive_topk=1024,
+        post_shortlist_compact_pair=True,
+    ).plan_layers(
+        routes,
+        [layout, layout],
+        [owners, owners],
+        **{**kwargs, "skip_final_route_update": True},
+    )
+    for actual, expected in zip(no_route, exact, strict=True):
+        assert actual.actions == expected.actions
+        assert actual.final_cost == expected.final_cost
+        assert actual.local_physical_routes is None
+    single_exact = _planner(
+        communication_scale=0.5,
+        forward_compute_per_assignment=0.25,
+        forward_compute_constant=1.5,
+    ).plan(
+        routes[0],
+        layout,
+        owners,
+        source_ranks=0,
+        max_swaps=1,
+        max_replicas=1,
+        step=5,
+        layer_seed=11,
+    )
+    single_primitive = _planner(
+        communication_scale=0.5,
+        forward_compute_per_assignment=0.25,
+        forward_compute_constant=1.5,
+        exact_primitive_topk=1024,
+        post_shortlist_compact_pair=True,
+    ).plan(
+        routes[0],
+        layout,
+        owners,
+        source_ranks=0,
+        max_swaps=1,
+        max_replicas=1,
+        step=5,
+        layer_seed=11,
+    )
+    assert single_primitive.actions == single_exact.actions
+    assert single_primitive.final_cost == single_exact.final_cost
+    torch.testing.assert_close(
+        single_primitive.local_physical_routes,
+        single_exact.local_physical_routes,
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_exact_primitive_max_only_matches_dense_final_decision():
+    layout, owners = _full_layout()
+    routes = [
+        torch.tensor([[0, 0, 1], [2, 3, 2], [1, 3, 0], [0, 2, 3]] * 3, dtype=torch.long),
+        torch.tensor([[3, 3, 0], [1, 2, 1], [0, 3, 2], [2, 1, 0]] * 3, dtype=torch.long),
+    ]
+    kwargs = dict(
+        source_ranks=0,
+        max_swaps=1,
+        max_replicas=1,
+        layer_seeds=(11, 17),
+        step=5,
+        skip_final_route_update=True,
+    )
+    dense_planner = _planner(
+        communication_scale=0.5,
+        forward_compute_per_assignment=0.25,
+        forward_compute_constant=1.5,
+        exact_primitive_topk=4,
+    )
+    sparse_planner = _planner(
+        communication_scale=0.5,
+        forward_compute_per_assignment=0.25,
+        forward_compute_constant=1.5,
+        exact_primitive_topk=4,
+        exact_primitive_max_only=True,
+    )
+    dense = dense_planner.plan_layers(routes, [layout, layout], [owners, owners], **kwargs)
+    sparse = sparse_planner.plan_layers(routes, [layout, layout], [owners, owners], **kwargs)
+
+    for actual, expected in zip(sparse, dense, strict=True):
+        assert actual.actions == expected.actions
+        assert actual.final_layout == expected.final_layout
+        assert actual.baseline_cost == expected.baseline_cost
+        assert actual.final_cost == expected.final_cost
+    assert sparse_planner.last_exact_primitive_stats["unary_selector"] == "batched_full_exact_compact"
+    assert sparse_planner.last_exact_primitive_stats["max_only_unary"]
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "defer_pair_statistics"),
+    (
+        ("_MAX_PAIR_EVENTS", False),
+        ("_MAX_BATCHED_PAIR_LOOKUP_ELEMENTS", True),
+    ),
+)
+def test_exact_primitive_falls_back_when_memory_guard_exceeded(
+    monkeypatch,
+    limit_name,
+    defer_pair_statistics,
+):
+    layout, owners = _full_layout()
+    routes = torch.tensor([[0, 0, 1], [2, 3, 2], [1, 3, 0], [0, 2, 3]] * 3, dtype=torch.long)
+    planner = _planner(exact_primitive_topk=4)
+    copy_slots = planner._copy_table(layout, int(owners.numel()))
+    assert statistical_primitive_fast_path_available(
+        planner,
+        routes,
+        copy_slots=copy_slots,
+        num_experts=int(owners.numel()),
+        defer_pair_statistics=defer_pair_statistics,
+    )
+
+    monkeypatch.setattr(statistical_scorer_module, limit_name, 0)
+    planner.post_shortlist_compact_pair = defer_pair_statistics
+    fallback = planner.plan_layers(
+        [routes],
+        [layout],
+        [owners],
+        source_ranks=0,
+        max_swaps=1,
+        max_replicas=1,
+        layer_seeds=(11,),
+        step=5,
+        skip_final_route_update=True,
+    )[0]
+    exact = _planner().plan_layers(
+        [routes],
+        [layout],
+        [owners],
+        source_ranks=0,
+        max_swaps=1,
+        max_replicas=1,
+        layer_seeds=(11,),
+        step=5,
+        skip_final_route_update=True,
+    )[0]
+
+    assert fallback.actions == exact.actions
+    assert fallback.final_cost == exact.final_cost
+    assert planner.last_exact_primitive_stats["enabled"] is False
+
+
+def test_exact_primitive_callback_reports_dependency_order():
+    layout, owners = _full_layout()
+    routes = torch.tensor([[0, 0, 1], [2, 3, 2], [1, 3, 0], [0, 2, 3]] * 3, dtype=torch.long)
+    stages = []
+    _planner(exact_primitive_topk=4).plan_layers(
+        [routes],
+        [layout],
+        [owners],
+        source_ranks=0,
+        max_swaps=1,
+        max_replicas=1,
+        layer_seeds=(11,),
+        step=5,
+        skip_final_route_update=True,
+        prepare_stage_callback=stages.append,
+    )
+
+    assert stages.index("pair_events") < stages.index("unary_statistics")
+    assert stages.index("unary_statistics") < stages.index("unary_scoring")
 
 
 def test_compact_pair_state_indices_are_dense_and_unique():

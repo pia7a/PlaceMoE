@@ -30,11 +30,18 @@ from .perf_model import HierMoEPerfModel
 from .planner import PlacementAction, PlacementCost, PlacementPlan, _hierarchy_distance, _route_hash
 from .statistical_scorer import (
     StatisticalPairContext,
+    StatisticalPrimitiveContext,
+    StatisticalPrimitiveSpec,
     StatisticalRouteTables,
     _canonical_route_mask,
+    build_statistical_primitive_spec,
     statistical_batched_selected_pair_local_deltas,
     statistical_candidate_local_deltas,
     statistical_pair_interaction_bound_local,
+    statistical_primitive_fast_path_available,
+    statistical_primitive_selected_pair_context,
+    statistical_primitive_unary_local_deltas,
+    statistical_proxy_candidate_local_deltas,
     statistical_selected_pair_local_deltas,
     statistical_unary_candidate_local_deltas,
     uniform_statistical_baseline_routes,
@@ -42,7 +49,7 @@ from .statistical_scorer import (
 from .topology import Hierarchy
 
 
-GREEDY_COVER_ALGORITHM_VERSION = "hiermoe-greedy-cover-p1-exact-stats-v8-adaptive-topk"
+GREEDY_COVER_ALGORITHM_VERSION = "hiermoe-greedy-cover-p1-exact-stats-v9-early-proxy-topk"
 GREEDY_COMMUNICATION_PHASE_MULTIPLIER = 4.0
 GREEDY_COMPUTE_PHASE_MULTIPLIER = 3.0
 _ACTION_SWAP = 0
@@ -82,6 +89,27 @@ class _PreparedActionCounts:
     pair_context: StatisticalPairContext | None = None
     candidate_pair_bound_local: torch.Tensor | None = None
     certificate_affected_groups: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class _PreparedPrimitiveCounts:
+    baseline_local: torch.Tensor
+    primitive_delta_local: torch.Tensor
+    baseline_assignment_local: torch.Tensor | None
+    primitive_assignment_delta_local: torch.Tensor | None
+    primitive_affected_ranks: torch.Tensor
+    primitive_affected_groups: tuple[torch.Tensor, ...]
+    context: StatisticalPrimitiveContext
+    baseline_physical_routes: torch.Tensor
+    route_hashes: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _GlobalPrimitiveCounts:
+    baseline: torch.Tensor
+    primitive_delta: torch.Tensor
+    baseline_assignment: torch.Tensor | None
+    primitive_assignment_delta: torch.Tensor | None
 
 
 def _reduce_sum(
@@ -234,6 +262,10 @@ class GreedyCommunicationPlanner:
         adaptive_topk_growth_factor: int = 2,
         adaptive_topk_epsilon: float = 1e-6,
         adaptive_topk_strict_certificate: bool = False,
+        early_proxy_topk: int = 0,
+        exact_primitive_topk: int = 0,
+        post_shortlist_compact_pair: bool = False,
+        exact_primitive_max_only: bool = False,
     ) -> None:
         if smooth_max_gamma <= 0:
             raise ValueError("smooth_max_gamma must be positive.")
@@ -262,7 +294,25 @@ class GreedyCommunicationPlanner:
         self.adaptive_topk_growth_factor = max(2, int(adaptive_topk_growth_factor))
         self.adaptive_topk_epsilon = max(0.0, float(adaptive_topk_epsilon))
         self.adaptive_topk_strict_certificate = bool(adaptive_topk_strict_certificate)
+        self.early_proxy_topk = max(0, int(early_proxy_topk))
+        self.exact_primitive_topk = max(0, int(exact_primitive_topk))
+        self.post_shortlist_compact_pair = bool(post_shortlist_compact_pair)
+        self.exact_primitive_max_only = bool(exact_primitive_max_only)
+        enabled_topk_modes = sum(
+            int(value)
+            for value in (
+                self.adaptive_topk,
+                self.early_proxy_topk > 0,
+                self.exact_primitive_topk > 0,
+            )
+        )
+        if enabled_topk_modes > 1:
+            raise ValueError("adaptive_topk, early_proxy_topk, and exact_primitive_topk are mutually exclusive.")
         self.last_adaptive_topk_stats: dict[str, object] = {}
+        self.last_early_proxy_stats: dict[str, object] = {"enabled": False}
+        self.last_early_proxy_shortlist_indices: list[torch.Tensor] = []
+        self.last_exact_primitive_stats: dict[str, object] = {"enabled": False}
+        self.last_exact_primitive_shortlist_indices: list[torch.Tensor] = []
         if self.communication_scale < 0.0:
             raise ValueError("communication_scale must be non-negative.")
         if self.forward_compute_per_assignment < 0.0:
@@ -708,6 +758,23 @@ class GreedyCommunicationPlanner:
         width = max(1, int(counts.max().item()))
         masked = torch.where(matches, slot_ids, torch.full_like(slot_ids, num_slots))
         return masked.sort(dim=0).values[:width].transpose(0, 1).contiguous()
+
+    def _primitive_spec(
+        self,
+        layout: torch.Tensor,
+        copy_slots: torch.Tensor,
+        rows: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> StatisticalPrimitiveSpec:
+        host = build_statistical_primitive_spec(self, layout, copy_slots, rows)
+        return StatisticalPrimitiveSpec(
+            experts=host.experts.to(device=device, non_blocking=True),
+            options=host.options.to(device=device, non_blocking=True),
+            lhs_ids=host.lhs_ids.to(device=device, non_blocking=True),
+            rhs_ids=host.rhs_ids.to(device=device, non_blocking=True),
+            rhs_valid=host.rhs_valid.to(device=device, non_blocking=True),
+        )
 
     def _candidate_copy_options(
         self,
@@ -1233,6 +1300,7 @@ class GreedyCommunicationPlanner:
         include_assignment_counts: bool | None = None,
         include_pair_interactions: bool = True,
         include_pair_bounds: bool = False,
+        prepare_stage_callback: Callable[[str], None] | None = None,
     ) -> _PreparedActionCounts:
         route_hashes = _route_hash(
             selected,
@@ -1240,6 +1308,8 @@ class GreedyCommunicationPlanner:
             step=step,
             layer_seed=layer_seed,
         )
+        if prepare_stage_callback is not None:
+            prepare_stage_callback("route_hash")
         if copy_slots is None:
             copy_slots = self._copy_table(layout, num_experts)
         uniform_baseline = None
@@ -1266,6 +1336,8 @@ class GreedyCommunicationPlanner:
                 max_copies=self.max_copies,
                 route_hashes=route_hashes,
             )
+        if prepare_stage_callback is not None:
+            prepare_stage_callback("baseline_route")
         unique_routes = None
         if self.candidate_scorer == "statistics":
             unique_routes = None if self.assume_unique_routes else _canonical_route_mask(selected)
@@ -1274,6 +1346,8 @@ class GreedyCommunicationPlanner:
             route_weights=None if self.assume_unique_routes else unique_routes,
         )
         baseline_local = (torch.cat(occupancies, dim=1) > 0).sum(dim=0, keepdim=True).to(torch.float32)
+        if prepare_stage_callback is not None:
+            prepare_stage_callback("occupancy")
         candidate_delta = None
         route_tables = None
         pair_context = None
@@ -1298,6 +1372,7 @@ class GreedyCommunicationPlanner:
                     step=step,
                     layer_seed=layer_seed,
                     num_experts=num_experts,
+                    prepare_stage_callback=prepare_stage_callback,
                 )
             if unary is not None:
                 candidate_delta, route_tables, pair_context = unary
@@ -1326,6 +1401,7 @@ class GreedyCommunicationPlanner:
                     step=step,
                     layer_seed=layer_seed,
                     num_experts=num_experts,
+                    prepare_stage_callback=prepare_stage_callback,
                 )
                 assert isinstance(statistical, tuple)
                 candidate_delta, route_tables = statistical
@@ -1422,6 +1498,8 @@ class GreedyCommunicationPlanner:
                     affected_groups,
                     copy_slots,
                 )
+        if prepare_stage_callback is not None:
+            prepare_stage_callback("candidate_pack")
         return _PreparedActionCounts(
             baseline_local=baseline_local,
             candidate_local=candidates,
@@ -1434,6 +1512,235 @@ class GreedyCommunicationPlanner:
             route_tables=route_tables,
             pair_context=pair_context,
             candidate_pair_bound_local=candidate_pair_bound_local,
+        )
+
+    def _prepare_proxy_action_counts(
+        self,
+        selected: torch.Tensor,
+        layout: torch.Tensor,
+        rows: torch.Tensor,
+        *,
+        uniform_source_rank: int | None,
+        copy_slots: torch.Tensor,
+        token_ordinals: torch.Tensor,
+        step: int,
+        layer_seed: int,
+        num_experts: int,
+        include_assignment_counts: bool,
+        prepare_stage_callback: Callable[[str], None] | None = None,
+    ) -> _PreparedActionCounts:
+        """Build the state-collapsed unary proxy before exact candidate routes."""
+
+        proxy = statistical_proxy_candidate_local_deltas(
+            self,
+            selected,
+            rows,
+            layout=layout,
+            copy_slots=copy_slots,
+            uniform_source_rank=uniform_source_rank,
+            routes_are_unique=self.assume_unique_routes,
+            token_ordinals=token_ordinals,
+            step=step,
+            layer_seed=layer_seed,
+            num_experts=num_experts,
+            prepare_stage_callback=prepare_stage_callback,
+        )
+        if proxy is None:
+            raise RuntimeError("The early proxy requires non-empty rows and one uniform source rank per EP process.")
+        baseline_local = self._local_packed_counts(proxy.physical)
+        candidate_local = baseline_local + proxy.candidate_delta
+        baseline_assignment_local = None
+        candidate_assignment_local = None
+        if include_assignment_counts:
+            baseline_assignment_local = self._local_assignment_counts(proxy.physical)
+            assignment_delta = self._statistical_assignment_local_deltas(
+                selected,
+                rows,
+                proxy.route_hashes,
+                proxy.route_tables,
+            )
+            candidate_assignment_local = baseline_assignment_local + assignment_delta
+        if prepare_stage_callback is not None:
+            prepare_stage_callback("proxy_candidate_pack")
+        return _PreparedActionCounts(
+            baseline_local=baseline_local,
+            candidate_local=candidate_local,
+            baseline_assignment_local=baseline_assignment_local,
+            candidate_assignment_local=candidate_assignment_local,
+            affected_groups=None,
+            affected_assignment_ranks=None,
+            baseline_physical_routes=proxy.physical,
+            route_hashes=proxy.route_hashes,
+            route_tables=proxy.route_tables,
+        )
+
+    def _primitive_assignment_local_deltas(
+        self,
+        selected: torch.Tensor,
+        route_hashes: torch.Tensor,
+        context: StatisticalPrimitiveContext,
+    ) -> torch.Tensor:
+        """Build exact non-deduplicated rank deltas once per primitive."""
+
+        state_count = context.state_count
+        route_states = torch.remainder(route_hashes, state_count)
+        pseudo = selected * state_count + route_states
+        multiplicities = torch.zeros(
+            (context.num_experts * state_count,),
+            dtype=torch.float32,
+            device=selected.device,
+        )
+        multiplicities.index_add_(
+            0,
+            pseudo.reshape(-1),
+            torch.ones_like(pseudo, dtype=torch.float32).reshape(-1),
+        )
+        multiplicities = multiplicities.view(context.num_experts, state_count)
+        experts = context.spec.experts
+        weights = multiplicities.index_select(0, experts)
+        old_ranks = torch.div(
+            context.baseline_slots.index_select(0, experts),
+            self.slots_per_rank,
+            rounding_mode="floor",
+        )
+        new_ranks = torch.div(context.primitive_slots, self.slots_per_rank, rounding_mode="floor")
+        delta = torch.zeros(
+            (experts.numel(), self.ep_size),
+            dtype=torch.float32,
+            device=selected.device,
+        )
+        delta.scatter_add_(1, old_ranks, -weights)
+        delta.scatter_add_(1, new_ranks, weights)
+        return delta
+
+    def _primitive_affected_metadata(
+        self,
+        copy_slots: torch.Tensor,
+        spec: StatisticalPrimitiveSpec,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        """Build layout-only sparse primitive rank/group indices."""
+
+        old_slots = copy_slots.index_select(0, spec.experts)
+        option_width = int(spec.options.shape[1])
+        if old_slots.shape[1] < option_width:
+            old_slots = torch.cat(
+                (
+                    old_slots,
+                    torch.full(
+                        (old_slots.shape[0], option_width - old_slots.shape[1]),
+                        self.ep_size * self.slots_per_rank,
+                        dtype=torch.long,
+                        device=old_slots.device,
+                    ),
+                ),
+                dim=1,
+            )
+        all_slots = torch.cat((old_slots, spec.options), dim=1)
+        valid_slots = all_slots < self.ep_size * self.slots_per_rank
+        affected_ranks = torch.div(
+            all_slots.clamp(max=self.ep_size * self.slots_per_rank - 1),
+            self.slots_per_rank,
+            rounding_mode="floor",
+        )
+        affected_ranks = torch.where(
+            valid_slots,
+            affected_ranks,
+            torch.full_like(affected_ranks, self.ep_size),
+        )
+        affected_ranks = affected_ranks.sort(dim=1).values
+        unique_rank = torch.ones_like(affected_ranks, dtype=torch.bool)
+        unique_rank[:, 1:] = affected_ranks[:, 1:] != affected_ranks[:, :-1]
+        affected_ranks = (
+            torch.where(
+                unique_rank,
+                affected_ranks,
+                torch.full_like(affected_ranks, self.ep_size),
+            )
+            .sort(dim=1)
+            .values
+        )
+        affected_groups = []
+        for level_size, width in zip(
+            (1,)
+            + tuple(int(size) for size in self.hierarchy.group_sizes[: max(0, int(self.hierarchy.selected_dim) - 1)]),
+            self._count_widths(),
+            strict=True,
+        ):
+            valid_ranks = affected_ranks < self.ep_size
+            groups = torch.div(
+                affected_ranks.clamp(max=self.ep_size - 1),
+                level_size,
+                rounding_mode="floor",
+            )
+            groups = torch.where(valid_ranks, groups, torch.full_like(groups, width))
+            groups = groups.sort(dim=1).values
+            unique_group = torch.ones_like(groups, dtype=torch.bool)
+            unique_group[:, 1:] = groups[:, 1:] != groups[:, :-1]
+            groups = (
+                torch.where(
+                    unique_group,
+                    groups,
+                    torch.full_like(groups, width),
+                )
+                .sort(dim=1)
+                .values
+            )
+            affected_groups.append(groups[:, : min(int(groups.shape[1]), width)])
+        return affected_ranks, tuple(affected_groups)
+
+    def _prepare_primitive_counts(
+        self,
+        context: dict[str, object],
+        *,
+        step: int,
+        include_assignment_counts: bool,
+        prepare_stage_callback: Callable[[str], None] | None = None,
+    ) -> _PreparedPrimitiveCounts:
+        result = statistical_primitive_unary_local_deltas(
+            self,
+            context["selected"],
+            context["primitive_spec"],
+            copy_slots=context["copy_slots"],
+            token_ordinals=context["ordinals"],
+            uniform_source_rank=context["uniform_source_rank"],
+            routes_are_unique=self.assume_unique_routes,
+            step=step,
+            layer_seed=context["layer_seed"],
+            num_experts=int(context["owners"].numel()),
+            defer_pair_statistics=self.post_shortlist_compact_pair,
+            prepare_stage_callback=prepare_stage_callback,
+        )
+        if result is None:
+            raise RuntimeError("Exact primitive scoring requires non-empty actions and a uniform source rank.")
+        affected_ranks = context.get("primitive_affected_ranks")
+        affected_groups = context.get("primitive_affected_groups")
+        if affected_ranks is None or affected_groups is None:
+            affected_ranks, affected_groups = self._primitive_affected_metadata(
+                context["copy_slots"],
+                result.context.spec,
+            )
+        baseline_local = self._local_packed_counts(result.physical)
+        baseline_assignment_local = None
+        primitive_assignment_delta_local = None
+        if include_assignment_counts:
+            baseline_assignment_local = self._local_assignment_counts(result.physical)
+            primitive_assignment_delta_local = self._primitive_assignment_local_deltas(
+                context["selected"],
+                result.route_hashes,
+                result.context,
+            )
+        if prepare_stage_callback is not None:
+            prepare_stage_callback("candidate_pack")
+        return _PreparedPrimitiveCounts(
+            baseline_local=baseline_local,
+            primitive_delta_local=result.primitive_delta,
+            baseline_assignment_local=baseline_assignment_local,
+            primitive_assignment_delta_local=primitive_assignment_delta_local,
+            primitive_affected_ranks=affected_ranks,
+            primitive_affected_groups=affected_groups,
+            context=result.context,
+            baseline_physical_routes=result.physical,
+            route_hashes=result.route_hashes,
         )
 
     def _score_actions(
@@ -1702,6 +2009,7 @@ class GreedyCommunicationPlanner:
         communication_scales: Sequence[float],
         forward_compute_per_assignment: Sequence[float],
         forward_compute_constant: Sequence[float],
+        prepare_stage_callback: Callable[[str], None] | None = None,
     ) -> list[_ScoredLayouts]:
         """Score independent layers with one full EP reduction."""
 
@@ -1745,7 +2053,10 @@ class GreedyCommunicationPlanner:
                 communication = torch.cat((communication, pair_bounds), dim=1)
             local_blocks.append(communication)
 
-        global_rows = _reduce_sum(torch.cat(local_blocks, dim=0), self.reducer)
+        local_payload = torch.cat(local_blocks, dim=0)
+        if prepare_stage_callback is not None:
+            prepare_stage_callback("collective_pack")
+        global_rows = _reduce_sum(local_payload, self.reducer)
         communication_rows = global_rows[:, :communication_width]
         assignment_end = communication_width + (self.ep_size if include_assignments else 0)
         assignment_rows = global_rows[:, communication_width:assignment_end] if include_assignments else None
@@ -1807,6 +2118,526 @@ class GreedyCommunicationPlanner:
             offset += row_count
         return scored_layers
 
+    def _score_global_count_rows(
+        self,
+        communication_rows: torch.Tensor,
+        assignment_rows: torch.Tensor | None,
+        *,
+        communication_scale: float,
+        forward_compute_per_assignment: float,
+        forward_compute_constant: float,
+        baseline_physical_routes: torch.Tensor,
+        route_hashes: torch.Tensor,
+        route_tables: StatisticalRouteTables | None = None,
+    ) -> _ScoredLayouts:
+        """Apply the joint cost model to already-global count rows."""
+
+        _unused, units, peak_rank, selected_dim = self._communication_cost_details(communication_rows)
+        communication = GREEDY_COMMUNICATION_PHASE_MULTIPLIER * float(communication_scale) * units
+        if assignment_rows is None:
+            compute = GREEDY_COMPUTE_PHASE_MULTIPLIER * torch.full_like(
+                communication,
+                float(forward_compute_constant),
+            )
+            peak_compute_rank = torch.full_like(peak_rank, -1)
+        else:
+            peak_assignments, peak_compute_rank = assignment_rows.max(dim=1)
+            compute = GREEDY_COMPUTE_PHASE_MULTIPLIER * (
+                float(forward_compute_per_assignment) * peak_assignments + float(forward_compute_constant)
+            )
+        return _ScoredLayouts(
+            communication=communication,
+            compute=compute,
+            communication_model_units=units,
+            peak_rank=peak_rank,
+            peak_compute_rank=peak_compute_rank,
+            selected_dim=selected_dim,
+            baseline_physical_routes=baseline_physical_routes,
+            route_hashes=route_hashes,
+            route_tables=route_tables,
+        )
+
+    def _score_batched_primitive_actions(
+        self,
+        prepared_layers: Sequence[_PreparedPrimitiveCounts],
+        global_layers: Sequence[_GlobalPrimitiveCounts],
+        *,
+        communication_scales: Sequence[float],
+        forward_compute_per_assignment: Sequence[float],
+        forward_compute_constant: Sequence[float],
+        batch_layers: bool,
+    ) -> list[_ScoredLayouts]:
+        """Compose and score the layer/action batch with one eager graph."""
+
+        layer_count = len(prepared_layers)
+        if layer_count == 0:
+            return []
+        primitive_counts = [int(value.primitive_delta.shape[0]) for value in global_layers]
+        action_counts = [int(value.context.spec.lhs_ids.numel()) for value in prepared_layers]
+        if not batch_layers or len(set(primitive_counts)) != 1 or len(set(action_counts)) != 1:
+            scored = []
+            for layer_index, (prepared, global_counts) in enumerate(zip(prepared_layers, global_layers, strict=True)):
+                spec = prepared.context.spec
+                rhs_ids = spec.rhs_ids.clamp_min(0)
+                candidate_communication = (
+                    global_counts.baseline
+                    + global_counts.primitive_delta.index_select(0, spec.lhs_ids)
+                    + global_counts.primitive_delta.index_select(0, rhs_ids)
+                    * spec.rhs_valid.view(-1, 1).to(global_counts.primitive_delta.dtype)
+                )
+                communication_rows = torch.cat(
+                    (global_counts.baseline, candidate_communication),
+                    dim=0,
+                )
+                assignment_rows = None
+                if global_counts.baseline_assignment is not None:
+                    assert global_counts.primitive_assignment_delta is not None
+                    candidate_assignment = (
+                        global_counts.baseline_assignment
+                        + global_counts.primitive_assignment_delta.index_select(0, spec.lhs_ids)
+                        + global_counts.primitive_assignment_delta.index_select(0, rhs_ids)
+                        * spec.rhs_valid.view(-1, 1).to(global_counts.primitive_assignment_delta.dtype)
+                    )
+                    assignment_rows = torch.cat(
+                        (global_counts.baseline_assignment, candidate_assignment),
+                        dim=0,
+                    )
+                scored.append(
+                    self._score_global_count_rows(
+                        communication_rows,
+                        assignment_rows,
+                        communication_scale=communication_scales[layer_index],
+                        forward_compute_per_assignment=forward_compute_per_assignment[layer_index],
+                        forward_compute_constant=forward_compute_constant[layer_index],
+                        baseline_physical_routes=prepared.baseline_physical_routes,
+                        route_hashes=prepared.route_hashes,
+                    )
+                )
+            return scored
+
+        action_count = action_counts[0]
+        communication_width = int(global_layers[0].baseline.shape[1])
+        baselines = torch.stack([value.baseline[0] for value in global_layers])
+        primitive_deltas = torch.stack([value.primitive_delta for value in global_layers])
+        lhs_ids = torch.stack([value.context.spec.lhs_ids for value in prepared_layers])
+        rhs_ids = torch.stack([value.context.spec.rhs_ids.clamp_min(0) for value in prepared_layers])
+        rhs_valid = torch.stack([value.context.spec.rhs_valid for value in prepared_layers])
+        lhs_delta = primitive_deltas.gather(
+            1,
+            lhs_ids.unsqueeze(2).expand(-1, -1, communication_width),
+        )
+        rhs_delta = primitive_deltas.gather(
+            1,
+            rhs_ids.unsqueeze(2).expand(-1, -1, communication_width),
+        )
+        candidate_communication = (
+            baselines.unsqueeze(1) + lhs_delta + rhs_delta * rhs_valid.unsqueeze(2).to(rhs_delta.dtype)
+        )
+        communication_rows = torch.cat(
+            (baselines.unsqueeze(1), candidate_communication),
+            dim=1,
+        )
+        row_count = action_count + 1
+        _unused, units, peak_rank, selected_dim = self._communication_cost_details(
+            communication_rows.reshape(layer_count * row_count, communication_width)
+        )
+        communication_scale_rows = (
+            torch.tensor(
+                communication_scales,
+                dtype=units.dtype,
+                device=units.device,
+            )
+            .view(layer_count, 1)
+            .expand(-1, row_count)
+            .reshape(-1)
+        )
+        communication = GREEDY_COMMUNICATION_PHASE_MULTIPLIER * communication_scale_rows * units
+
+        include_assignments = global_layers[0].baseline_assignment is not None
+        if include_assignments:
+            if any(
+                value.baseline_assignment is None or value.primitive_assignment_delta is None
+                for value in global_layers
+            ):
+                raise ValueError("Batched primitive assignment statistics must be present for every layer.")
+            assignment_baselines = torch.stack(
+                [value.baseline_assignment[0] for value in global_layers if value.baseline_assignment is not None]
+            )
+            assignment_deltas = torch.stack(
+                [
+                    value.primitive_assignment_delta
+                    for value in global_layers
+                    if value.primitive_assignment_delta is not None
+                ]
+            )
+            lhs_assignment = assignment_deltas.gather(
+                1,
+                lhs_ids.unsqueeze(2).expand(-1, -1, self.ep_size),
+            )
+            rhs_assignment = assignment_deltas.gather(
+                1,
+                rhs_ids.unsqueeze(2).expand(-1, -1, self.ep_size),
+            )
+            candidate_assignment = (
+                assignment_baselines.unsqueeze(1)
+                + lhs_assignment
+                + rhs_assignment * rhs_valid.unsqueeze(2).to(rhs_assignment.dtype)
+            )
+            assignment_rows = torch.cat(
+                (assignment_baselines.unsqueeze(1), candidate_assignment),
+                dim=1,
+            ).reshape(layer_count * row_count, self.ep_size)
+            peak_assignments, peak_compute_rank = assignment_rows.max(dim=1)
+            compute_slopes = (
+                torch.tensor(
+                    forward_compute_per_assignment,
+                    dtype=peak_assignments.dtype,
+                    device=peak_assignments.device,
+                )
+                .view(layer_count, 1)
+                .expand(-1, row_count)
+                .reshape(-1)
+            )
+            compute_constants = (
+                torch.tensor(
+                    forward_compute_constant,
+                    dtype=peak_assignments.dtype,
+                    device=peak_assignments.device,
+                )
+                .view(layer_count, 1)
+                .expand(-1, row_count)
+                .reshape(-1)
+            )
+            compute = GREEDY_COMPUTE_PHASE_MULTIPLIER * (compute_slopes * peak_assignments + compute_constants)
+        else:
+            compute = GREEDY_COMPUTE_PHASE_MULTIPLIER * (
+                torch.tensor(
+                    forward_compute_constant,
+                    dtype=units.dtype,
+                    device=units.device,
+                )
+                .view(layer_count, 1)
+                .expand(-1, row_count)
+                .reshape(-1)
+            )
+            peak_compute_rank = torch.full_like(peak_rank, -1)
+
+        scored = []
+        for layer_index, prepared in enumerate(prepared_layers):
+            rows = slice(layer_index * row_count, (layer_index + 1) * row_count)
+            scored.append(
+                _ScoredLayouts(
+                    communication=communication[rows],
+                    compute=compute[rows],
+                    communication_model_units=units[rows],
+                    peak_rank=peak_rank[rows],
+                    peak_compute_rank=peak_compute_rank[rows],
+                    selected_dim=selected_dim[rows],
+                    baseline_physical_routes=prepared.baseline_physical_routes,
+                    route_hashes=prepared.route_hashes,
+                    route_tables=None,
+                )
+            )
+        return scored
+
+    def _score_primitive_unary_layers(
+        self,
+        prepared_layers: Sequence[_PreparedPrimitiveCounts],
+        *,
+        communication_scales: Sequence[float],
+        forward_compute_per_assignment: Sequence[float],
+        forward_compute_constant: Sequence[float],
+        prepare_stage_callback: Callable[[str], None] | None = None,
+    ) -> tuple[list[_ScoredLayouts], list[_GlobalPrimitiveCounts]]:
+        """Reduce primitive deltas once, then compose every action locally."""
+
+        if not prepared_layers:
+            return [], []
+        include_assignments = any(value > 0.0 for value in forward_compute_per_assignment)
+        communication_width = prepared_layers[0].baseline_local.shape[1]
+        local_blocks = []
+        primitive_counts = []
+        for prepared in prepared_layers:
+            primitive_count = int(prepared.primitive_delta_local.shape[0])
+            primitive_counts.append(primitive_count)
+            if self.exact_primitive_max_only:
+                parts = [prepared.baseline_local.reshape(-1)]
+                level_offset = 0
+                for affected_groups, width in zip(
+                    prepared.primitive_affected_groups,
+                    self._count_widths(),
+                    strict=True,
+                ):
+                    valid = affected_groups < width
+                    values = prepared.primitive_delta_local[:, level_offset : level_offset + width].gather(
+                        1, affected_groups.clamp(max=width - 1)
+                    )
+                    parts.append(torch.where(valid, values, torch.zeros_like(values)).reshape(-1))
+                    level_offset += width
+                if include_assignments:
+                    if prepared.baseline_assignment_local is None or prepared.primitive_assignment_delta_local is None:
+                        raise ValueError("Primitive joint-cost scoring requires assignment deltas.")
+                    affected_ranks = prepared.primitive_affected_ranks
+                    valid_ranks = affected_ranks < self.ep_size
+                    assignment_values = prepared.primitive_assignment_delta_local.gather(
+                        1,
+                        affected_ranks.clamp(max=self.ep_size - 1),
+                    )
+                    parts.extend(
+                        (
+                            prepared.baseline_assignment_local.reshape(-1),
+                            torch.where(
+                                valid_ranks,
+                                assignment_values,
+                                torch.zeros_like(assignment_values),
+                            ).reshape(-1),
+                        )
+                    )
+                block = torch.cat(parts)
+            else:
+                block = torch.cat((prepared.baseline_local, prepared.primitive_delta_local), dim=0)
+                if include_assignments:
+                    if prepared.baseline_assignment_local is None or prepared.primitive_assignment_delta_local is None:
+                        raise ValueError("Primitive joint-cost scoring requires assignment deltas.")
+                    assignments = torch.cat(
+                        (
+                            prepared.baseline_assignment_local,
+                            prepared.primitive_assignment_delta_local,
+                        ),
+                        dim=0,
+                    )
+                    block = torch.cat((block, assignments), dim=1)
+            local_blocks.append(block)
+        local_payload = torch.cat(local_blocks, dim=0)
+        if prepare_stage_callback is not None:
+            prepare_stage_callback("collective_pack")
+        global_payload = _reduce_sum(local_payload, self.reducer)
+
+        global_layers = []
+        offset = 0
+        for prepared, primitive_count in zip(prepared_layers, primitive_counts, strict=True):
+            if self.exact_primitive_max_only:
+                baseline = global_payload[offset : offset + communication_width].view(
+                    1,
+                    communication_width,
+                )
+                offset += communication_width
+                primitive_delta = baseline.new_zeros((primitive_count, communication_width))
+                level_offset = 0
+                for affected_groups, width in zip(
+                    prepared.primitive_affected_groups,
+                    self._count_widths(),
+                    strict=True,
+                ):
+                    value_count = primitive_count * int(affected_groups.shape[1])
+                    values = global_payload[offset : offset + value_count].view(
+                        primitive_count,
+                        -1,
+                    )
+                    offset += value_count
+                    dense_level = values.new_zeros((primitive_count, width + 1))
+                    dense_level.scatter_(1, affected_groups, values)
+                    primitive_delta[:, level_offset : level_offset + width] = dense_level[:, :width]
+                    level_offset += width
+                baseline_assignment = None
+                primitive_assignment_delta = None
+                if include_assignments:
+                    baseline_assignment = global_payload[offset : offset + self.ep_size].view(
+                        1,
+                        self.ep_size,
+                    )
+                    offset += self.ep_size
+                    affected_ranks = prepared.primitive_affected_ranks
+                    assignment_value_count = primitive_count * int(affected_ranks.shape[1])
+                    assignment_values = global_payload[offset : offset + assignment_value_count].view(
+                        primitive_count, -1
+                    )
+                    offset += assignment_value_count
+                    dense_assignment = assignment_values.new_zeros((primitive_count, self.ep_size + 1))
+                    dense_assignment.scatter_(1, affected_ranks, assignment_values)
+                    primitive_assignment_delta = dense_assignment[:, : self.ep_size]
+            else:
+                block = global_payload[offset : offset + primitive_count + 1]
+                offset += primitive_count + 1
+                baseline = block[:1, :communication_width]
+                primitive_delta = block[1:, :communication_width]
+                assignment_end = communication_width + (self.ep_size if include_assignments else 0)
+                baseline_assignment = block[:1, communication_width:assignment_end] if include_assignments else None
+                primitive_assignment_delta = (
+                    block[1:, communication_width:assignment_end] if include_assignments else None
+                )
+            global_layers.append(
+                _GlobalPrimitiveCounts(
+                    baseline=baseline,
+                    primitive_delta=primitive_delta,
+                    baseline_assignment=baseline_assignment,
+                    primitive_assignment_delta=primitive_assignment_delta,
+                )
+            )
+        scored_layers = self._score_batched_primitive_actions(
+            prepared_layers,
+            global_layers,
+            communication_scales=communication_scales,
+            forward_compute_per_assignment=forward_compute_per_assignment,
+            forward_compute_constant=forward_compute_constant,
+            batch_layers=self.exact_primitive_max_only,
+        )
+        return scored_layers, global_layers
+
+    def _exact_primitive_topk_layers(
+        self,
+        prepared_layers: Sequence[_PreparedPrimitiveCounts],
+        contexts: Sequence[dict[str, object]],
+        unary_scored: Sequence[_ScoredLayouts],
+        global_layers: Sequence[_GlobalPrimitiveCounts],
+        *,
+        communication_scales: Sequence[float],
+        forward_compute_per_assignment: Sequence[float],
+        forward_compute_constant: Sequence[float],
+        materialize_route_tables: bool,
+    ) -> tuple[list[_ScoredLayouts], list[torch.Tensor], dict[str, object]]:
+        """Select exact-unary Top-K and add only their exact pair corrections."""
+
+        started = time.perf_counter()
+        shortlist_indices = [
+            torch.topk(
+                scored.total[1:],
+                k=min(self.exact_primitive_topk, int(scored.total.numel()) - 1),
+                largest=False,
+                sorted=True,
+            ).indices
+            for scored in unary_scored
+        ]
+        selected_pair_contexts = []
+        selected_rows = []
+        route_tables = []
+        pair_action_indices = []
+        for prepared, context, indices in zip(
+            prepared_layers,
+            contexts,
+            shortlist_indices,
+            strict=True,
+        ):
+            pair_context, rows, tables = statistical_primitive_selected_pair_context(
+                self,
+                prepared.context,
+                context["rows"],
+                indices,
+                layout=context["layout"],
+                copy_slots=context["copy_slots"],
+                uniform_source_rank=context["uniform_source_rank"],
+                materialize_route_tables=materialize_route_tables,
+            )
+            selected_pair_contexts.append(pair_context)
+            selected_rows.append(rows)
+            route_tables.append(tables)
+            pair_action_indices.append(torch.arange(indices.numel(), dtype=torch.long, device=indices.device))
+            context["scored_rows"] = rows
+        compact_pair_statistics = all(context.pair_absence is None for context in selected_pair_contexts)
+        pair_local = statistical_batched_selected_pair_local_deltas(
+            selected_pair_contexts,
+            selected_rows,
+            pair_action_indices,
+        )
+        pair_execution = "batched_compact" if compact_pair_statistics else "batched_dense"
+        pair_counts = [int(value.shape[0]) for value in pair_local]
+        pair_global_payload = _reduce_sum(torch.cat(pair_local, dim=0), self.reducer)
+
+        exact_scored = []
+        offset = 0
+        include_assignments = any(value > 0.0 for value in forward_compute_per_assignment)
+        for layer_index, (
+            prepared,
+            indices,
+            tables,
+            global_counts,
+            selected_count,
+        ) in enumerate(
+            zip(
+                prepared_layers,
+                shortlist_indices,
+                route_tables,
+                global_layers,
+                pair_counts,
+                strict=True,
+            )
+        ):
+            pair_delta = pair_global_payload[offset : offset + selected_count]
+            offset += selected_count
+            spec = prepared.context.spec
+            lhs_ids = spec.lhs_ids.index_select(0, indices)
+            rhs_ids = spec.rhs_ids.index_select(0, indices)
+            rhs_valid = rhs_ids >= 0
+            rhs_safe = rhs_ids.clamp_min(0)
+            unary_delta = global_counts.primitive_delta.index_select(0, lhs_ids)
+            rhs_delta = global_counts.primitive_delta.index_select(0, rhs_safe)
+            unary_delta += rhs_delta * rhs_valid.view(-1, 1).to(rhs_delta.dtype)
+            candidate_communication = global_counts.baseline + unary_delta + pair_delta
+            communication_rows = torch.cat((global_counts.baseline, candidate_communication), dim=0)
+            assignment_rows = None
+            if include_assignments:
+                assert (
+                    global_counts.baseline_assignment is not None
+                    and global_counts.primitive_assignment_delta is not None
+                )
+                assignment_delta = global_counts.primitive_assignment_delta.index_select(0, lhs_ids)
+                rhs_assignment = global_counts.primitive_assignment_delta.index_select(0, rhs_safe)
+                assignment_delta += rhs_assignment * rhs_valid.view(-1, 1).to(rhs_assignment.dtype)
+                candidate_assignment = global_counts.baseline_assignment + assignment_delta
+                assignment_rows = torch.cat(
+                    (global_counts.baseline_assignment, candidate_assignment),
+                    dim=0,
+                )
+            exact_scored.append(
+                self._score_global_count_rows(
+                    communication_rows,
+                    assignment_rows,
+                    communication_scale=communication_scales[layer_index],
+                    forward_compute_per_assignment=forward_compute_per_assignment[layer_index],
+                    forward_compute_constant=forward_compute_constant[layer_index],
+                    baseline_physical_routes=prepared.baseline_physical_routes,
+                    route_hashes=prepared.route_hashes,
+                    route_tables=tables,
+                )
+            )
+        stats = {
+            "enabled": True,
+            "topk": self.exact_primitive_topk,
+            "max_only_unary": self.exact_primitive_max_only,
+            "unary_selector": ("batched_full_exact_compact" if self.exact_primitive_max_only else "full_exact_unary"),
+            "primitive_counts": [int(value.primitive_delta_local.shape[0]) for value in prepared_layers],
+            "candidate_counts": [int(context["rows"].shape[0]) for context in contexts],
+            "shortlist_counts": [int(value.numel()) for value in shortlist_indices],
+            "pair_rerank_host_ms": (time.perf_counter() - started) * 1000.0,
+            "pair_statistics_mode": ("post_shortlist_compact" if compact_pair_statistics else "precomputed_dense"),
+            "pair_execution": pair_execution,
+            "collective_rounds": 2,
+        }
+        dense_collective_elements = sum(
+            (int(value.primitive_delta_local.shape[0]) + 1)
+            * (int(value.baseline_local.shape[1]) + (self.ep_size if include_assignments else 0))
+            for value in prepared_layers
+        )
+        compact_collective_elements = sum(
+            int(value.baseline_local.shape[1])
+            + int(value.primitive_delta_local.shape[0])
+            * sum(int(groups.shape[1]) for groups in value.primitive_affected_groups)
+            + (
+                self.ep_size + int(value.primitive_delta_local.shape[0]) * int(value.primitive_affected_ranks.shape[1])
+                if include_assignments
+                else 0
+            )
+            for value in prepared_layers
+        )
+        stats["unary_collective_elements"] = (
+            compact_collective_elements if self.exact_primitive_max_only else dense_collective_elements
+        )
+        stats["unary_collective_dense_elements"] = dense_collective_elements
+        stats["unary_collective_compression"] = float(dense_collective_elements) / float(
+            compact_collective_elements if self.exact_primitive_max_only else dense_collective_elements
+        )
+        return exact_scored, shortlist_indices, stats
+
     def _selected_exact_prepared(
         self,
         prepared: _PreparedActionCounts,
@@ -1864,6 +2695,20 @@ class GreedyCommunicationPlanner:
         if self.reducer is None or not dist.is_initialized() or not prepared_layers:
             return local_available
         available = prepared_layers[0].baseline_local.new_tensor([float(local_available)])
+        available_count = _reduce_sum(available, self.reducer)
+        return int(available_count.item()) == self.ep_size
+
+    def _fast_path_available_on_all_ranks(
+        self,
+        local_available: bool,
+        *,
+        device: torch.device,
+    ) -> bool:
+        """Require every EP rank to select the same scoring path."""
+
+        if self.reducer is None or not dist.is_initialized():
+            return bool(local_available)
+        available = torch.tensor([float(local_available)], dtype=torch.float32, device=device)
         available_count = _reduce_sum(available, self.reducer)
         return int(available_count.item()) == self.ep_size
 
@@ -2022,6 +2867,8 @@ class GreedyCommunicationPlanner:
         include_assignment_counts: bool,
         include_pair_interactions: bool = True,
         include_pair_bounds: bool = False,
+        early_proxy: bool = False,
+        prepare_stage_callback: Callable[[str], None] | None = None,
     ) -> list[_PreparedActionCounts]:
         """Build exact per-layer statistics concurrently on accelerator streams.
 
@@ -2032,6 +2879,20 @@ class GreedyCommunicationPlanner:
         """
 
         def prepare(context: dict[str, object]) -> _PreparedActionCounts:
+            if early_proxy:
+                return self._prepare_proxy_action_counts(
+                    context["selected"],
+                    context["layout"],
+                    context["rows"],
+                    uniform_source_rank=context["uniform_source_rank"],
+                    copy_slots=context["copy_slots"],
+                    token_ordinals=context["ordinals"],
+                    step=step,
+                    layer_seed=context["layer_seed"],
+                    num_experts=int(context["owners"].numel()),
+                    include_assignment_counts=include_assignment_counts,
+                    prepare_stage_callback=prepare_stage_callback,
+                )
             return self._prepare_action_counts(
                 context["selected"],
                 context["layout"],
@@ -2047,6 +2908,7 @@ class GreedyCommunicationPlanner:
                 include_assignment_counts=include_assignment_counts,
                 include_pair_interactions=include_pair_interactions,
                 include_pair_bounds=include_pair_bounds,
+                prepare_stage_callback=prepare_stage_callback,
             )
 
         if not contexts:
@@ -2094,6 +2956,65 @@ class GreedyCommunicationPlanner:
             raise RuntimeError("Batched layer statistic preparation did not produce every layer.")
         return [value for value in prepared if value is not None]
 
+    def _prepare_primitive_layers(
+        self,
+        contexts: Sequence[dict[str, object]],
+        *,
+        step: int,
+        include_assignment_counts: bool,
+        prepare_stage_callback: Callable[[str], None] | None = None,
+    ) -> list[_PreparedPrimitiveCounts]:
+        """Build exact primitive statistics on the existing bounded stream pool."""
+
+        if not contexts:
+            return []
+
+        def prepare(context: dict[str, object]) -> _PreparedPrimitiveCounts:
+            return self._prepare_primitive_counts(
+                context,
+                step=step,
+                include_assignment_counts=include_assignment_counts,
+                prepare_stage_callback=prepare_stage_callback,
+            )
+
+        device = contexts[0]["selected"].device
+        prepared: list[_PreparedPrimitiveCounts | None] = [None] * len(contexts)
+        prepared[0] = prepare(contexts[0])
+        common_shape = tuple(contexts[0]["selected"].shape)
+        shapes_match = all(tuple(context["selected"].shape) == common_shape for context in contexts)
+        stream_count = min(self.layer_parallel_streams, len(contexts) - 1) if shapes_match else 0
+        if device.type == "cpu" or stream_count <= 1:
+            for index in range(1, len(contexts)):
+                prepared[index] = prepare(contexts[index])
+        else:
+            device_api = get_torch_device()
+            try:
+                caller_stream = device_api.current_stream(device)
+            except TypeError:
+                caller_stream = device_api.current_stream()
+            cache_key = (device.type, device.index, stream_count)
+            compute_streams = _LAYER_COMPUTE_STREAMS.get(cache_key)
+            if compute_streams is None:
+                values = []
+                for _ in range(stream_count):
+                    try:
+                        values.append(device_api.Stream(device=device))
+                    except TypeError:
+                        values.append(device_api.Stream())
+                compute_streams = tuple(values)
+                _LAYER_COMPUTE_STREAMS[cache_key] = compute_streams
+            for compute_stream in compute_streams:
+                compute_stream.wait_stream(caller_stream)
+            for index in range(1, len(contexts)):
+                compute_stream = compute_streams[(index - 1) % stream_count]
+                with device_api.stream(compute_stream):
+                    prepared[index] = prepare(contexts[index])
+            for compute_stream in compute_streams:
+                caller_stream.wait_stream(compute_stream)
+        if any(value is None for value in prepared):
+            raise RuntimeError("Batched primitive preparation did not produce every layer.")
+        return [value for value in prepared if value is not None]
+
     def score_layout(
         self,
         selected_experts: torch.Tensor,
@@ -2137,6 +3058,7 @@ class GreedyCommunicationPlanner:
         forward_compute_per_assignment: Sequence[float] | None = None,
         forward_compute_constant: Sequence[float] | None = None,
         skip_final_route_update: bool = True,
+        prepare_stage_callback: Callable[[str], None] | None = None,
     ) -> list[PlacementPlan]:
         """Plan one steady-state action per independent layer with one EP collective."""
 
@@ -2172,6 +3094,12 @@ class GreedyCommunicationPlanner:
 
         candidate_started = time.perf_counter()
         contexts: list[dict[str, object]] = []
+        # Step-mode callers commonly pass the same steady-state layout object
+        # to every layer (for example the initial R2 layout).  Candidate rows,
+        # copy tables, and primitive ids depend only on that metadata, not on
+        # the layer's token routes.  Reuse the immutable tensors instead of
+        # repeating CPU copies and an exact torch.unique for all 48 layers.
+        layout_metadata_cache: dict[tuple[int, int], dict[str, object]] = {}
         include_assignments = any(value > 0.0 for value in compute_slopes)
         for layer_index, (raw_selected, raw_layout, raw_owners, raw_source, layer_seed) in enumerate(
             zip(
@@ -2192,12 +3120,6 @@ class GreedyCommunicationPlanner:
                     f"selected_experts[{layer_index}] must have rank 1 or 2, got shape={tuple(selected.shape)}."
                 )
             device = selected.device
-            host_layout = raw_layout.detach().to(device="cpu", dtype=torch.long).clone()
-            host_owners = raw_owners.detach().to(device="cpu", dtype=torch.long).reshape(-1).clone()
-            if host_layout.numel() != self.ep_size * self.slots_per_rank:
-                raise ValueError("A batched slot_to_logical does not match ep_size * slots_per_rank.")
-            if bool((host_layout < 0).any().item()):
-                raise ValueError("plan_layers currently requires initialized steady-state layouts.")
             if isinstance(raw_source, int):
                 uniform_source_rank = int(raw_source)
                 sources = torch.full(
@@ -2212,29 +3134,63 @@ class GreedyCommunicationPlanner:
             if sources.numel() != selected.shape[0]:
                 raise ValueError("A batched source_ranks tensor does not match its local token count.")
             ordinals = torch.arange(selected.shape[0], dtype=torch.long, device=device)
-            all_slots = torch.arange(host_layout.numel(), dtype=torch.long)
-            owner_mask = torch.zeros((host_layout.numel(),), dtype=torch.bool)
-            owner_mask.scatter_(0, host_owners, True)
-            rows_by_kind = []
-            if max(0, int(max_swaps)) > 0:
-                rows_by_kind.append(self._swap_rows(host_layout, host_owners))
-            if max(0, int(max_replicas)) > 0:
-                cover_slots = all_slots[(~owner_mask) & (host_layout >= 0)]
-                rows_by_kind.append(self._cover_rows(host_layout, host_owners, cover_slots))
-            nonempty_rows = [value for value in rows_by_kind if value.numel()]
-            host_rows = torch.cat(nonempty_rows, dim=0) if nonempty_rows else torch.empty((0, 5), dtype=torch.long)
-            host_copy_slots = self._copy_table(host_layout, int(host_owners.numel()))
-            contexts.append(
-                {
-                    "selected": selected,
-                    "original_selected_ndim": original_selected_ndim,
+            metadata_key = (id(raw_layout), id(raw_owners))
+            metadata = layout_metadata_cache.get(metadata_key)
+            if metadata is None:
+                host_layout = raw_layout.detach().to(device="cpu", dtype=torch.long).clone()
+                host_owners = raw_owners.detach().to(device="cpu", dtype=torch.long).reshape(-1).clone()
+                if host_layout.numel() != self.ep_size * self.slots_per_rank:
+                    raise ValueError("A batched slot_to_logical does not match ep_size * slots_per_rank.")
+                if bool((host_layout < 0).any().item()):
+                    raise ValueError("plan_layers currently requires initialized steady-state layouts.")
+                all_slots = torch.arange(host_layout.numel(), dtype=torch.long)
+                owner_mask = torch.zeros((host_layout.numel(),), dtype=torch.bool)
+                owner_mask.scatter_(0, host_owners, True)
+                rows_by_kind = []
+                if max(0, int(max_swaps)) > 0:
+                    rows_by_kind.append(self._swap_rows(host_layout, host_owners))
+                if max(0, int(max_replicas)) > 0:
+                    cover_slots = all_slots[(~owner_mask) & (host_layout >= 0)]
+                    rows_by_kind.append(self._cover_rows(host_layout, host_owners, cover_slots))
+                nonempty_rows = [value for value in rows_by_kind if value.numel()]
+                host_rows = torch.cat(nonempty_rows, dim=0) if nonempty_rows else torch.empty((0, 5), dtype=torch.long)
+                host_copy_slots = self._copy_table(host_layout, int(host_owners.numel()))
+                primitive_spec = (
+                    self._primitive_spec(
+                        host_layout,
+                        host_copy_slots,
+                        host_rows,
+                        device=device,
+                    )
+                    if self.exact_primitive_topk and host_rows.numel()
+                    else None
+                )
+                device_copy_slots = host_copy_slots.to(device=device, non_blocking=True)
+                primitive_affected_ranks = None
+                primitive_affected_groups = None
+                if primitive_spec is not None and self.exact_primitive_max_only:
+                    primitive_affected_ranks, primitive_affected_groups = self._primitive_affected_metadata(
+                        device_copy_slots,
+                        primitive_spec,
+                    )
+                metadata = {
                     "host_layout": host_layout,
                     "host_owners": host_owners,
                     "layout": host_layout.to(device=device, non_blocking=True),
                     "owners": host_owners.to(device=device, non_blocking=True),
                     "host_rows": host_rows,
                     "rows": host_rows.to(device=device, non_blocking=True),
-                    "copy_slots": host_copy_slots.to(device=device, non_blocking=True),
+                    "copy_slots": device_copy_slots,
+                    "primitive_spec": primitive_spec,
+                    "primitive_affected_ranks": primitive_affected_ranks,
+                    "primitive_affected_groups": primitive_affected_groups,
+                }
+                layout_metadata_cache[metadata_key] = metadata
+            contexts.append(
+                {
+                    "selected": selected,
+                    "original_selected_ndim": original_selected_ndim,
+                    **metadata,
                     "sources": sources,
                     "uniform_source_rank": uniform_source_rank,
                     "ordinals": ordinals,
@@ -2242,56 +3198,216 @@ class GreedyCommunicationPlanner:
                 }
             )
         route_stats_ms = (time.perf_counter() - candidate_started) * 1000.0
+        if prepare_stage_callback is not None:
+            prepare_stage_callback("context")
 
         score_started = time.perf_counter()
-        prepared_layers = self._prepare_independent_layers(
-            contexts,
-            step=step,
-            include_assignment_counts=include_assignments,
-            include_pair_interactions=not self.adaptive_topk,
-            include_pair_bounds=self.adaptive_topk and self.adaptive_topk_strict_certificate,
+        early_available = (
+            self.early_proxy_topk > 0
+            and self.candidate_scorer == "statistics"
+            and all(context["uniform_source_rank"] is not None and context["rows"].numel() for context in contexts)
         )
-        adaptive_available = self.adaptive_topk and self._adaptive_fast_path_available_on_all_ranks(prepared_layers)
-        if adaptive_available:
-            scored_layers, candidate_index_maps, adaptive_stats = self._adaptive_score_layers(
-                prepared_layers,
+        primitive_local_available = (
+            self.exact_primitive_topk > 0
+            and self.candidate_scorer == "statistics"
+            and all(
+                context["uniform_source_rank"] is not None
+                and context["rows"].numel()
+                and context["primitive_spec"] is not None
+                and statistical_primitive_fast_path_available(
+                    self,
+                    context["selected"],
+                    copy_slots=context["copy_slots"],
+                    num_experts=int(context["owners"].numel()),
+                    defer_pair_statistics=self.post_shortlist_compact_pair,
+                    batched_layer_count=len(contexts),
+                )
+                for context in contexts
+            )
+        )
+        primitive_available = (
+            self._fast_path_available_on_all_ranks(
+                primitive_local_available,
+                device=contexts[0]["selected"].device,
+            )
+            if self.exact_primitive_topk > 0
+            else False
+        )
+        route_table_index_maps: list[torch.Tensor]
+        if primitive_available:
+            primitive_started = time.perf_counter()
+            prepared_layers = self._prepare_primitive_layers(
                 contexts,
+                step=step,
+                include_assignment_counts=include_assignments,
+                prepare_stage_callback=prepare_stage_callback,
+            )
+            unary_scored, global_primitive = self._score_primitive_unary_layers(
+                prepared_layers,
                 communication_scales=scales,
                 forward_compute_per_assignment=compute_slopes,
                 forward_compute_constant=compute_constants,
+                prepare_stage_callback=prepare_stage_callback,
             )
-            self.last_adaptive_topk_stats = adaptive_stats
-        else:
-            if self.adaptive_topk:
-                prepared_layers = self._prepare_independent_layers(
-                    contexts,
-                    step=step,
-                    include_assignment_counts=include_assignments,
-                    include_pair_interactions=True,
-                    include_pair_bounds=False,
-                )
+            scored_layers, candidate_index_maps, primitive_stats = self._exact_primitive_topk_layers(
+                prepared_layers,
+                contexts,
+                unary_scored,
+                global_primitive,
+                communication_scales=scales,
+                forward_compute_per_assignment=compute_slopes,
+                forward_compute_constant=compute_constants,
+                materialize_route_tables=not skip_final_route_update,
+            )
+            route_table_index_maps = [
+                torch.arange(indices.numel(), dtype=torch.long, device=indices.device)
+                for indices in candidate_index_maps
+            ]
+            primitive_stats["total_host_ms"] = (time.perf_counter() - primitive_started) * 1000.0
+            self.last_exact_primitive_stats = primitive_stats
+            self.last_exact_primitive_shortlist_indices = candidate_index_maps
+            self.last_early_proxy_stats = {"enabled": False, "reason": "disabled"}
+            self.last_early_proxy_shortlist_indices = []
+            self.last_adaptive_topk_stats = {"enabled": False}
+        elif early_available:
+            proxy_started = time.perf_counter()
+            proxy_prepared = self._prepare_independent_layers(
+                contexts,
+                step=step,
+                include_assignment_counts=include_assignments,
+                early_proxy=True,
+                prepare_stage_callback=prepare_stage_callback,
+            )
+            proxy_scored = self._score_prepared_layers(
+                proxy_prepared,
+                communication_scales=scales,
+                forward_compute_per_assignment=compute_slopes,
+                forward_compute_constant=compute_constants,
+                prepare_stage_callback=prepare_stage_callback,
+            )
+            shortlist_indices = [
+                torch.topk(
+                    scored.total[1:],
+                    k=min(self.early_proxy_topk, int(scored.total.numel()) - 1),
+                    largest=False,
+                    sorted=True,
+                ).indices
+                for scored in proxy_scored
+            ]
+            proxy_ms = (time.perf_counter() - proxy_started) * 1000.0
+            exact_contexts = []
+            for context, indices in zip(contexts, shortlist_indices, strict=True):
+                exact_context = dict(context)
+                exact_rows = context["rows"].index_select(0, indices)
+                exact_context["rows"] = exact_rows
+                context["scored_rows"] = exact_rows
+                exact_contexts.append(exact_context)
+            exact_started = time.perf_counter()
+            prepared_layers = self._prepare_independent_layers(
+                exact_contexts,
+                step=step,
+                include_assignment_counts=include_assignments,
+                include_pair_interactions=True,
+                include_pair_bounds=False,
+                prepare_stage_callback=prepare_stage_callback,
+            )
             scored_layers = self._score_prepared_layers(
                 prepared_layers,
                 communication_scales=scales,
                 forward_compute_per_assignment=compute_slopes,
                 forward_compute_constant=compute_constants,
+                prepare_stage_callback=prepare_stage_callback,
             )
-            candidate_index_maps = [
-                torch.arange(
-                    context["rows"].shape[0],
-                    dtype=torch.long,
-                    device=context["rows"].device,
-                )
-                for context in contexts
+            exact_ms = (time.perf_counter() - exact_started) * 1000.0
+            candidate_index_maps = shortlist_indices
+            self.last_early_proxy_shortlist_indices = shortlist_indices
+            route_table_index_maps = [
+                torch.arange(indices.numel(), dtype=torch.long, device=indices.device) for indices in shortlist_indices
             ]
-            self.last_adaptive_topk_stats = (
-                {
-                    "enabled": False,
-                    "reason": "statistical unary fast path unavailable on at least one EP rank",
-                }
-                if self.adaptive_topk
-                else {"enabled": False}
+            self.last_early_proxy_stats = {
+                "enabled": True,
+                "topk": self.early_proxy_topk,
+                "candidate_counts": [int(context["rows"].shape[0]) for context in contexts],
+                "shortlist_counts": [int(indices.numel()) for indices in shortlist_indices],
+                "proxy_host_ms": proxy_ms,
+                "exact_shortlist_host_ms": exact_ms,
+            }
+            self.last_adaptive_topk_stats = {"enabled": False}
+            self.last_exact_primitive_stats = {"enabled": False, "reason": "disabled"}
+            self.last_exact_primitive_shortlist_indices = []
+        else:
+            prepared_layers = self._prepare_independent_layers(
+                contexts,
+                step=step,
+                include_assignment_counts=include_assignments,
+                include_pair_interactions=not self.adaptive_topk,
+                include_pair_bounds=self.adaptive_topk and self.adaptive_topk_strict_certificate,
+                prepare_stage_callback=prepare_stage_callback,
             )
+            adaptive_available = self.adaptive_topk and self._adaptive_fast_path_available_on_all_ranks(
+                prepared_layers
+            )
+            if adaptive_available:
+                scored_layers, candidate_index_maps, adaptive_stats = self._adaptive_score_layers(
+                    prepared_layers,
+                    contexts,
+                    communication_scales=scales,
+                    forward_compute_per_assignment=compute_slopes,
+                    forward_compute_constant=compute_constants,
+                )
+                route_table_index_maps = candidate_index_maps
+                self.last_adaptive_topk_stats = adaptive_stats
+            else:
+                if self.adaptive_topk:
+                    prepared_layers = self._prepare_independent_layers(
+                        contexts,
+                        step=step,
+                        include_assignment_counts=include_assignments,
+                        include_pair_interactions=True,
+                        include_pair_bounds=False,
+                    )
+                scored_layers = self._score_prepared_layers(
+                    prepared_layers,
+                    communication_scales=scales,
+                    forward_compute_per_assignment=compute_slopes,
+                    forward_compute_constant=compute_constants,
+                    prepare_stage_callback=prepare_stage_callback,
+                )
+                candidate_index_maps = [
+                    torch.arange(
+                        context["rows"].shape[0],
+                        dtype=torch.long,
+                        device=context["rows"].device,
+                    )
+                    for context in contexts
+                ]
+                route_table_index_maps = candidate_index_maps
+                self.last_adaptive_topk_stats = (
+                    {
+                        "enabled": False,
+                        "reason": "statistical unary fast path unavailable on at least one EP rank",
+                    }
+                    if self.adaptive_topk
+                    else {"enabled": False}
+                )
+            self.last_early_proxy_stats = {
+                "enabled": False,
+                "reason": (
+                    "requires statistics scorer, non-empty candidates, and one uniform source rank per EP process"
+                    if self.early_proxy_topk
+                    else "disabled"
+                ),
+            }
+            self.last_early_proxy_shortlist_indices = []
+            self.last_exact_primitive_stats = {
+                "enabled": False,
+                "reason": (
+                    "requires statistics scorer, non-empty candidates, and one uniform source rank per EP process"
+                    if self.exact_primitive_topk
+                    else "disabled"
+                ),
+            }
+            self.last_exact_primitive_shortlist_indices = []
         score_ms = (time.perf_counter() - score_started) * 1000.0
 
         decision_started = time.perf_counter()
@@ -2311,6 +3427,14 @@ class GreedyCommunicationPlanner:
         best_indices = torch.stack(
             [
                 candidate_index_maps[layer_index][best_positions[layer_index]]
+                if candidate_counts[layer_index]
+                else torch.full((), -1, dtype=torch.long, device=device)
+                for layer_index in range(layer_count)
+            ]
+        )
+        best_route_table_indices = torch.stack(
+            [
+                route_table_index_maps[layer_index][best_positions[layer_index]]
                 if candidate_counts[layer_index]
                 else torch.full((), -1, dtype=torch.long, device=device)
                 for layer_index in range(layer_count)
@@ -2344,6 +3468,13 @@ class GreedyCommunicationPlanner:
                 torch.where(has_candidate, best_indices, torch.full_like(best_indices, -1))
                 .to(scored_layers[0].communication.dtype)
                 .view(-1, 1),
+                torch.where(
+                    has_candidate,
+                    best_route_table_indices,
+                    torch.full_like(best_route_table_indices, -1),
+                )
+                .to(scored_layers[0].communication.dtype)
+                .view(-1, 1),
                 torch.stack(baseline_metrics),
                 torch.stack(candidate_metrics),
             ),
@@ -2355,15 +3486,16 @@ class GreedyCommunicationPlanner:
         finalization_started = time.perf_counter()
         plans: list[PlacementPlan] = []
         per_layer_planning_ms = (time.perf_counter() - started) * 1000.0 / layer_count
-        for context, prepared, decision_row in zip(
+        for context, scored, decision_row in zip(
             contexts,
-            prepared_layers,
+            scored_layers,
             decision_rows,
             strict=True,
         ):
             winner_index = int(decision_row[0])
-            baseline_cost = self._placement_cost_from_values(decision_row[1:7])
-            candidate_cost = self._placement_cost_from_values(decision_row[7:13])
+            route_table_index = int(decision_row[1])
+            baseline_cost = self._placement_cost_from_values(decision_row[2:8])
+            candidate_cost = self._placement_cost_from_values(decision_row[8:14])
             final_cost = baseline_cost
             host_layout = context["host_layout"]
             host_owners = context["host_owners"]
@@ -2386,31 +3518,32 @@ class GreedyCommunicationPlanner:
                 else:
                     final_host_layout[action.dst_slot] = action.src_logical
                 if not skip_final_route_update:
-                    row = context["rows"][winner_index]
-                    if prepared.route_tables is not None:
+                    scored_rows = context.get("scored_rows", context["rows"])
+                    row = scored_rows[route_table_index]
+                    if scored.route_tables is not None:
                         final_physical = self._apply_statistical_action_routes(
                             context["selected"],
                             row,
-                            winner_index,
-                            prepared.baseline_physical_routes,
-                            prepared.route_hashes,
-                            prepared.route_tables,
+                            route_table_index,
+                            scored.baseline_physical_routes,
+                            scored.route_hashes,
+                            scored.route_tables,
                         )
                     else:
                         final_physical = self._apply_action_routes(
                             context["selected"],
                             context["layout"],
                             row,
-                            prepared.baseline_physical_routes,
+                            scored.baseline_physical_routes,
                             source_ranks=context["sources"],
                             token_ordinals=context["ordinals"],
-                            route_hashes=prepared.route_hashes,
+                            route_hashes=scored.route_hashes,
                             step=step,
                             layer_seed=context["layer_seed"],
                             num_experts=int(context["owners"].numel()),
                         )
             if not skip_final_route_update and final_physical is None:
-                final_physical = prepared.baseline_physical_routes
+                final_physical = scored.baseline_physical_routes
             if final_physical is not None and int(context["original_selected_ndim"]) == 1:
                 final_physical = final_physical.squeeze(-1)
             chose_swap = bool(actions) and actions[0].kind == "swap"
@@ -2464,6 +3597,23 @@ class GreedyCommunicationPlanner:
         step: int = 0,
         layer_seed: int = 0,
     ) -> PlacementPlan:
+        if self.exact_primitive_topk and token_ordinals is None:
+            host_layout = slot_to_logical.detach().to(device="cpu", dtype=torch.long)
+            if not bool((host_layout < 0).any().item()):
+                batched_sources: int | Sequence[int | torch.Tensor] = (
+                    int(source_ranks) if isinstance(source_ranks, int) else [source_ranks]
+                )
+                return self.plan_layers(
+                    [selected_experts],
+                    [slot_to_logical],
+                    [owner_slots],
+                    source_ranks=batched_sources,
+                    max_swaps=max_swaps,
+                    max_replicas=max_replicas,
+                    layer_seeds=[layer_seed],
+                    step=step,
+                    skip_final_route_update=False,
+                )[0]
         started = time.perf_counter()
         selected = selected_experts.to(torch.long)
         original_selected_ndim = selected.ndim
@@ -2532,7 +3682,83 @@ class GreedyCommunicationPlanner:
 
         score_started = time.perf_counter()
         candidate_index_map = torch.arange(rows.shape[0], dtype=torch.long, device=device)
-        if self.adaptive_topk and not initializing and rows.numel():
+        route_table_index_map = candidate_index_map
+        scored_rows = rows
+        early_available = (
+            self.early_proxy_topk > 0
+            and not initializing
+            and rows.numel()
+            and self.candidate_scorer == "statistics"
+            and uniform_source_rank is not None
+        )
+        if early_available:
+            proxy_started = time.perf_counter()
+            proxy_prepared = self._prepare_proxy_action_counts(
+                selected,
+                layout,
+                rows,
+                uniform_source_rank=uniform_source_rank,
+                copy_slots=copy_slots,
+                token_ordinals=ordinals,
+                step=step,
+                layer_seed=layer_seed,
+                num_experts=int(owners.numel()),
+                include_assignment_counts=self.forward_compute_per_assignment > 0.0,
+            )
+            proxy_scored = self._score_prepared_layers(
+                [proxy_prepared],
+                communication_scales=[self.communication_scale],
+                forward_compute_per_assignment=[self.forward_compute_per_assignment],
+                forward_compute_constant=[self.forward_compute_constant],
+            )[0]
+            shortlist_count = min(self.early_proxy_topk, int(rows.shape[0]))
+            candidate_index_map = torch.topk(
+                proxy_scored.total[1:],
+                k=shortlist_count,
+                largest=False,
+                sorted=True,
+            ).indices
+            self.last_early_proxy_shortlist_indices = [candidate_index_map]
+            proxy_ms = (time.perf_counter() - proxy_started) * 1000.0
+            scored_rows = rows.index_select(0, candidate_index_map)
+            exact_started = time.perf_counter()
+            prepared = self._prepare_action_counts(
+                selected,
+                layout,
+                scored_rows,
+                source_ranks=sources,
+                uniform_source_rank=uniform_source_rank,
+                copy_slots=copy_slots,
+                affected_groups=None,
+                token_ordinals=ordinals,
+                step=step,
+                layer_seed=layer_seed,
+                num_experts=int(owners.numel()),
+                include_pair_interactions=True,
+                include_pair_bounds=False,
+            )
+            scored = self._score_prepared_layers(
+                [prepared],
+                communication_scales=[self.communication_scale],
+                forward_compute_per_assignment=[self.forward_compute_per_assignment],
+                forward_compute_constant=[self.forward_compute_constant],
+            )[0]
+            exact_ms = (time.perf_counter() - exact_started) * 1000.0
+            route_table_index_map = torch.arange(
+                shortlist_count,
+                dtype=torch.long,
+                device=device,
+            )
+            self.last_early_proxy_stats = {
+                "enabled": True,
+                "topk": self.early_proxy_topk,
+                "candidate_counts": [int(rows.shape[0])],
+                "shortlist_counts": [shortlist_count],
+                "proxy_host_ms": proxy_ms,
+                "exact_shortlist_host_ms": exact_ms,
+            }
+            self.last_adaptive_topk_stats = {"enabled": False}
+        elif self.adaptive_topk and not initializing and rows.numel():
             prepared = self._prepare_action_counts(
                 selected,
                 layout,
@@ -2562,6 +3788,7 @@ class GreedyCommunicationPlanner:
                 )
                 scored = adaptive_scored[0]
                 candidate_index_map = candidate_maps[0]
+                route_table_index_map = candidate_index_map
                 self.last_adaptive_topk_stats = adaptive_stats
             else:
                 prepared = self._prepare_action_counts(
@@ -2589,6 +3816,8 @@ class GreedyCommunicationPlanner:
                     "enabled": False,
                     "reason": "statistical unary fast path unavailable on at least one EP rank",
                 }
+            self.last_early_proxy_stats = {"enabled": False, "reason": "disabled"}
+            self.last_early_proxy_shortlist_indices = []
         else:
             scored = self._score_actions(
                 selected,
@@ -2604,6 +3833,15 @@ class GreedyCommunicationPlanner:
                 num_experts=int(owners.numel()),
             )
             self.last_adaptive_topk_stats = {"enabled": False}
+            self.last_early_proxy_stats = {
+                "enabled": False,
+                "reason": (
+                    "requires statistics scorer, steady state candidates, and one uniform source rank"
+                    if self.early_proxy_topk
+                    else "disabled"
+                ),
+            }
+            self.last_early_proxy_shortlist_indices = []
         score_ms = (time.perf_counter() - score_started) * 1000.0
         baseline_cost = self._placement_cost(scored, 0) if initializing or rows.numel() == 0 else None
         actions: tuple[PlacementAction, ...] = ()
@@ -2701,6 +3939,7 @@ class GreedyCommunicationPlanner:
             candidate_costs = scored.total[1:]
             best_position = candidate_costs.argmin()
             best_index = candidate_index_map.index_select(0, best_position.view(1))[0]
+            route_table_index = route_table_index_map.index_select(0, best_position.view(1))[0]
             metrics = torch.stack(
                 (
                     scored.communication,
@@ -2716,16 +3955,18 @@ class GreedyCommunicationPlanner:
             decision = torch.cat(
                 (
                     best_index.to(scored.communication.dtype).view(1),
+                    route_table_index.to(scored.communication.dtype).view(1),
                     metrics.index_select(0, metric_indices).reshape(-1),
                 )
             )
             decision_values = decision.detach().to(device="cpu").tolist()
             winner_index = int(decision_values[0])
-            baseline_cost = self._placement_cost_from_values(decision_values[1:7])
-            candidate_cost = self._placement_cost_from_values(decision_values[7:13])
+            winner_route_table_index = int(decision_values[1])
+            baseline_cost = self._placement_cost_from_values(decision_values[2:8])
+            candidate_cost = self._placement_cost_from_values(decision_values[8:14])
             final_cost = baseline_cost
             if candidate_cost.total < baseline_cost.total:
-                row = rows.index_select(0, best_index.view(1))[0]
+                row = scored_rows[winner_route_table_index]
                 host_row = host_rows[winner_index]
                 action = self._placement_action(host_row.tolist())
                 actions = (action,)
@@ -2743,7 +3984,7 @@ class GreedyCommunicationPlanner:
                     final_physical = self._apply_statistical_action_routes(
                         selected,
                         row,
-                        winner_index,
+                        winner_route_table_index,
                         scored.baseline_physical_routes,
                         scored.route_hashes,
                         scored.route_tables,

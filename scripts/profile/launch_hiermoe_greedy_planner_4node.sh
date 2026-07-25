@@ -24,6 +24,11 @@ forward_compute_constant=${FORWARD_COMPUTE_CONSTANT:-0.0}
 adaptive_topk=${ADAPTIVE_TOPK:-0}
 adaptive_topk_initial=${ADAPTIVE_TOPK_INITIAL:-16}
 adaptive_topk_strict=${ADAPTIVE_TOPK_STRICT:-0}
+early_proxy_topk=${EARLY_PROXY_TOPK:-0}
+exact_primitive_topk=${EXACT_PRIMITIVE_TOPK:-0}
+post_shortlist_compact_pair=${POST_SHORTLIST_COMPACT_PAIR:-0}
+exact_primitive_max_only=${EXACT_PRIMITIVE_MAX_ONLY:-0}
+compare_full_exact=${COMPARE_FULL_EXACT:-0}
 
 benchmark_args=(
   --route-dir=${route_dir}
@@ -53,6 +58,21 @@ if [[ "${adaptive_topk}" == "1" ]]; then
 fi
 if [[ "${adaptive_topk_strict}" == "1" ]]; then
   benchmark_args+=(--adaptive-topk-strict-certificate)
+fi
+if (( early_proxy_topk > 0 )); then
+  benchmark_args+=(--early-proxy-topk="${early_proxy_topk}")
+fi
+if (( exact_primitive_topk > 0 )); then
+  benchmark_args+=(--exact-primitive-topk="${exact_primitive_topk}")
+fi
+if [[ "${post_shortlist_compact_pair}" == "1" ]]; then
+  benchmark_args+=(--post-shortlist-compact-pair)
+fi
+if [[ "${exact_primitive_max_only}" == "1" ]]; then
+  benchmark_args+=(--exact-primitive-max-only)
+fi
+if [[ "${compare_full_exact}" == "1" ]]; then
+  benchmark_args+=(--compare-full-exact)
 fi
 
 launch_remote() {

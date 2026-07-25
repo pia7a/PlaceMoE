@@ -52,6 +52,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--adaptive-topk", action="store_true")
     parser.add_argument("--adaptive-topk-initial", type=int, default=16)
     parser.add_argument("--adaptive-topk-strict-certificate", action="store_true")
+    parser.add_argument("--early-proxy-topk", type=int, default=0)
+    parser.add_argument("--exact-primitive-topk", type=int, default=0)
+    parser.add_argument("--post-shortlist-compact-pair", action="store_true")
+    parser.add_argument("--exact-primitive-max-only", action="store_true")
+    parser.add_argument("--compare-full-exact", action="store_true")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=7)
     parser.add_argument("--backend", choices=("hccl", "gloo"), default="hccl")
@@ -196,6 +201,10 @@ def main() -> None:
         adaptive_topk=args.adaptive_topk,
         adaptive_topk_initial=args.adaptive_topk_initial,
         adaptive_topk_strict_certificate=args.adaptive_topk_strict_certificate,
+        early_proxy_topk=args.early_proxy_topk,
+        exact_primitive_topk=args.exact_primitive_topk,
+        post_shortlist_compact_pair=args.post_shortlist_compact_pair,
+        exact_primitive_max_only=args.exact_primitive_max_only,
     )
     initialization_ms = None
     initialization_actions: list[str] = []
@@ -317,6 +326,7 @@ def main() -> None:
 
     samples: list[float] = []
     final_plans = None
+    final_shortlist_indices_by_layer: list[torch.Tensor] | None = None
     for iteration in range(args.warmup + args.iterations):
         if dist.is_initialized():
             dist.barrier()
@@ -334,20 +344,39 @@ def main() -> None:
                 step=1,
                 skip_final_route_update=True,
             )
+            iteration_shortlists = (
+                planner.last_exact_primitive_shortlist_indices
+                if planner.last_exact_primitive_shortlist_indices
+                else planner.last_early_proxy_shortlist_indices
+            )
+            final_shortlist_indices_by_layer = list(iteration_shortlists) if iteration_shortlists else None
         else:
-            plans = [
-                planner.plan(
-                    layer_routes,
-                    layout,
-                    owners,
-                    source_ranks=route_rank,
-                    max_swaps=max_swaps,
-                    max_replicas=max_covers,
-                    step=1,
-                    layer_seed=layer,
+            plans = []
+            iteration_shortlists = []
+            shortlist_complete = True
+            for layer, layer_routes in zip(layer_ids, routes_by_layer, strict=True):
+                plans.append(
+                    planner.plan(
+                        layer_routes,
+                        layout,
+                        owners,
+                        source_ranks=route_rank,
+                        max_swaps=max_swaps,
+                        max_replicas=max_covers,
+                        step=1,
+                        layer_seed=layer,
+                    )
                 )
-                for layer, layer_routes in zip(layer_ids, routes_by_layer, strict=True)
-            ]
+                layer_shortlists = (
+                    planner.last_exact_primitive_shortlist_indices
+                    if planner.last_exact_primitive_shortlist_indices
+                    else planner.last_early_proxy_shortlist_indices
+                )
+                if layer_shortlists:
+                    iteration_shortlists.append(layer_shortlists[0])
+                else:
+                    shortlist_complete = False
+            final_shortlist_indices_by_layer = iteration_shortlists if shortlist_complete else None
         _synchronize(device)
         elapsed = torch.tensor([(time.perf_counter() - started) * 1000.0], device=device)
         if dist.is_initialized():
@@ -365,6 +394,125 @@ def main() -> None:
         final_plans = plans
 
     assert final_plans is not None
+    full_exact_comparison = None
+    if args.compare_full_exact:
+        exact_planner = GreedyCommunicationPlanner(
+            hierarchy=planner.hierarchy,
+            perf_model=planner.perf_model,
+            hidden_size=int(metadata["hidden_size"]),
+            bytes_per_element=int(metadata["bytes_per_element"]),
+            slots_per_rank=slots_per_rank,
+            communication_scale=args.communication_scale,
+            forward_compute_per_assignment=args.forward_compute_per_assignment,
+            forward_compute_constant=args.forward_compute_constant,
+            reducer=reducer,
+            process_group=dist.group.WORLD if dist.is_initialized() else None,
+            max_copies=args.max_copies,
+            candidate_scorer=args.candidate_scorer,
+            compact_candidate_collective=args.candidate_collective == "compact",
+            assume_unique_routes=True,
+            layer_parallel_streams=args.layer_parallel_streams,
+        )
+        if dist.is_initialized():
+            dist.barrier()
+        _synchronize(device)
+        exact_started = time.perf_counter()
+        if args.layer_execution == "batched":
+            exact_plans = exact_planner.plan_layers(
+                routes_by_layer,
+                [layout] * args.layer_count,
+                [owners] * args.layer_count,
+                source_ranks=route_rank,
+                max_swaps=max_swaps,
+                max_replicas=max_covers,
+                layer_seeds=layer_ids,
+                step=1,
+                skip_final_route_update=True,
+            )
+        else:
+            exact_plans = [
+                exact_planner.plan(
+                    layer_routes,
+                    layout,
+                    owners,
+                    source_ranks=route_rank,
+                    max_swaps=max_swaps,
+                    max_replicas=max_covers,
+                    step=1,
+                    layer_seed=layer,
+                )
+                for layer, layer_routes in zip(layer_ids, routes_by_layer, strict=True)
+            ]
+        _synchronize(device)
+        exact_elapsed = torch.tensor([(time.perf_counter() - exact_started) * 1000.0], device=device)
+        if dist.is_initialized():
+            dist.all_reduce(exact_elapsed, op=dist.ReduceOp.MAX)
+        shortlist_indices_by_layer = final_shortlist_indices_by_layer
+        shortlist_hits = None
+        if shortlist_indices_by_layer:
+            candidate_rows_host = candidate_rows.detach().to(device="cpu")
+            shortlist_hits = []
+            for approximate, exact, indices in zip(
+                final_plans,
+                exact_plans,
+                shortlist_indices_by_layer,
+                strict=True,
+            ):
+                if not exact.actions:
+                    shortlist_hits.append(not approximate.actions)
+                    continue
+                exact_key = tuple(action.format() for action in exact.actions)
+                shortlist_keys = {
+                    (planner._placement_action(candidate_rows_host[int(index)]).format(),)
+                    for index in indices.detach().to(device="cpu").tolist()
+                }
+                shortlist_hits.append(exact_key in shortlist_keys)
+        matches = [
+            tuple(action.format() for action in approximate.actions)
+            == tuple(action.format() for action in exact.actions)
+            for approximate, exact in zip(final_plans, exact_plans, strict=True)
+        ]
+        gain_captures = []
+        relative_cost_gaps = []
+        mismatch_layers = []
+        for layer, approximate, exact, matched in zip(
+            layer_ids,
+            final_plans,
+            exact_plans,
+            matches,
+            strict=True,
+        ):
+            exact_gain = max(0.0, exact.baseline_cost.total - exact.final_cost.total)
+            approximate_gain = max(0.0, approximate.baseline_cost.total - approximate.final_cost.total)
+            gain_captures.append(approximate_gain / exact_gain if exact_gain > 0.0 else 1.0)
+            relative_cost_gaps.append(
+                (approximate.final_cost.total - exact.final_cost.total) / max(abs(exact.final_cost.total), 1.0)
+            )
+            if not matched:
+                mismatch_layers.append(
+                    {
+                        "layer": layer,
+                        "early": [action.format() for action in approximate.actions],
+                        "exact": [action.format() for action in exact.actions],
+                        "gain_capture": gain_captures[-1],
+                        "relative_cost_gap": relative_cost_gaps[-1],
+                    }
+                )
+        full_exact_comparison = {
+            "elapsed_ms": float(exact_elapsed.item()),
+            "action_matches": sum(matches),
+            "action_match_rate": statistics.mean(float(value) for value in matches),
+            "exact_winner_in_shortlist": None if shortlist_hits is None else sum(shortlist_hits),
+            "exact_winner_recall": (
+                None if shortlist_hits is None else statistics.mean(float(value) for value in shortlist_hits)
+            ),
+            "mean_gain_capture": statistics.mean(gain_captures),
+            "min_gain_capture": min(gain_captures),
+            "mean_relative_cost_gap": statistics.mean(relative_cost_gaps),
+            "max_relative_cost_gap": max(relative_cost_gaps),
+            "mismatch_layers": mismatch_layers,
+        }
+
     final_plan = final_plans[0]
     aggregate_planning_ms = sum(plan.planning_ms for plan in final_plans)
     aggregate_route_stats_ms = sum(plan.route_stats_ms for plan in final_plans)
@@ -395,6 +543,13 @@ def main() -> None:
         "adaptive_topk": args.adaptive_topk,
         "adaptive_topk_strict_certificate": args.adaptive_topk_strict_certificate,
         "adaptive_topk_stats": planner.last_adaptive_topk_stats,
+        "early_proxy_topk": args.early_proxy_topk,
+        "early_proxy_stats": planner.last_early_proxy_stats,
+        "exact_primitive_topk": args.exact_primitive_topk,
+        "post_shortlist_compact_pair": args.post_shortlist_compact_pair,
+        "exact_primitive_max_only": args.exact_primitive_max_only,
+        "exact_primitive_stats": planner.last_exact_primitive_stats,
+        "full_exact_comparison": full_exact_comparison,
         "layer_execution": args.layer_execution,
         "layer_parallel_streams": args.layer_parallel_streams,
         "cost_model": {
