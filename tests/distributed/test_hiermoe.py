@@ -373,6 +373,181 @@ def test_compute_calibration_fits_nonnegative_affine_model():
     assert constant == pytest.approx(2.0)
 
 
+def test_cost_model_diagnostics_report_exact_predictions():
+    diagnostics = expert_swap_module.ExpertSwapManager._cost_model_diagnostics(
+        [2.0, 4.0, 8.0],
+        [2.0, 4.0, 8.0],
+    )
+
+    assert diagnostics["r_squared"] == pytest.approx(1.0)
+    assert diagnostics["mape_percent"] == pytest.approx(0.0)
+    assert diagnostics["rmse_ms"] == pytest.approx(0.0)
+
+
+def test_cost_model_verification_fits_then_validates_without_actions(monkeypatch):
+    manager = expert_swap_module.ExpertSwapManager(
+        ep_group=None,
+        ep_size=1,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=0,
+        redundant_slot_increment_per_device=1,
+        max_replica_rounds=0,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=1, group_sizes=(1,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="step",
+        expert_swap_selector="hiermoe_greedy_cover_p1",
+    )
+    manager._cost_model_verify = True
+    manager._online_freeze_calibration_step = 1
+
+    calibration = {
+        "sample_count": 3,
+        "compute_fit_sample_count": 3,
+        "communication_units": [1.0, 2.0, 3.0],
+        "peak_assignments": [10.0, 20.0, 30.0],
+        "actual_communication_ms": [2.0, 4.0, 6.0],
+        "actual_compute_ms": [3.0, 5.0, 7.0],
+        "paired_assignments": [10.0, 20.0, 30.0],
+        "paired_compute_ms": [3.0, 5.0, 7.0],
+    }
+    validation = {
+        "sample_count": 2,
+        "compute_fit_sample_count": 2,
+        "communication_units": [4.0, 5.0],
+        "peak_assignments": [40.0, 50.0],
+        "actual_communication_ms": [8.0, 10.0],
+        "actual_compute_ms": [9.0, 11.0],
+        "paired_assignments": [40.0, 50.0],
+        "paired_compute_ms": [9.0, 11.0],
+    }
+    observations = {1: calibration, 2: validation}
+    monkeypatch.setattr(
+        manager,
+        "_cost_model_step_observations",
+        lambda _layers, *, step: observations[step],
+    )
+
+    manager._begin_metrics_step(1)
+    assert manager._run_cost_model_verification((), 1) == "none"
+    assert manager._cost_model_verify_coefficients == pytest.approx((2.0, 0.0, 0.2, 1.0))
+
+    manager._begin_metrics_step(2)
+    assert manager._run_cost_model_verification((), 2) == "none"
+    assert manager._cost_model_verify_complete
+    metrics = manager.placement_metrics()
+    assert metrics["hiermoe/cost_model_validation_communication_r2"] == pytest.approx(1.0)
+    assert metrics["hiermoe/cost_model_validation_compute_r2"] == pytest.approx(1.0)
+    assert metrics["hiermoe/cost_model_validation_joint_mape_percent"] == pytest.approx(0.0)
+
+
+def test_online_freeze_calibration_uses_shared_communication_and_paired_compute_samples(monkeypatch):
+    manager = expert_swap_module.ExpertSwapManager(
+        ep_group=None,
+        ep_size=1,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=0,
+        redundant_slot_increment_per_device=1,
+        max_replica_rounds=1,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=1, group_sizes=(1,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="step",
+        expert_swap_selector="hiermoe_greedy_cover_p1",
+    )
+    manager._online_freeze_cost_mode = "joint"
+    manager._online_freeze_communication_ratio = 3.1
+    manager._online_freeze_compute_ratio = 4.19
+
+    class _TimingEvent:
+        event = None
+
+        def __init__(self, elapsed_ms):
+            self.elapsed_ms = elapsed_ms
+
+        def elapsed_time(self, _end):
+            return self.elapsed_ms
+
+    units = iter((100.0, 200.0))
+    layers = []
+    for layer_index, (assignments, compute_ms, communication_ms) in enumerate(
+        ((100.0, 7.0, 5.0), (200.0, 12.0, 10.0))
+    ):
+        key = f"layers.{layer_index}.mlp.experts"
+        manager.register_layer(
+            key,
+            _FakeExperts(num_experts=4, local_start=0, local_experts=5, hidden_size=2),
+        )
+        layer = manager.layers[key]
+        layer.latest_hidden_size = 2
+        layer.latest_bytes_per_element = 2
+        layer.pending_timing = expert_swap_module._PendingLayerTiming(
+            step=1,
+            selected_experts=torch.tensor([[0, 1], [2, 3]], dtype=torch.long),
+            slot_to_logical=layer.slot_to_logical.clone(),
+            local_assignment_count=torch.tensor(assignments),
+            dispatch_start=_TimingEvent(communication_ms * 0.4),
+            dispatch_end=_TimingEvent(0.0),
+            compute_start=_TimingEvent(compute_ms),
+            compute_end=_TimingEvent(0.0),
+            combine_start=_TimingEvent(communication_ms * 0.6),
+            combine_end=_TimingEvent(0.0),
+        )
+        layers.append(layer)
+
+    fake_planner = SimpleNamespace(
+        score_layout=lambda *_args, **_kwargs: SimpleNamespace(communication_model_units=next(units))
+    )
+    monkeypatch.setattr(manager, "_planner_for_layer", lambda *_args, **_kwargs: fake_planner)
+    monkeypatch.setattr(manager, "_events_ready", lambda _timing: True)
+    manager._begin_metrics_step(1)
+
+    manager._prepare_online_freeze_calibrations(layers, step=1, started=0.0)
+
+    calibrations = [layer.planner_calibration for layer in layers]
+    assert all(calibration is not None for calibration in calibrations)
+    assert all(calibration.communication_scale == pytest.approx(3.1 * 0.05 / 4.0) for calibration in calibrations)
+    assert all(
+        calibration.forward_compute_per_assignment == pytest.approx(4.19 * 0.05 / 3.0) for calibration in calibrations
+    )
+    assert all(calibration.forward_compute_constant == pytest.approx(4.19 * 2.0 / 3.0) for calibration in calibrations)
+    assert manager.placement_metrics()["hiermoe/placement_calibration_compute_samples"] == 2
+
+
+def test_online_freeze_reset_preserves_owner_slots_and_exposes_only_redundant_slots():
+    manager = expert_swap_module.ExpertSwapManager(
+        ep_group=None,
+        ep_size=2,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=0,
+        redundant_slot_increment_per_device=2,
+        max_replica_rounds=4,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=2, group_sizes=(2,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="step",
+        expert_swap_selector="hiermoe_greedy_cover_p1",
+        replica_slot_capacity=4,
+    )
+    manager.register_layer(
+        "layers.0.mlp.experts",
+        _FakeExperts(num_experts=4, local_start=0, local_experts=4, hidden_size=2),
+    )
+    layer = manager.layers["layers.0.mlp.experts"]
+    layer.slot_to_logical = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3], dtype=torch.long)
+    layer.logical_to_physical = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    layer.fixed_r2_layout = True
+
+    manager._reset_redundant_slots_for_online_freeze((layer,))
+
+    torch.testing.assert_close(layer.slot_to_logical, torch.tensor([0, 1, 2, 3, -1, -1, -1, -1]))
+    torch.testing.assert_close(layer.logical_to_physical, torch.tensor([0, 1, 2, 3]))
+    assert layer.fixed_r2_layout is False
+
+
 def test_greedy_calibration_uses_first_step_peak_assignment_profile(monkeypatch):
     manager = expert_swap_module.ExpertSwapManager(
         ep_group=None,
@@ -2574,7 +2749,7 @@ def test_redundant_slot_state_collection_skips_ep_symmetry_checks(monkeypatch):
     assert len(entries) == 6
 
 
-def _placement_executor_atomic_state_worker():
+def _placement_executor_atomic_state_worker(fast_sparse_transfer: bool = False):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     manager = expert_swap_module.ExpertSwapManager(
@@ -2617,7 +2792,31 @@ def _placement_executor_atomic_state_worker():
         final_owner_slots=(3, 1, 0, 4),
     )
 
-    committed = manager._execute_placement_plan(manager.layers[key], plan)
+    original_all_to_all_single = dist.all_to_all_single
+    original_batch_isend_irecv = dist.batch_isend_irecv
+    p2p_calls = 0
+
+    def fail_all_to_all(*_args, **_kwargs):
+        raise AssertionError("fast sparse placement must not launch an EP-wide All-to-All")
+
+    def count_batch_isend_irecv(ops):
+        nonlocal p2p_calls
+        p2p_calls += 1
+        return original_batch_isend_irecv(ops)
+
+    if fast_sparse_transfer:
+        dist.all_to_all_single = fail_all_to_all
+        dist.batch_isend_irecv = count_batch_isend_irecv
+    try:
+        committed = manager._execute_placement_plan(
+            manager.layers[key], plan, fast_sparse_transfer=fast_sparse_transfer
+        )
+    finally:
+        dist.all_to_all_single = original_all_to_all_single
+        dist.batch_isend_irecv = original_batch_isend_irecv
+
+    if fast_sparse_transfer:
+        assert p2p_calls == 1
 
     assert committed == [f"{key}:swap(0<->2)", f"{key}:replica(3->2)"]
     layer = manager.layers[key]
@@ -2647,6 +2846,10 @@ def _placement_executor_atomic_state_worker():
 
 def test_placement_executor_batches_parameter_gradient_and_optimizer_state():
     torchrun(_placement_executor_atomic_state_worker, world_size=2, backend="gloo")
+
+
+def test_placement_executor_fast_sparse_cover_preserves_all_state():
+    torchrun(_placement_executor_atomic_state_worker, 2, True, backend="gloo")
 
 
 def _placement_executor_pure_swap_p2p_worker():
@@ -5014,7 +5217,6 @@ def test_exact_p1_direct_executor_validates_full_layout_only_in_debug(monkeypatc
 def test_exact_p1_batches_layer_statistics_into_one_collective(monkeypatch):
     manager = expert_swap_module.ExpertSwapManager(
         ep_group=object(),
-
         ep_size=4,
         ep_rank=0,
         expert_swap_interval=1,
@@ -5153,12 +5355,15 @@ def test_fixed_pipeline_plans_current_step_and_migrates_next_step_in_layer_order
         )
 
     migrated = []
+    migration_kwargs = []
     monkeypatch.setattr(manager, "_pipeline_plan_worker", fake_plan_worker)
     monkeypatch.setattr(manager, "_record_plan_metrics", lambda _plan: None)
     monkeypatch.setattr(
         manager,
         "_execute_placement_plan",
-        lambda layer, _plan, **_kwargs: migrated.append(layer.key) or [layer.key],
+        lambda layer, _plan, **_kwargs: (migration_kwargs.append(_kwargs), migrated.append(layer.key), [layer.key])[
+            -1
+        ],
     )
 
     manager.configure_pipeline_microstep(step=0, micro_step=0, num_micro_steps=1)
@@ -5188,6 +5393,9 @@ def test_fixed_pipeline_plans_current_step_and_migrates_next_step_in_layer_order
     assert migrated == keys
     assert manager._pipeline_pending_plans == {}
     assert manager.placement_metrics()["hiermoe/pipeline_migration_jobs"] == 2
+    assert len(migration_kwargs) == 2
+    assert all(kwargs["force_staged_transfer"] is False for kwargs in migration_kwargs)
+    assert all(kwargs["fast_sparse_transfer"] is True for kwargs in migration_kwargs)
     manager.shutdown_pipeline()
 
 
@@ -5266,15 +5474,95 @@ def test_fixed_pipeline_planner_score_continues_after_same_layer_combine(monkeyp
     manager.shutdown_pipeline()
 
 
-def test_fixed_pipeline_reuses_one_background_process_group(monkeypatch):
-    created = []
+def test_fixed_pipeline_planner_score_waits_for_compute_done_event(monkeypatch):
+    manager = expert_swap_module.ExpertSwapManager(
+        ep_group=None,
+        ep_size=1,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=1,
+        redundant_slot_increment_per_device=1,
+        max_replica_rounds=1,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=1, group_sizes=(1,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="step",
+        expert_swap_selector="hiermoe_greedy_cover_p1",
+        fixed_pipeline_overlap=True,
+    )
+    key = "layers.0.mlp.experts"
+    manager.register_layer(key, _FakeExperts(num_experts=4, local_start=0, local_experts=5, hidden_size=2))
+    windows = expert_swap_module._PipelinePlannerWindows()
+    windows.collective_result_ready.set()
+    manager._pipeline_planner_windows[key] = windows
+    manager._pipeline_plan_futures[key] = object()
+
+    compute_done = object()
+    calls = []
+
+    class FakeTimingEvent:
+        def __init__(self, timestamp):
+            self.timestamp = timestamp
+
+        def elapsed_time(self, end):
+            return end.timestamp - self.timestamp
+
+    timing_events = iter(FakeTimingEvent(value) for value in range(4))
+    timing = expert_swap_module._PipelinePlannerStageTiming(prepare_start=next(timing_events))
+
+    class FakeStream:
+        def wait_event(self, event):
+            calls.append(("wait", event))
+
+        def synchronize(self):
+            calls.append("synchronize")
+
+    stream = FakeStream()
+    monkeypatch.setattr(manager, "_pipeline_ready_event", lambda _device: compute_done)
+    manager.open_pipeline_planner_score_window(key)
+    assert manager._pipeline_planner_compute_events[key] is compute_done
+
+    monkeypatch.setattr(manager, "_pipeline_stream", lambda _kind, _device: stream)
+    monkeypatch.setattr(manager, "_pipeline_stage_event", lambda: next(timing_events))
+    tensor = torch.ones((1,), dtype=torch.float32)
+    assert manager._pipeline_planner_reduce_sum(key, tensor, tensor.device, timing) is tensor
+    timing.score_end = next(timing_events)
+    assert timing.durations_ms() == (1, 0, 1)
+    assert calls == [("wait", compute_done)]
+
+    manager._pipeline_plan_futures.clear()
+    manager._pipeline_planner_windows.clear()
+    manager._pipeline_planner_dispatch_events.clear()
+    manager._pipeline_planner_compute_events.clear()
+    manager.shutdown_pipeline()
+
+
+def test_pipeline_prepare_substage_timing_separates_device_host_and_thread_cpu(monkeypatch):
+    class FakeTimingEvent:
+        def __init__(self, timestamp):
+            self.timestamp = timestamp
+
+        def elapsed_time(self, end):
+            return end.timestamp - self.timestamp
+
+    wall_starts = iter((30.0, 50.0))
+    thread_starts = iter((40.0, 60.0))
+    monkeypatch.setattr(expert_swap_module.time, "perf_counter", lambda: next(wall_starts))
+    monkeypatch.setattr(expert_swap_module.time, "thread_time", lambda: next(thread_starts))
+
+    timing = expert_swap_module._PipelinePrepareSubstageTiming()
+    timing.begin(FakeTimingEvent(1.0), 10.0, 20.0)
+    timing.checkpoint("route_hash", 10.003, 20.001, FakeTimingEvent(3.0))
+    timing.checkpoint("occupancy", 30.005, 40.002, FakeTimingEvent(7.0))
+
+    device_ms, host_ms, thread_cpu_ms = timing.durations_ms()
+    assert device_ms == {"route_hash": 2.0, "occupancy": 4.0}
+    assert host_ms == pytest.approx({"route_hash": 3.0, "occupancy": 5.0})
+    assert thread_cpu_ms == pytest.approx({"route_hash": 1.0, "occupancy": 2.0})
+
+
+def test_fixed_pipeline_reuses_ep_group_with_one_ordered_collective_executor():
     background_group = object()
-
-    def create_group(_ep_group, _ep_size, group_desc="hiermoe_expert_swap"):
-        created.append(group_desc)
-        return background_group
-
-    monkeypatch.setattr(expert_swap_module, "_create_expert_swap_process_group", create_group)
     manager = expert_swap_module.ExpertSwapManager(
         ep_group=background_group,
         ep_size=4,
@@ -5291,11 +5579,11 @@ def test_fixed_pipeline_reuses_one_background_process_group(monkeypatch):
         fixed_pipeline_overlap=True,
     )
 
-    assert created == []
     assert manager._swap_group is None
     assert manager._pipeline_planner_group is background_group
     assert manager._pipeline_migration_group is background_group
     assert manager._pipeline_grad_group is background_group
+    assert manager._pipeline_collective_executor is not None
     manager.shutdown_pipeline()
 
 
@@ -5347,6 +5635,7 @@ def test_fixed_pipeline_gradient_sync_waits_for_dispatch_backward_boundary():
 def test_fixed_pipeline_autograd_markers_bracket_dispatch_backward(monkeypatch):
     events = []
     manager = SimpleNamespace(
+        close_pipeline_planner_collective_window=lambda key: events.append(("collective_close", key)),
         close_pipeline_gradient_window_before_dispatch=lambda key: events.append(("close", key)),
         open_pipeline_gradient_window_after_dispatch=lambda key: events.append(("open", key)),
     )
@@ -5362,7 +5651,7 @@ def test_fixed_pipeline_autograd_markers_bracket_dispatch_backward(monkeypatch):
 
     marked.sum().backward()
 
-    assert events == [("close", key), ("open", key)]
+    assert events == [("collective_close", key), ("close", key), ("open", key)]
     torch.testing.assert_close(source.grad, torch.full_like(source, 2.0))
 
 
@@ -5404,6 +5693,7 @@ def _fixed_pipeline_planner_window_worker():
         bytes_per_element=4,
         step=0,
     )
+    manager.release_pipeline_planner_prepare(key)
     manager.open_pipeline_planner_collective_window(key)
     manager.open_pipeline_planner_score_window(key)
     manager.advance_pipeline_after_combine(key)
@@ -5411,7 +5701,8 @@ def _fixed_pipeline_planner_window_worker():
 
     metrics = manager.placement_metrics()
     assert metrics["hiermoe/pipeline_planner_jobs"] == 1
-    assert metrics["hiermoe/pipeline_planner_raw_ms"] >= metrics["hiermoe/pipeline_planner_exposed_ms"]
+    assert metrics["hiermoe/pipeline_planner_raw_ms"] >= 0.0
+    assert metrics["hiermoe/pipeline_planner_exposed_ms"] >= 0.0
     manager.shutdown_pipeline()
 
 

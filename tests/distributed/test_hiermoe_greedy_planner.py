@@ -133,6 +133,53 @@ def test_cost_model_uses_explicit_training_phase_multipliers():
     torch.testing.assert_close(peak_compute_rank, torch.tensor([1]), rtol=0, atol=0)
 
 
+def test_source_aware_communication_cost_detects_outgoing_bottleneck():
+    planner = _planner()
+    source_counts = torch.zeros((4, 1, 6), dtype=torch.float32)
+    source_counts[0, 0] = torch.tensor([4.0, 4.0, 4.0, 4.0, 8.0, 8.0])
+
+    receive_only_units = planner._communication_cost_details(source_counts.sum(dim=0))[1]
+    _communication, source_aware_units, send_maxima, receive_maxima, _selected_dim = (
+        planner._source_aware_communication_cost_details(source_counts)
+    )
+
+    torch.testing.assert_close(send_maxima, torch.tensor([[16.0, 16.0]]))
+    torch.testing.assert_close(receive_maxima, torch.tensor([[4.0, 8.0]]))
+    assert source_aware_units.item() > receive_only_units.item()
+
+
+def test_hierarchical_traffic_features_match_two_stage_payloads():
+    planner = _planner()
+    source_unique = torch.zeros((4, 1, 6), dtype=torch.float32)
+    source_assignments = torch.zeros_like(source_unique)
+    # Source rank 0 sends three unique activations to rank 2 and one to
+    # rank 3. At stage 1 those activations are deduplicated to three rows for
+    # destination node 1, while six assignment metadata rows remain.
+    source_unique[0, 0] = torch.tensor([0.0, 0.0, 3.0, 1.0, 0.0, 3.0])
+    source_assignments[0, 0] = torch.tensor([0.0, 0.0, 4.0, 2.0, 0.0, 6.0])
+
+    features = planner._hierarchical_traffic_features(source_unique, source_assignments)
+
+    # hidden_bytes=16*2=32. Stage 1 dispatch is 3*32 + 6*12 bytes and
+    # combine is 3*32. Stage 2 dispatch is 4*32 + 6*8 and combine is 4*32.
+    torch.testing.assert_close(features["stage1_payload_endpoint_bytes"], torch.tensor([264.0]))
+    torch.testing.assert_close(features["stage2_payload_endpoint_bytes"], torch.tensor([304.0]))
+    torch.testing.assert_close(features["stage1_payload_edge_bytes"], torch.tensor([264.0]))
+    torch.testing.assert_close(features["stage2_payload_edge_bytes"], torch.tensor([224.0]))
+    torch.testing.assert_close(features["stage1_max_active_peers"], torch.tensor([1.0]))
+    torch.testing.assert_close(features["stage2_max_active_peers"], torch.tensor([2.0]))
+
+
+def test_nonnegative_multifeature_fit_recovers_affine_model():
+    rows = [[1.0, 4.0], [2.0, 1.0], [3.0, 5.0], [5.0, 2.0]]
+    targets = [2.0 * row[0] + 3.0 * row[1] + 7.0 for row in rows]
+
+    coefficients, intercept = expert_swap_module.ExpertSwapManager._fit_nonnegative_linear_model(rows, targets)
+
+    assert coefficients == pytest.approx((2.0, 3.0))
+    assert intercept == pytest.approx(7.0)
+
+
 def _assert_routes_match_layout(
     selected: torch.Tensor,
     physical: torch.Tensor,

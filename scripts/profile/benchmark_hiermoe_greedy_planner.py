@@ -23,6 +23,7 @@ from veomni.distributed.moe.hiermoe.greedy_planner import (
     GreedyCommunicationPlanner,
     assign_tokens_to_copies_greedy,
 )
+from veomni.distributed.moe.hiermoe.npu_layer_owner_planner import NPULayerOwnerPlanner
 from veomni.distributed.moe.hiermoe.perf_model import HierMoEPerfModel
 from veomni.distributed.moe.hiermoe.statistical_scorer import statistical_candidate_local_deltas
 from veomni.distributed.moe.hiermoe.topology import Hierarchy
@@ -35,6 +36,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--layer-count", type=int, default=1)
     parser.add_argument("--layer-execution", choices=("sequential", "batched"), default="sequential")
     parser.add_argument("--layer-parallel-streams", type=int, default=8)
+    parser.add_argument("--layer-owner", action="store_true")
+    parser.add_argument(
+        "--layer-owner-collective",
+        choices=("reduce_scatter", "all_to_all"),
+        default="reduce_scatter",
+    )
     parser.add_argument("--rank", type=int, default=0, help="Route rank for a non-distributed run.")
     parser.add_argument("--ep-size", type=int, default=32)
     parser.add_argument("--group-sizes", type=int, nargs="+", default=(8, 16, 32))
@@ -206,6 +213,17 @@ def main() -> None:
         post_shortlist_compact_pair=args.post_shortlist_compact_pair,
         exact_primitive_max_only=args.exact_primitive_max_only,
     )
+    layer_owner_planner = (
+        NPULayerOwnerPlanner(
+            planner,
+            process_group=dist.group.WORLD,
+            statistic_collective=args.layer_owner_collective,
+        )
+        if args.layer_owner and dist.is_initialized()
+        else None
+    )
+    if args.layer_owner and (args.layer_execution != "batched" or layer_owner_planner is None):
+        raise ValueError("--layer-owner requires distributed batched layer execution.")
     initialization_ms = None
     initialization_actions: list[str] = []
     if args.phase == "initialized-steady":
@@ -332,7 +350,23 @@ def main() -> None:
             dist.barrier()
         _synchronize(device)
         started = time.perf_counter()
-        if args.layer_execution == "batched":
+        if layer_owner_planner is not None:
+            layer_owner_result = layer_owner_planner.plan_layers(
+                routes_by_layer,
+                [layout] * args.layer_count,
+                [owners] * args.layer_count,
+                source_rank=route_rank,
+                max_swaps=max_swaps,
+                max_replicas=max_covers,
+                layer_seeds=layer_ids,
+                step=1,
+                communication_scales=[args.communication_scale] * args.layer_count,
+                forward_compute_per_assignment=[args.forward_compute_per_assignment] * args.layer_count,
+                forward_compute_constant=[args.forward_compute_constant] * args.layer_count,
+            )
+            plans = list(layer_owner_result.plans)
+            final_shortlist_indices_by_layer = None
+        elif args.layer_execution == "batched":
             plans = planner.plan_layers(
                 routes_by_layer,
                 [layout] * args.layer_count,
@@ -551,6 +585,13 @@ def main() -> None:
         "exact_primitive_stats": planner.last_exact_primitive_stats,
         "full_exact_comparison": full_exact_comparison,
         "layer_execution": args.layer_execution,
+        "layer_owner": args.layer_owner,
+        "layer_owner_collective": args.layer_owner_collective,
+        "layer_owner_timing": (
+            None
+            if layer_owner_planner is None or layer_owner_planner.last_result is None
+            else vars(layer_owner_planner.last_result.timing)
+        ),
         "layer_parallel_streams": args.layer_parallel_streams,
         "cost_model": {
             "communication_phase_multiplier": GREEDY_COMMUNICATION_PHASE_MULTIPLIER,

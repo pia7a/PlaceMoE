@@ -232,9 +232,6 @@ def npu_ep_fused_moe_forward(
 
         if placement_already_applied and placement_manager is not None and layer_key is not None:
             placement_manager.wait_pending_layer_swap(layer_key)
-        if placement_manager is not None and layer_key is not None and state.layer_swap_forward_enabled:
-            placement_manager.open_pipeline_planner_collective_window(layer_key)
-
         if fc1_1_2_weight is not None:
             fc1_weight = fc1_1_2_weight
         else:
@@ -278,8 +275,6 @@ def npu_ep_fused_moe_forward(
         expert_ms = (time.perf_counter() - expert_start) * 1000.0 if expert_start is not None else None
         placement_compute_end = placement_manager.placement_timing_event() if capture_placement_timing else None
 
-        if placement_manager is not None and layer_key is not None and state.layer_swap_forward_enabled:
-            placement_manager.open_pipeline_planner_score_window(layer_key)
         placement_combine_start = placement_manager.placement_timing_event() if capture_placement_timing else None
         combine_start = time.perf_counter() if record_wall_metrics else None
         region_start = moe_timing_event() if timing_record is not None else None
@@ -333,6 +328,7 @@ def npu_ep_fused_moe_forward(
                 combine_start=placement_combine_start,
                 combine_end=placement_combine_end,
                 selected_dim=hiermoe_ctx.selected_dim,
+                communication_events=hiermoe_ctx.internal_timing_events,
             )
         return hidden_states
 

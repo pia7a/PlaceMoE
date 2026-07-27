@@ -18,6 +18,8 @@ layer=${LAYER:-0}
 layer_count=${LAYER_COUNT:-1}
 layer_execution=${LAYER_EXECUTION:-sequential}
 layer_parallel_streams=${LAYER_PARALLEL_STREAMS:-8}
+layer_owner=${LAYER_OWNER:-0}
+layer_owner_collective=${LAYER_OWNER_COLLECTIVE:-reduce_scatter}
 communication_scale=${COMMUNICATION_SCALE:-1.0}
 forward_compute_per_assignment=${FORWARD_COMPUTE_PER_ASSIGNMENT:-0.0}
 forward_compute_constant=${FORWARD_COMPUTE_CONSTANT:-0.0}
@@ -55,6 +57,9 @@ benchmark_args=(
 )
 if [[ "${adaptive_topk}" == "1" ]]; then
   benchmark_args+=(--adaptive-topk --adaptive-topk-initial="${adaptive_topk_initial}")
+fi
+if [[ "${layer_owner}" == "1" ]]; then
+  benchmark_args+=(--layer-owner --layer-owner-collective="${layer_owner_collective}")
 fi
 if [[ "${adaptive_topk_strict}" == "1" ]]; then
   benchmark_args+=(--adaptive-topk-strict-certificate)

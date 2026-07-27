@@ -26,6 +26,8 @@ capture_call=${HIERMOE_CAPTURE_CALL_OVERRIDE:-0}
 debug_copy_stats=${HIERMOE_DEBUG_COPY_STATS_OVERRIDE:-0}
 debug_copy_layers=${HIERMOE_DEBUG_COPY_LAYERS_OVERRIDE:-1}
 debug_copy_groups=${HIERMOE_DEBUG_COPY_GROUPS_OVERRIDE:-2}
+hccl_if_base_port=${HCCL_IF_BASE_PORT:-55000}
+ablation_replay_path=${HIERMOE_ABLATION_REPLAY_PATH_OVERRIDE:-${source_root}/results/qwen3vl_greedy_ep32_mb4_gbs128_r2_pipeline_6step_hccl_serial_nonblocking_score_20260726_r3_committed_layout.json}
 key=/home/tzq/KeyPair-3bce.pem
 
 hiermoe_enable=false
@@ -39,6 +41,26 @@ fixed_r2=0
 fixed_pipeline=false
 swap_mode=step
 swap_selector=current_joint
+ablation_replay_mode=off
+ablation_migration_mode=hidden
+ablation_grad_mode=hidden
+cpu_planner_mode=off
+cpu_train_cores_per_rank=${HIERMOE_CPU_TRAIN_CORES_PER_RANK_OVERRIDE:-8}
+npu_layer_owner_blocking=0
+npu_layer_owner_collective=${HIERMOE_NPU_LAYER_OWNER_COLLECTIVE_OVERRIDE:-reduce_scatter}
+online_freeze_cost_mode=off
+online_freeze_calibration_step=${HIERMOE_ONLINE_FREEZE_CALIBRATION_STEP_OVERRIDE:-1}
+online_freeze_communication_ratio=${HIERMOE_ONLINE_FREEZE_COMMUNICATION_RATIO_OVERRIDE:-3.1}
+online_freeze_compute_ratio=${HIERMOE_ONLINE_FREEZE_COMPUTE_RATIO_OVERRIDE:-4.19}
+cost_model_verify=0
+forward_reuse_cover=0
+forward_reuse_cover_patch_remap=0
+forward_reuse_cover_fast=0
+forward_reuse_cover_compute_weight=${HIERMOE_FORWARD_REUSE_COVER_COMPUTE_WEIGHT_OVERRIDE:-1.0}
+forward_reuse_cover_min_gain=${HIERMOE_FORWARD_REUSE_COVER_MIN_GAIN_OVERRIDE:-0.0}
+hiermoe_internal_timing=${VEOMNI_HIERMOE_INTERNAL_TIMING_OVERRIDE:-0}
+force_fixed_r2_mirrored_remap=0
+full_profile_start_step=3
 
 case "${variant}" in
   baseline)
@@ -74,6 +96,17 @@ case "${variant}" in
     swap_mode=step
     swap_selector=hiermoe_greedy_cover_p1
     ;;
+  fixed_r2_mirrored_pipeline_grad)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    redundant_slots=4
+    fixed_r2=1
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    force_fixed_r2_mirrored_remap=1
+    ;;
   r2_pipeline)
     hiermoe_enable=true
     token_dedup=true
@@ -86,6 +119,161 @@ case "${variant}" in
     swap_mode=step
     swap_selector=hiermoe_greedy_cover_p1
     ;;
+  cpu_planner_blocking|cpu_planner_background)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    max_pairs=1
+    redundant_slots=4
+    replica_rounds=1
+    fixed_r2=1
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    ablation_migration_mode=blocking
+    ablation_grad_mode=hidden
+    if [[ "${variant}" == "cpu_planner_blocking" ]]; then
+      cpu_planner_mode=blocking
+    else
+      cpu_planner_mode=background
+    fi
+    ;;
+  cpu_process_blocking|cpu_process_background)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    max_pairs=1
+    redundant_slots=4
+    replica_rounds=1
+    fixed_r2=1
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    ablation_migration_mode=blocking
+    ablation_grad_mode=hidden
+    if [[ "${variant}" == "cpu_process_blocking" ]]; then
+      cpu_planner_mode=process_blocking
+    else
+      cpu_planner_mode=process_background
+    fi
+    ;;
+  npu_layer_owner_blocking)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    max_pairs=1
+    redundant_slots=4
+    replica_rounds=1
+    fixed_r2=1
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    ablation_migration_mode=blocking
+    ablation_grad_mode=hidden
+    npu_layer_owner_blocking=1
+    ;;
+  planner_init_freeze)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    max_pairs=0
+    redundant_slots=4
+    replica_rounds=128
+    fixed_r2=0
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    ablation_migration_mode=blocking
+    ablation_grad_mode=hidden
+    # Empty-slot initialization bypasses the steady-state interval check.
+    # After step 1 fills all slots, this interval freezes the resulting layout.
+    swap_interval=1000
+    ;;
+  online_freeze_comm|online_freeze_joint)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    max_pairs=0
+    redundant_slots=4
+    replica_rounds=128
+    fixed_r2=1
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    ablation_migration_mode=blocking
+    ablation_grad_mode=hidden
+    full_profile_start_step=4
+    if [[ "${variant}" == "online_freeze_comm" ]]; then
+      online_freeze_cost_mode=communication
+    else
+      online_freeze_cost_mode=joint
+    fi
+    ;;
+  cost_model_verify)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    max_pairs=0
+    redundant_slots=4
+    replica_rounds=0
+    fixed_r2=1
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    ablation_grad_mode=hidden
+    cost_model_verify=1
+    hiermoe_internal_timing=1
+    force_fixed_r2_mirrored_remap=1
+    full_profile_start_step=1
+    ;;
+  forward_reuse_cover)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    max_pairs=0
+    redundant_slots=4
+    replica_rounds=1
+    fixed_r2=1
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    ablation_migration_mode=blocking
+    ablation_grad_mode=hidden
+    forward_reuse_cover=1
+    ;;
+  forward_reuse_cover_patch)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    max_pairs=0
+    redundant_slots=4
+    replica_rounds=1
+    fixed_r2=1
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    ablation_migration_mode=blocking
+    ablation_grad_mode=hidden
+    forward_reuse_cover=1
+    forward_reuse_cover_patch_remap=1
+    ;;
+  forward_reuse_cover_fast)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    max_pairs=0
+    redundant_slots=4
+    replica_rounds=1
+    fixed_r2=1
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    ablation_migration_mode=blocking
+    ablation_grad_mode=hidden
+    forward_reuse_cover=1
+    forward_reuse_cover_patch_remap=1
+    forward_reuse_cover_fast=1
+    ;;
   r2_planner)
     hiermoe_enable=true
     token_dedup=true
@@ -96,6 +284,33 @@ case "${variant}" in
     fixed_r2=1
     swap_mode=layer
     swap_selector=hiermoe_greedy_cover_p1
+    ;;
+  ablation_g_blocking|ablation_g_hidden|ablation_m_blocking|ablation_m_hidden)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    redundant_slots=4
+    fixed_r2=1
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    if [[ "${variant}" == ablation_g_* ]]; then
+      ablation_replay_mode=static
+      ablation_migration_mode=blocking
+      if [[ "${variant}" == "ablation_g_blocking" ]]; then
+        ablation_grad_mode=blocking
+      else
+        ablation_grad_mode=hidden
+      fi
+    else
+      ablation_replay_mode=step
+      ablation_grad_mode=blocking
+      if [[ "${variant}" == "ablation_m_blocking" ]]; then
+        ablation_migration_mode=blocking
+      else
+        ablation_migration_mode=hidden
+      fi
+    fi
     ;;
   greedy)
     hiermoe_enable=true
@@ -147,6 +362,27 @@ common_env=(
   -e "HIERMOE_MAX_SLOT_OP_SEARCH_ROUNDS=${replica_rounds}"
   -e "HIERMOE_EXPERT_SWAP_MODE=${swap_mode}"
   -e "HIERMOE_FIXED_PIPELINE_OVERLAP=${fixed_pipeline}"
+  -e "VEOMNI_HIERMOE_PIPELINE_STAGE_TIMING=1"
+  -e "VEOMNI_HIERMOE_PIPELINE_PLAN_WORKERS=64"
+  -e "VEOMNI_HIERMOE_ABLATION_REPLAY_PATH=${ablation_replay_path}"
+  -e "VEOMNI_HIERMOE_ABLATION_REPLAY_MODE=${ablation_replay_mode}"
+  -e "VEOMNI_HIERMOE_ABLATION_MIGRATION_MODE=${ablation_migration_mode}"
+  -e "VEOMNI_HIERMOE_ABLATION_GRAD_MODE=${ablation_grad_mode}"
+  -e "VEOMNI_HIERMOE_CPU_PLANNER_MODE=${cpu_planner_mode}"
+  -e "VEOMNI_HIERMOE_CPU_TRAIN_CORES_PER_RANK=${cpu_train_cores_per_rank}"
+  -e "VEOMNI_HIERMOE_NPU_LAYER_OWNER_BLOCKING=${npu_layer_owner_blocking}"
+  -e "VEOMNI_HIERMOE_NPU_LAYER_OWNER_COLLECTIVE=${npu_layer_owner_collective}"
+  -e "VEOMNI_HIERMOE_ONLINE_FREEZE_COST_MODE=${online_freeze_cost_mode}"
+  -e "VEOMNI_HIERMOE_ONLINE_FREEZE_CALIBRATION_STEP=${online_freeze_calibration_step}"
+  -e "VEOMNI_HIERMOE_ONLINE_FREEZE_COMMUNICATION_RATIO=${online_freeze_communication_ratio}"
+  -e "VEOMNI_HIERMOE_ONLINE_FREEZE_COMPUTE_RATIO=${online_freeze_compute_ratio}"
+  -e "VEOMNI_HIERMOE_COST_MODEL_VERIFY=${cost_model_verify}"
+  -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER=${forward_reuse_cover}"
+  -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_PATCH_REMAP=${forward_reuse_cover_patch_remap}"
+  -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_FAST=${forward_reuse_cover_fast}"
+  -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_COMPUTE_WEIGHT=${forward_reuse_cover_compute_weight}"
+  -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_MIN_GAIN=${forward_reuse_cover_min_gain}"
+  -e "VEOMNI_HIERMOE_FORCE_FIXED_R2_MIRRORED_REMAP=${force_fixed_r2_mirrored_remap}"
   -e "HIERMOE_FIT_PERF_MODEL_ON_STARTUP=0"
   -e "HIERMOE_PERF_MODEL_PATH=${perf_model_path}"
   -e "VEOMNI_HIERMOE_FIXED_R2_LAYOUT=${fixed_r2}"
@@ -155,15 +391,16 @@ common_env=(
   -e "VEOMNI_HIERMOE_GREEDY_ADAPTIVE_TOPK_STRICT=${greedy_adaptive_topk_strict}"
   -e "VEOMNI_HIERMOE_FULL_ROUTE_GATHER_MAX_TOKENS=16384"
   -e "VEOMNI_FULL_PROFILE_ENABLE=1"
-  -e "VEOMNI_FULL_PROFILE_START_STEP=3"
+  -e "VEOMNI_FULL_PROFILE_START_STEP=${full_profile_start_step}"
   -e "VEOMNI_FULL_PROFILE_EVERY_N=1"
   -e "VEOMNI_FULL_PROFILE_RANKS=0"
-  -e "VEOMNI_HIERMOE_INTERNAL_TIMING=0"
+  -e "VEOMNI_HIERMOE_INTERNAL_TIMING=${hiermoe_internal_timing}"
   -e "VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STATS=${debug_copy_stats}"
   -e "VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STATS_MAX_LAYERS=${debug_copy_layers}"
   -e "VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STATS_MAX_GROUPS=${debug_copy_groups}"
   -e "VEOMNI_TORCH_PROFILE_ENABLE=0"
   -e "VEOMNI_MOE_TIMING_SYNC_EVENTS=0"
+  -e "HCCL_IF_BASE_PORT=${hccl_if_base_port}"
 )
 
 if [[ "${capture_routes}" == "1" ]]; then

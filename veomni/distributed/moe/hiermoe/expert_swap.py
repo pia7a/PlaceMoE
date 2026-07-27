@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import time
@@ -37,17 +38,20 @@ except ImportError:  # pragma: no cover - older torch fallback
 
 from ....utils import logging
 from ....utils.accelerator_timing import AcceleratorEvent, record_accelerator_event
-from ....utils.device import get_device_type, get_torch_device
+from ....utils.device import get_device_type, get_torch_device, synchronize
 from .core_planner import (
     CORE_MOE_ALGORITHM_VERSION,
     CoReMoEPlanner,
     QuotaPolicyEntry,
     assign_tokens_to_copies_with_quota,
 )
+from .forward_cover_planner import forward_cover_local_validation_stats, propose_forward_reuse_cover
 from .greedy_planner import GreedyCommunicationPlanner, assign_tokens_to_copies_greedy
 from .perf_model import HierMoEPerfModel
 from .planner import (
     CurrentRoutePlanner,
+    PlacementAction,
+    PlacementCost,
     PlacementPlan,
     assign_tokens_to_copies,
     assign_tokens_to_mirrored_r2,
@@ -119,6 +123,7 @@ _DEBUG_REDUNDANT_COPY_STATS = _env_flag("VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STA
 _DEBUG_REDUNDANT_COPY_STATS_MAX_LAYERS = _env_int("VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STATS_MAX_LAYERS", 2)
 _DEBUG_REDUNDANT_COPY_STATS_MAX_GROUPS = _env_int("VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STATS_MAX_GROUPS", 4)
 _FIXED_R2_LAYOUT = _env_flag("VEOMNI_HIERMOE_FIXED_R2_LAYOUT")
+_FORCE_FIXED_R2_MIRRORED_REMAP = _env_flag("VEOMNI_HIERMOE_FORCE_FIXED_R2_MIRRORED_REMAP")
 _GREEDY_ADAPTIVE_TOPK = _env_flag("VEOMNI_HIERMOE_GREEDY_ADAPTIVE_TOPK")
 _GREEDY_ADAPTIVE_TOPK_STRICT = _env_flag("VEOMNI_HIERMOE_GREEDY_ADAPTIVE_TOPK_STRICT")
 _GREEDY_POST_SHORTLIST_COMPACT_PAIR = _env_flag("VEOMNI_HIERMOE_GREEDY_POST_SHORTLIST_COMPACT_PAIR")
@@ -140,7 +145,54 @@ _PIPELINE_PREPARE_SUBSTAGES = (
     "collective_pack",
 )
 _PIPELINE_PREPARE_CUT_POINTS = (2, 2, 5, 7, 10, 13)
+# Event.wait() still wakes immediately on the normal path.  The timeout only
+# controls how often a blocked planner checks for an exceptional future or
+# shutdown.  A 1 ms timeout makes 48 layer workers contend for the GIL and the
+# manager lock tens of thousands of times per second while they are supposed
+# to be dormant between fixed pipeline windows.
+_PIPELINE_HOST_EVENT_POLL_SECONDS = 0.05
 _PIPELINE_PLAN_WORKERS = _env_int("VEOMNI_HIERMOE_PIPELINE_PLAN_WORKERS", 64)
+_ABLATION_REPLAY_PATH = os.environ.get("VEOMNI_HIERMOE_ABLATION_REPLAY_PATH", "").strip()
+_ABLATION_REPLAY_MODE = os.environ.get("VEOMNI_HIERMOE_ABLATION_REPLAY_MODE", "off").strip().lower()
+_ABLATION_MIGRATION_MODE = os.environ.get("VEOMNI_HIERMOE_ABLATION_MIGRATION_MODE", "hidden").strip().lower()
+_ABLATION_GRAD_MODE = os.environ.get("VEOMNI_HIERMOE_ABLATION_GRAD_MODE", "hidden").strip().lower()
+_CPU_PLANNER_MODE = os.environ.get("VEOMNI_HIERMOE_CPU_PLANNER_MODE", "off").strip().lower()
+_CPU_TRAIN_CORES_PER_RANK = _env_int("VEOMNI_HIERMOE_CPU_TRAIN_CORES_PER_RANK", 8)
+_NPU_LAYER_OWNER_BLOCKING = _env_flag("VEOMNI_HIERMOE_NPU_LAYER_OWNER_BLOCKING")
+_NPU_LAYER_OWNER_COLLECTIVE = (
+    os.environ.get(
+        "VEOMNI_HIERMOE_NPU_LAYER_OWNER_COLLECTIVE",
+        "reduce_scatter",
+    )
+    .strip()
+    .lower()
+)
+_ONLINE_FREEZE_COST_MODE = os.environ.get("VEOMNI_HIERMOE_ONLINE_FREEZE_COST_MODE", "off").strip().lower()
+_ONLINE_FREEZE_CALIBRATION_STEP = _env_int(
+    "VEOMNI_HIERMOE_ONLINE_FREEZE_CALIBRATION_STEP",
+    1,
+    minimum=0,
+)
+_ONLINE_FREEZE_COMMUNICATION_RATIO = _env_float(
+    "VEOMNI_HIERMOE_ONLINE_FREEZE_COMMUNICATION_RATIO",
+    3.1,
+)
+_ONLINE_FREEZE_COMPUTE_RATIO = _env_float(
+    "VEOMNI_HIERMOE_ONLINE_FREEZE_COMPUTE_RATIO",
+    4.19,
+)
+_COST_MODEL_VERIFY = _env_flag("VEOMNI_HIERMOE_COST_MODEL_VERIFY")
+_FORWARD_REUSE_COVER = _env_flag("VEOMNI_HIERMOE_FORWARD_REUSE_COVER")
+_FORWARD_REUSE_COVER_COMPUTE_WEIGHT = _env_float(
+    "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_COMPUTE_WEIGHT",
+    1.0,
+)
+_FORWARD_REUSE_COVER_MIN_GAIN = _env_float(
+    "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_MIN_GAIN",
+    0.0,
+)
+_FORWARD_REUSE_COVER_PATCH_REMAP = _env_flag("VEOMNI_HIERMOE_FORWARD_REUSE_COVER_PATCH_REMAP")
+_FORWARD_REUSE_COVER_FAST = _env_flag("VEOMNI_HIERMOE_FORWARD_REUSE_COVER_FAST")
 
 
 def _full_timing_range(section: str):
@@ -216,6 +268,20 @@ class _PendingLayerTiming:
     combine_end: AcceleratorEvent
 
 
+@dataclass
+class _CostModelTiming:
+    step: int
+    physical_routes: torch.Tensor
+    local_assignment_count: torch.Tensor
+    communication_events: dict[str, tuple[AcceleratorEvent, AcceleratorEvent]] | None
+    dispatch_start: AcceleratorEvent
+    dispatch_end: AcceleratorEvent
+    compute_start: AcceleratorEvent
+    compute_end: AcceleratorEvent
+    combine_start: AcceleratorEvent
+    combine_end: AcceleratorEvent
+
+
 @dataclass(frozen=True)
 class _PlannerCalibration:
     source_step: int
@@ -237,13 +303,17 @@ class ExpertLayerState:
     slot_to_logical: torch.Tensor | None = None
     canonical_physical_slots: torch.Tensor | None = None
     latest_selected_experts: torch.Tensor | None = None
+    latest_physical_routes: torch.Tensor | None = None
     latest_route_step: int = -1
     last_planned_step: int = -1
     accumulated_tokens_per_local_expert: torch.Tensor | None = None
+    latest_tokens_per_local_expert: torch.Tensor | None = None
     latest_hidden_size: int = 0
     latest_bytes_per_element: int = 0
     is_identity: bool = True
     _device_mapping_cache: dict[torch.device, torch.Tensor] = field(default_factory=dict)
+    source_logical_to_physical: torch.Tensor | None = None
+    _device_source_mapping_cache: dict[tuple[torch.device, int], torch.Tensor] = field(default_factory=dict)
     _device_slot_layout_cache: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
     _device_redundant_groups_cache: dict[torch.device, tuple[tuple[int, torch.Tensor], ...]] = field(
         default_factory=dict
@@ -252,6 +322,7 @@ class ExpertLayerState:
     _replica_grad_schedule_cache: _ReplicaGradSchedule | None = None
     placement_version: int = 0
     pending_timing: _PendingLayerTiming | None = None
+    cost_model_timings: list[_CostModelTiming] = field(default_factory=list)
     planner_calibration: _PlannerCalibration | None = None
     last_plan: PlacementPlan | None = None
     pending_physical_routes: torch.Tensor | None = None
@@ -261,6 +332,7 @@ class ExpertLayerState:
 
     def invalidate_cache(self) -> None:
         self._device_mapping_cache.clear()
+        self._device_source_mapping_cache.clear()
         self._device_slot_layout_cache.clear()
         self._device_redundant_groups_cache.clear()
         self._redundant_copy_groups_cache = None
@@ -284,6 +356,16 @@ class ExpertLayerState:
         if cached is None:
             cached = self.logical_to_physical.to(device=device, non_blocking=True)
             self._device_mapping_cache[device] = cached
+        return cached
+
+    def source_mapping_for_device(self, device: torch.device, source_rank: int) -> torch.Tensor:
+        if self.source_logical_to_physical is None:
+            raise RuntimeError(f"HierMoE layer {self.key} has no source-rank route LUT.")
+        key = (device, int(source_rank))
+        cached = self._device_source_mapping_cache.get(key)
+        if cached is None:
+            cached = self.source_logical_to_physical[int(source_rank)].to(device=device, non_blocking=True)
+            self._device_source_mapping_cache[key] = cached
         return cached
 
     @property
@@ -507,6 +589,38 @@ class _PipelineGradResult:
 
 
 @dataclass(frozen=True)
+class _CPUBatchedPlanResult:
+    source_step: int
+    placement_versions: tuple[int, ...]
+    plans: tuple[PlacementPlan, ...]
+    route_copy_ms: float
+    active_ms: float
+    latency_ms: float
+    timing: Any
+
+
+@dataclass
+class _CPUBatchedPlanState:
+    source_step: int
+    placement_versions: tuple[int, ...]
+    submitted_at: float
+    background: bool
+    collective_ready: Event = field(default_factory=Event)
+    collective_gate: Event = field(default_factory=Event)
+    collective_enqueued: Event = field(default_factory=Event)
+    collective_done_event: AcceleratorEvent | None = None
+    collective_error: BaseException | None = None
+    collective_gate_wait_ms: float = 0.0
+    collective_ready_host_wait_ms: float = 0.0
+    collective_close_host_wait_ms: float = 0.0
+    process_slot: int = -1
+    route_share_ms: float = 0.0
+    process_collective_active_ms: float = 0.0
+    process_collective_future: Future[Any] | None = None
+    future: Future[_CPUBatchedPlanResult] | None = None
+
+
+@dataclass(frozen=True)
 class _PendingPipelinePlan:
     plan: PlacementPlan
     source_step: int
@@ -529,8 +643,20 @@ class _PipelinePlannerWindows:
     )
     prepare_next_window: int = 0
     collective_gate: Event = field(default_factory=Event)
+    collective_tensor_ready: Event = field(default_factory=Event)
+    collective_result_ready: Event = field(default_factory=Event)
     collective_done: Event = field(default_factory=Event)
+    collective_tensor: torch.Tensor | None = None
+    collective_device: torch.device | None = None
+    collective_timing: _PipelinePlannerStageTiming | None = None
+    collective_error: BaseException | None = None
+    collective_future: Future[Any] | None = None
+    collective_done_event: AcceleratorEvent | None = None
+    collective_deadline_event: AcceleratorEvent | None = None
     score_gate: Event = field(default_factory=Event)
+    score_done: Event = field(default_factory=Event)
+    score_done_event: AcceleratorEvent | None = None
+    score_deadline_event: AcceleratorEvent | None = None
 
 
 @dataclass(frozen=True)
@@ -2584,6 +2710,135 @@ class ExpertSwapManager:
             self.expert_swap_mode != "step" or self.expert_swap_selector != "hiermoe_greedy_cover_p1"
         ):
             raise ValueError("fixed_pipeline_overlap requires step mode with the hiermoe_greedy_cover_p1 selector.")
+        if _ABLATION_REPLAY_MODE not in {"off", "static", "step"}:
+            raise ValueError(
+                f"VEOMNI_HIERMOE_ABLATION_REPLAY_MODE must be off, static, or step, got {_ABLATION_REPLAY_MODE!r}."
+            )
+        if _ABLATION_MIGRATION_MODE not in {"hidden", "blocking"}:
+            raise ValueError(
+                f"VEOMNI_HIERMOE_ABLATION_MIGRATION_MODE must be hidden or blocking, got {_ABLATION_MIGRATION_MODE!r}."
+            )
+        if _ABLATION_GRAD_MODE not in {"hidden", "blocking"}:
+            raise ValueError(
+                f"VEOMNI_HIERMOE_ABLATION_GRAD_MODE must be hidden or blocking, got {_ABLATION_GRAD_MODE!r}."
+            )
+        if _CPU_PLANNER_MODE not in {
+            "off",
+            "blocking",
+            "background",
+            "process_blocking",
+            "process_background",
+        }:
+            raise ValueError(
+                "VEOMNI_HIERMOE_CPU_PLANNER_MODE must be off, blocking, background, "
+                "process_blocking, or process_background, "
+                f"got {_CPU_PLANNER_MODE!r}."
+            )
+        if _CPU_PLANNER_MODE != "off" and (
+            not self.fixed_pipeline_overlap
+            or self.expert_swap_mode != "step"
+            or self.expert_swap_selector != "hiermoe_greedy_cover_p1"
+        ):
+            raise ValueError(
+                "The experimental CPU planner requires fixed-pipeline step mode with "
+                "the hiermoe_greedy_cover_p1 selector."
+            )
+        if _NPU_LAYER_OWNER_BLOCKING and (
+            not self.fixed_pipeline_overlap
+            or self.expert_swap_mode != "step"
+            or self.expert_swap_selector != "hiermoe_greedy_cover_p1"
+            or _CPU_PLANNER_MODE != "off"
+        ):
+            raise ValueError(
+                "Blocking NPU layer-owner planning requires fixed-pipeline step mode, "
+                "the hiermoe_greedy_cover_p1 selector, and CPU planner mode off."
+            )
+        if _NPU_LAYER_OWNER_COLLECTIVE not in {"reduce_scatter", "all_to_all"}:
+            raise ValueError(
+                "VEOMNI_HIERMOE_NPU_LAYER_OWNER_COLLECTIVE must be reduce_scatter or all_to_all, "
+                f"got {_NPU_LAYER_OWNER_COLLECTIVE!r}."
+            )
+        if _ONLINE_FREEZE_COST_MODE not in {"off", "communication", "joint"}:
+            raise ValueError(
+                "VEOMNI_HIERMOE_ONLINE_FREEZE_COST_MODE must be off, communication, or joint, "
+                f"got {_ONLINE_FREEZE_COST_MODE!r}."
+            )
+        if _ONLINE_FREEZE_COST_MODE != "off" and (
+            not self.fixed_pipeline_overlap
+            or self.expert_swap_mode != "step"
+            or self.expert_swap_selector != "hiermoe_greedy_cover_p1"
+            or not _FIXED_R2_LAYOUT
+            or self.expert_swap_max_pairs_per_layer != 0
+            or self.max_replica_rounds != self.replica_slot_capacity
+        ):
+            raise ValueError(
+                "The online freeze experiment requires fixed R2, fixed-pipeline step mode, "
+                "the hiermoe_greedy_cover_p1 selector, zero swaps, and one initialization "
+                "round for every redundant slot."
+            )
+        if _COST_MODEL_VERIFY and (
+            not self.fixed_pipeline_overlap
+            or self.expert_swap_mode != "step"
+            or self.expert_swap_selector != "hiermoe_greedy_cover_p1"
+            or not _FIXED_R2_LAYOUT
+            or self.expert_swap_max_pairs_per_layer != 0
+            or _ONLINE_FREEZE_COST_MODE != "off"
+            or _FORWARD_REUSE_COVER
+        ):
+            raise ValueError(
+                "Cost-model verification requires fixed R2, fixed-pipeline step mode, "
+                "the hiermoe_greedy_cover_p1 selector, zero swaps, and all placement "
+                "experiments disabled."
+            )
+        if _FORWARD_REUSE_COVER and (
+            not self.fixed_pipeline_overlap
+            or self.expert_swap_mode != "step"
+            or self.expert_swap_selector != "hiermoe_greedy_cover_p1"
+            or not _FIXED_R2_LAYOUT
+            or _CPU_PLANNER_MODE != "off"
+            or _NPU_LAYER_OWNER_BLOCKING
+            or _ONLINE_FREEZE_COST_MODE != "off"
+            or _ABLATION_REPLAY_MODE != "off"
+        ):
+            raise ValueError(
+                "Forward-reuse cover planning requires fixed R2, fixed-pipeline step mode, "
+                "the hiermoe_greedy_cover_p1 selector, and all other experimental planners disabled."
+            )
+        if _FORWARD_REUSE_COVER_PATCH_REMAP and not _FORWARD_REUSE_COVER:
+            raise ValueError("Forward-reuse patch remapping requires VEOMNI_HIERMOE_FORWARD_REUSE_COVER=1.")
+        if _FORWARD_REUSE_COVER_FAST and not _FORWARD_REUSE_COVER_PATCH_REMAP:
+            raise ValueError("Fast Forward-reuse Cover requires VEOMNI_HIERMOE_FORWARD_REUSE_COVER_PATCH_REMAP=1.")
+        if _ABLATION_REPLAY_MODE != "off" and not self.fixed_pipeline_overlap:
+            raise ValueError("HierMoE ablation replay requires fixed_pipeline_overlap=true.")
+        if _ABLATION_REPLAY_MODE != "off" and not _ABLATION_REPLAY_PATH:
+            raise ValueError("VEOMNI_HIERMOE_ABLATION_REPLAY_PATH is required when ablation replay is enabled.")
+        self._ablation_replay_mode = _ABLATION_REPLAY_MODE
+        self._ablation_migration_mode = _ABLATION_MIGRATION_MODE
+        self._ablation_grad_mode = _ABLATION_GRAD_MODE
+        self._cpu_planner_mode = _CPU_PLANNER_MODE
+        self._npu_layer_owner_blocking = _NPU_LAYER_OWNER_BLOCKING
+        self._npu_layer_owner_collective = _NPU_LAYER_OWNER_COLLECTIVE
+        self._online_freeze_cost_mode = _ONLINE_FREEZE_COST_MODE
+        self._online_freeze_calibration_step = _ONLINE_FREEZE_CALIBRATION_STEP
+        self._online_freeze_communication_ratio = _ONLINE_FREEZE_COMMUNICATION_RATIO
+        self._online_freeze_compute_ratio = _ONLINE_FREEZE_COMPUTE_RATIO
+        self._cost_model_verify = _COST_MODEL_VERIFY
+        self._cost_model_verify_coefficients: tuple[float, float, float, float] | None = None
+        self._cost_model_verify_receive_only_coefficients: tuple[float, float] | None = None
+        self._cost_model_verify_feature_coefficients: dict[
+            str,
+            dict[str, tuple[tuple[float, ...], float]],
+        ] | None = None
+        self._cost_model_verify_complete = False
+        self._forward_reuse_cover = _FORWARD_REUSE_COVER
+        self._forward_reuse_cover_patch_remap = _FORWARD_REUSE_COVER_PATCH_REMAP
+        self._forward_reuse_cover_fast = _FORWARD_REUSE_COVER_FAST
+        self._forward_reuse_cover_compute_weight = _FORWARD_REUSE_COVER_COMPUTE_WEIGHT
+        self._forward_reuse_cover_min_gain = _FORWARD_REUSE_COVER_MIN_GAIN
+        self._ablation_actions_by_step: dict[int, dict[str, tuple[tuple[str, str], ...]]] = {}
+        self._ablation_expected_layouts: dict[str, tuple[int, ...]] = {}
+        if self._ablation_replay_mode != "off":
+            self._load_ablation_replay(_ABLATION_REPLAY_PATH)
 
         self.activation_checkpointing_enabled = bool(activation_checkpointing_enabled)
         self._swap_group = (
@@ -2591,10 +2846,10 @@ class ExpertSwapManager:
             if self.expert_swap_max_pairs_per_layer > 0 and not self.fixed_pipeline_overlap
             else None
         )
-        # Planner collectives, staged migration, and redundant-gradient sync
-        # occupy disjoint fixed windows, so the existing EP communicator can be
-        # reused without conflicting collective order or reserving another EP32
-        # HCCL workspace.
+        # All fixed-pipeline communication reuses EP/HCCL to avoid reserving
+        # another device communication workspace. Planner collectives are
+        # serialized through one host executor below, so 48 layer workers can
+        # never race collective launch order.
         self._pipeline_background_group = ep_group if self.fixed_pipeline_overlap else None
         self._pipeline_planner_group = self._pipeline_background_group
         self._pipeline_migration_group = self._pipeline_background_group
@@ -2630,6 +2885,11 @@ class ExpertSwapManager:
             if self.fixed_pipeline_overlap
             else None
         )
+        self._pipeline_collective_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="hiermoe-collective")
+            if self.fixed_pipeline_overlap
+            else None
+        )
         self._pipeline_migration_executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="hiermoe-move")
             if self.fixed_pipeline_overlap
@@ -2638,6 +2898,11 @@ class ExpertSwapManager:
         self._pipeline_grad_executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="hiermoe-grad")
             if self.fixed_pipeline_overlap
+            else None
+        )
+        self._cpu_plan_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="hiermoe-cpu-batch")
+            if self._cpu_planner_mode == "background"
             else None
         )
         self._pipeline_streams: dict[tuple[str, torch.device], Any] = {}
@@ -2656,6 +2921,10 @@ class ExpertSwapManager:
         self._pipeline_grad_window_exposed_ms = 0.0
         self._pipeline_grad_hook_handles: list[Any] = []
         self._pipeline_grad_hook_params: set[int] = set()
+        self._cpu_batch_state: _CPUBatchedPlanState | None = None
+        self._cpu_process_runtime: Any | None = None
+        self._cpu_training_affinity: tuple[int, ...] = ()
+        self._cpu_planner_affinity: tuple[int, ...] = ()
         self._pipeline_step = -1
         self._pipeline_micro_step = 0
         self._pipeline_num_micro_steps = 1
@@ -2663,6 +2932,200 @@ class ExpertSwapManager:
         self._pipeline_next_grad_index = 0
         self._pipeline_layer_order: tuple[str, ...] = ()
         self._pipeline_shutdown = False
+
+    def _load_ablation_replay(self, path: str) -> None:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"Cannot load HierMoE ablation replay from {path!r}.") from error
+
+        topology = payload.get("topology", {})
+        replay_ep_size = int(topology.get("ep_size", -1))
+        if replay_ep_size != self.ep_size:
+            raise ValueError(f"HierMoE ablation replay uses ep_size={replay_ep_size}, current ep_size={self.ep_size}.")
+        raw_steps = payload.get("replay", {}).get("actions_by_step", {})
+        if not isinstance(raw_steps, dict) or not raw_steps:
+            raise ValueError("HierMoE ablation replay contains no actions_by_step.")
+
+        actions_by_step: dict[int, dict[str, list[tuple[str, str]]]] = defaultdict(lambda: defaultdict(list))
+        for raw_step, rows in raw_steps.items():
+            step = int(raw_step)
+            if not isinstance(rows, list):
+                raise ValueError(f"HierMoE ablation replay step {step} is not a list.")
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ValueError(f"HierMoE ablation replay step {step} contains a non-mapping action.")
+                layer = str(row.get("layer", ""))
+                kind = str(row.get("kind", ""))
+                body = str(row.get("body", ""))
+                if not layer or kind not in {"swap", "replica", "empty"} or not body:
+                    raise ValueError(f"HierMoE ablation replay step {step} contains an invalid action: {row!r}.")
+                actions_by_step[step][layer].append((kind, body))
+        self._ablation_actions_by_step = {
+            step: {layer: tuple(actions) for layer, actions in by_layer.items()}
+            for step, by_layer in actions_by_step.items()
+        }
+
+        raw_layers = payload.get("layers", {})
+        if not isinstance(raw_layers, dict) or not raw_layers:
+            raise ValueError("HierMoE ablation replay contains no final layer layouts.")
+        self._ablation_expected_layouts = {
+            str(layer): tuple(int(value) for value in layer_payload["slot_to_logical"])
+            for layer, layer_payload in raw_layers.items()
+        }
+
+    @staticmethod
+    def _zero_placement_cost() -> PlacementCost:
+        return PlacementCost(
+            communication=0.0,
+            compute=0.0,
+            communication_model_units=0.0,
+            peak_communication_rank=-1,
+            peak_compute_rank=-1,
+            selected_dim=0,
+        )
+
+    def _build_ablation_replay_plan(
+        self,
+        layer: ExpertLayerState,
+        specs: Sequence[tuple[str, str]],
+    ) -> PlacementPlan:
+        initial = self._layer_layout(layer)
+        working = initial.clone()
+        owners = layer.logical_to_physical.detach().cpu().clone()
+        actions: list[PlacementAction] = []
+        for kind, body in specs:
+            if kind == "swap":
+                lhs_text, rhs_text = body.split("<->", maxsplit=1)
+                lhs, rhs = int(lhs_text), int(rhs_text)
+                lhs_slot, rhs_slot = int(owners[lhs].item()), int(owners[rhs].item())
+                if int(working[lhs_slot].item()) != lhs or int(working[rhs_slot].item()) != rhs:
+                    raise RuntimeError(f"HierMoE ablation swap {body} does not match layer {layer.key}.")
+                actions.append(PlacementAction("swap", lhs_slot, rhs_slot, lhs, rhs))
+                working[lhs_slot], working[rhs_slot] = working[rhs_slot].clone(), working[lhs_slot].clone()
+                owners[lhs], owners[rhs] = owners[rhs].clone(), owners[lhs].clone()
+                continue
+            if kind == "replica":
+                logical_text, dst_text = body.split("->", maxsplit=1)
+                logical, dst_slot = int(logical_text), int(dst_text)
+                src_slot = int(owners[logical].item())
+                previous = int(working[dst_slot].item())
+                if src_slot == dst_slot or int(working[src_slot].item()) != logical:
+                    raise RuntimeError(f"HierMoE ablation replica {body} has no valid owner source in {layer.key}.")
+                if dst_slot in {int(value) for value in owners.tolist()}:
+                    raise RuntimeError(
+                        f"HierMoE ablation replica {body} overwrites an owner slot; "
+                        "the compact action log cannot reconstruct the replacement owner."
+                    )
+                actions.append(PlacementAction("replica", src_slot, dst_slot, logical, previous))
+                working[dst_slot] = logical
+                continue
+            logical_text, slot_text = body.split("@", maxsplit=1)
+            logical, slot = int(logical_text), int(slot_text)
+            if int(working[slot].item()) != logical or slot in {int(value) for value in owners.tolist()}:
+                raise RuntimeError(f"HierMoE ablation empty action {body} is invalid for layer {layer.key}.")
+            actions.append(PlacementAction("empty", slot, slot, logical, -1))
+            working[slot] = -1
+
+        zero_cost = self._zero_placement_cost()
+        final_layout = tuple(int(value) for value in working.tolist())
+        return PlacementPlan(
+            actions=tuple(actions),
+            initial_layout=tuple(int(value) for value in initial.tolist()),
+            final_layout=final_layout,
+            baseline_cost=zero_cost,
+            final_cost=zero_cost,
+            swap_rounds=sum(action.kind == "swap" for action in actions),
+            replica_rounds=sum(action.kind == "replica" for action in actions),
+            planning_ms=0.0,
+            route_stats_ms=0.0,
+            swap_ms=0.0,
+            replica_ms=0.0,
+            swap_score_ms=0.0,
+            swap_update_ms=0.0,
+            swap_collective_ms=0.0,
+            replica_score_ms=0.0,
+            replica_update_ms=0.0,
+            replica_collective_ms=0.0,
+            decision_sync_ms=0.0,
+            finalization_ms=0.0,
+            algorithm_version="hiermoe-ablation-replay-v1",
+            layout_digest=f"{zlib.crc32(repr(final_layout).encode()):08x}",
+            final_owner_slots=tuple(int(value) for value in owners.tolist()),
+        )
+
+    def _validate_ablation_final_layout(self) -> None:
+        if set(self._ablation_expected_layouts) != set(self.layers):
+            missing = sorted(set(self.layers) - set(self._ablation_expected_layouts))
+            unexpected = sorted(set(self._ablation_expected_layouts) - set(self.layers))
+            raise RuntimeError(f"HierMoE ablation layer mismatch: missing={missing}, unexpected={unexpected}.")
+        for layer_key, layer in self.layers.items():
+            actual = tuple(int(value) for value in self._layer_layout(layer).tolist())
+            expected = self._ablation_expected_layouts[layer_key]
+            if actual != expected:
+                raise RuntimeError(f"HierMoE ablation final layout does not match replay output for {layer_key}.")
+
+    @torch.no_grad()
+    def _install_static_ablation_layout(self) -> None:
+        if not _FIXED_R2_LAYOUT:
+            raise RuntimeError("Static HierMoE ablation replay requires VEOMNI_HIERMOE_FIXED_R2_LAYOUT=1.")
+        action_count = 0
+        for step in sorted(self._ablation_actions_by_step):
+            by_layer = self._ablation_actions_by_step[step]
+            if set(by_layer) != set(self.layers):
+                raise RuntimeError(f"HierMoE ablation replay step {step} does not contain every registered layer.")
+            for layer_key in self.layers:
+                layer = self.layers[layer_key]
+                plan = self._build_ablation_replay_plan(layer, by_layer[layer_key])
+                self._execute_placement_plan(
+                    layer,
+                    plan,
+                    timing_prefix=None,
+                    transfer_group=self.ep_group,
+                    force_staged_transfer=False,
+                    fast_sparse_transfer=True,
+                )
+                action_count += len(plan.actions)
+        self._validate_ablation_final_layout()
+        logger.info_rank0(
+            "HierMoE installed static ablation layout from %s using %s replayed actions.",
+            _ABLATION_REPLAY_PATH,
+            action_count,
+        )
+
+    def _queue_ablation_replay_step(self, step: int) -> str:
+        if self._ablation_replay_mode == "static":
+            self.latest_pair = "none"
+            return self.latest_pair
+        # ``maybe_swap`` receives the zero-based optimizer-step index while
+        # action logs use the one-based training-step number shown in metrics.
+        logged_step = int(step) + 1
+        by_layer = self._ablation_actions_by_step.get(logged_step)
+        if by_layer is None:
+            if logged_step > max(self._ablation_actions_by_step):
+                self._validate_ablation_final_layout()
+            self.latest_pair = "none"
+            return self.latest_pair
+        if set(by_layer) != set(self.layers):
+            raise RuntimeError(f"HierMoE ablation replay step {logged_step} does not contain every registered layer.")
+
+        committed: list[str] = []
+        for layer_key in self.layers:
+            if layer_key in self._pipeline_pending_plans:
+                raise RuntimeError(f"HierMoE ablation replay has an unconsumed plan for {layer_key}.")
+            layer = self.layers[layer_key]
+            plan = self._build_ablation_replay_plan(layer, by_layer[layer_key])
+            self._pipeline_pending_plans[layer_key] = _PendingPipelinePlan(
+                plan=plan,
+                source_step=int(step),
+                placement_version=int(layer.placement_version),
+            )
+            committed.extend(f"{layer_key}:{action.format()}" for action in plan.actions)
+        self._accumulate_metric("hiermoe/ablation_replay_actions", len(committed))
+        self._accumulate_metric("hiermoe/ablation_replay_logged_step", logged_step)
+        self.latest_pair = ",".join(committed) if committed else "none"
+        return self.latest_pair
 
     def _ensure_pipeline_plan_worker_capacity(self) -> None:
         """Guarantee that every gate-blocked layer owns a planner worker.
@@ -2689,9 +3152,15 @@ class ExpertSwapManager:
         executor.shutdown(wait=True, cancel_futures=False)
 
     def placement_planning_enabled(self) -> bool:
-        return self.expert_swap_max_pairs_per_layer > 0 or self.redundant_slot_increment_per_device > 0
+        return self._ablation_replay_mode == "off" and (
+            self.expert_swap_max_pairs_per_layer > 0 or self.redundant_slot_increment_per_device > 0
+        )
 
     def layer_calibration_enabled(self) -> bool:
+        if self._cost_model_verify:
+            return not self._cost_model_verify_complete
+        if self._forward_reuse_cover:
+            return False
         if self.expert_swap_selector == "current_joint":
             return True
         if self.expert_swap_selector == "hiermoe_greedy_cover_p1":
@@ -2713,8 +3182,27 @@ class ExpertSwapManager:
             "hiermoe/placement_replica_rounds_effective": self.max_replica_rounds,
             "hiermoe/placement_route_sample_size": self.planner_route_sample_size,
             "hiermoe/placement_runtime_cost_model": self.perf_model.runtime_cost_status,
+            "hiermoe/cost_model_verify": int(self._cost_model_verify),
             "hiermoe/expert_swap_selector": self.expert_swap_selector,
             "hiermoe/fixed_pipeline_overlap": int(self.fixed_pipeline_overlap),
+            "hiermoe/cpu_planner_mode": self._cpu_planner_mode,
+            "hiermoe/cpu_training_affinity_cores": len(self._cpu_training_affinity),
+            "hiermoe/cpu_planner_affinity_cores": len(self._cpu_planner_affinity),
+            "hiermoe/ablation_replay_mode": self._ablation_replay_mode,
+            "hiermoe/ablation_migration_mode": self._ablation_migration_mode,
+            "hiermoe/ablation_grad_mode": self._ablation_grad_mode,
+            "hiermoe/online_freeze_cost_mode": self._online_freeze_cost_mode,
+            "hiermoe/fixed_r2_mirrored_remap": int(_FORCE_FIXED_R2_MIRRORED_REMAP),
+            "hiermoe/forward_reuse_cover": int(self._forward_reuse_cover),
+            "hiermoe/forward_reuse_cover_patch_remap": int(self._forward_reuse_cover_patch_remap),
+            "hiermoe/forward_reuse_cover_fast": int(self._forward_reuse_cover_fast),
+            "hiermoe/forward_reuse_cover_compute_weight": self._forward_reuse_cover_compute_weight,
+            "hiermoe/forward_reuse_cover_min_gain": self._forward_reuse_cover_min_gain,
+            "hiermoe/pipeline_planner_backend": (
+                self._planner_collective_backend(self._pipeline_planner_group)
+                if self._pipeline_planner_group is not None
+                else "none"
+            ),
         }
 
     def _accumulate_metric(self, key: str, value: float | int | str) -> None:
@@ -2795,7 +3283,10 @@ class ExpertSwapManager:
             return
         self._debug_log_redundant_copy_stats("step_begin", include_grads=False)
         self._begin_metrics_step(step)
-        self._ensure_pipeline_plan_worker_capacity()
+        if self._uses_cpu_process_planner():
+            self._ensure_cpu_process_runtime()
+        if self._ablation_replay_mode == "off" and not self._npu_layer_owner_blocking:
+            self._ensure_pipeline_plan_worker_capacity()
         with self._pipeline_lock:
             if self._pipeline_grad_futures:
                 raise RuntimeError("HierMoE started a new step before redundant gradient synchronization completed.")
@@ -2808,13 +3299,14 @@ class ExpertSwapManager:
             self._pipeline_layer_order = tuple(self.layers)
             self._pipeline_next_migration_index = 0
             self._pipeline_next_grad_index = 0
-        self._launch_next_pipeline_migration()
+        if self._ablation_migration_mode == "hidden":
+            self._launch_next_pipeline_migration()
 
     def _pipeline_is_final_microstep(self) -> bool:
         return self._pipeline_micro_step + 1 >= self._pipeline_num_micro_steps
 
     def _wait_pipeline_host_event(self, layer_key: str, event: Event) -> None:
-        while not event.wait(timeout=0.001):
+        while not event.wait(timeout=_PIPELINE_HOST_EVENT_POLL_SECONDS):
             with self._pipeline_lock:
                 future = self._pipeline_plan_futures.get(layer_key)
             if future is not None and future.done():
@@ -2887,7 +3379,14 @@ class ExpertSwapManager:
             windows = self._pipeline_planner_windows.get(layer_key)
         if windows is None:
             return
+        host_wait_started = time.perf_counter()
         self._wait_pipeline_host_event(layer_key, windows.prepare_enqueued[index])
+        host_wait_ms = (time.perf_counter() - host_wait_started) * 1000.0
+        self._accumulate_metric("hiermoe/pipeline_planner_prepare_host_gate_wait_ms", host_wait_ms)
+        self._accumulate_metric(
+            f"hiermoe/pipeline_planner_prepare_window_{index}_host_gate_wait_ms",
+            host_wait_ms,
+        )
         with self._pipeline_lock:
             if self._pipeline_planner_windows.get(layer_key) is not windows:
                 return
@@ -2921,6 +3420,550 @@ class ExpertSwapManager:
             else:
                 per_window.append(max(0.0, a2a_end.elapsed_time(planner_done)))
         return sum(per_window), tuple(per_window)
+
+    @staticmethod
+    def _pipeline_stage_exposure_ms(
+        deadline: AcceleratorEvent | None,
+        done: AcceleratorEvent | None,
+    ) -> float:
+        if deadline is None or done is None:
+            return 0.0
+        return max(0.0, deadline.elapsed_time(done))
+
+    def _uses_cpu_process_planner(self) -> bool:
+        return self._cpu_planner_mode in {"process_blocking", "process_background"}
+
+    @staticmethod
+    def _bind_all_process_threads(cpu_ids: Sequence[int]) -> None:
+        cpus = {int(cpu_id) for cpu_id in cpu_ids}
+        if not cpus or not hasattr(os, "sched_setaffinity"):
+            return
+        task_root = "/proc/self/task"
+        try:
+            task_ids = tuple(int(name) for name in os.listdir(task_root) if name.isdigit())
+        except OSError:
+            task_ids = (0,)
+        for task_id in task_ids:
+            try:
+                os.sched_setaffinity(task_id, cpus)
+            except (OSError, ProcessLookupError):
+                continue
+        os.sched_setaffinity(0, cpus)
+
+    def _cpu_process_affinity_masks(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        visible = sorted(os.sched_getaffinity(0))
+        local_world_size = max(1, int(os.environ.get("LOCAL_WORLD_SIZE", "1")))
+        local_rank = int(os.environ.get("LOCAL_RANK", str(self.ep_rank % local_world_size)))
+        start = (len(visible) * local_rank) // local_world_size
+        end = (len(visible) * (local_rank + 1)) // local_world_size
+        rank_cpus = tuple(visible[start:end])
+        if len(rank_cpus) < 2:
+            return rank_cpus, rank_cpus
+        training_count = min(max(1, _CPU_TRAIN_CORES_PER_RANK), len(rank_cpus) - 1)
+        return rank_cpus[:training_count], rank_cpus[training_count:]
+
+    def _ensure_cpu_process_runtime(self) -> Any:
+        if not self._uses_cpu_process_planner():
+            raise RuntimeError("CPU planner process requested for a non-process planner mode.")
+        if self._cpu_process_runtime is not None:
+            return self._cpu_process_runtime
+        from .cpu_planner import SharedMemoryCPUPlannerProcess
+
+        training_cpus, planner_cpus = self._cpu_process_affinity_masks()
+        if not training_cpus or not planner_cpus:
+            raise RuntimeError("CPU planner process isolation requires at least two visible CPU cores per local rank.")
+        # Bind every currently existing training/HCCL/PyTorch thread. New
+        # threads inherit the calling thread's training mask. The spawned
+        # planner immediately switches to the disjoint planner mask.
+        self._bind_all_process_threads(training_cpus)
+        runtime = SharedMemoryCPUPlannerProcess(planner_cpu_ids=planner_cpus)
+        self._cpu_training_affinity = training_cpus
+        self._cpu_planner_affinity = planner_cpus
+        self._cpu_process_runtime = runtime
+        self._placement_metrics["hiermoe/cpu_training_affinity_cores"] = len(training_cpus)
+        self._placement_metrics["hiermoe/cpu_planner_affinity_cores"] = len(planner_cpus)
+        logger.info_rank0(
+            "HierMoE isolated CPU planner process pid=%s with training cores=%s planner cores=%s.",
+            runtime.pid,
+            training_cpus,
+            planner_cpus,
+        )
+        return runtime
+
+    def _cpu_exact_planner_for_layer(self, layer: ExpertLayerState) -> GreedyCommunicationPlanner:
+        """Build the same exact scorer as the fixed-pipeline NPU backend on CPU."""
+
+        return GreedyCommunicationPlanner(
+            hierarchy=self.hierarchy,
+            perf_model=self.perf_model,
+            hidden_size=layer.latest_hidden_size,
+            bytes_per_element=layer.latest_bytes_per_element,
+            slots_per_rank=layer.num_local_experts,
+            communication_scale=1.0,
+            forward_compute_per_assignment=0.0,
+            forward_compute_constant=0.0,
+            smooth_max_gamma=self.smooth_max_gamma,
+            reducer=None,
+            candidate_chunk_size=_SWAP_COST_CHUNK_CANDIDATES,
+            process_group=None,
+            max_copies=self.greedy_max_copies_per_expert,
+            assume_unique_routes=True,
+            layer_parallel_streams=_GREEDY_LAYER_PARALLEL_STREAMS,
+            adaptive_topk=False,
+            adaptive_topk_initial=_GREEDY_ADAPTIVE_TOPK_INITIAL,
+            adaptive_topk_strict_certificate=False,
+            exact_primitive_topk=0,
+            post_shortlist_compact_pair=False,
+            exact_primitive_max_only=False,
+        )
+
+    def _cpu_batched_plan_layers(self, step: int) -> tuple[ExpertLayerState, ...]:
+        order = self._pipeline_layer_order or tuple(self.layers)
+        layers = tuple(self.layers[key] for key in order)
+        if not layers:
+            return ()
+        if any(layer.latest_selected_experts is None or layer.latest_route_step != int(step) for layer in layers):
+            return ()
+        if any(bool((self._layer_layout(layer) < 0).any().item()) for layer in layers):
+            return ()
+        signature = {
+            (
+                layer.latest_hidden_size,
+                layer.latest_bytes_per_element,
+                layer.num_local_experts,
+                layer.num_experts,
+            )
+            for layer in layers
+        }
+        if len(signature) != 1:
+            raise RuntimeError(
+                "The 48-layer CPU/HCCL planner requires identical route and expert shapes across planned layers."
+            )
+        return layers
+
+    @staticmethod
+    def _synchronize_pipeline_event(event: Any | None) -> None:
+        if event is None:
+            return
+        synchronize = getattr(event, "synchronize", None)
+        if callable(synchronize):
+            synchronize()
+
+    def _cpu_hccl_reduce(
+        self,
+        state: _CPUBatchedPlanState,
+        local_payload: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Stage one packed CPU payload through the existing EP/HCCL group."""
+
+        state.collective_ready.set()
+        if state.background:
+            gate_started = time.perf_counter()
+            while not state.collective_gate.wait(timeout=_PIPELINE_HOST_EVENT_POLL_SECONDS):
+                if self._pipeline_shutdown:
+                    raise RuntimeError("CPU planner was shut down before its HCCL window opened.")
+            state.collective_gate_wait_ms = (time.perf_counter() - gate_started) * 1000.0
+
+        if device.type == "cpu" or self._pipeline_planner_group is None or self.ep_size <= 1:
+            state.collective_enqueued.set()
+            return local_payload
+
+        device_api = get_torch_device()
+        device_api.set_device(device)
+        stream = self._pipeline_stream("planner", device)
+        if stream is None:
+            raise RuntimeError("CPU planner HCCL reduction requires a device planner stream.")
+        try:
+            with device_api.stream(stream):
+                device_payload = local_payload.to(device=device, non_blocking=True)
+                dist.all_reduce(
+                    device_payload,
+                    op=dist.ReduceOp.SUM,
+                    group=self._pipeline_planner_group,
+                )
+                done_event = self._pipeline_stage_event()
+                state.collective_done_event = done_event
+            state.collective_enqueued.set()
+            if done_event is not None:
+                self._synchronize_pipeline_event(done_event.event)
+            else:
+                stream.synchronize()
+            return device_payload.to(device="cpu")
+        except BaseException as error:
+            state.collective_error = error
+            state.collective_enqueued.set()
+            raise
+
+    @torch.no_grad()
+    def _cpu_batched_plan_worker(
+        self,
+        state: _CPUBatchedPlanState,
+        layers: tuple[ExpertLayerState, ...],
+        routes: tuple[torch.Tensor, ...],
+        layouts: tuple[torch.Tensor, ...],
+        owners: tuple[torch.Tensor, ...],
+        route_ready_event: Any | None,
+    ) -> _CPUBatchedPlanResult:
+        from .cpu_planner import CPUHCCLBatchedPlanner
+
+        self._synchronize_pipeline_event(route_ready_event)
+        route_copy_started = time.perf_counter()
+        cpu_routes = tuple(route.detach().to(device="cpu") for route in routes)
+        route_copy_ms = (time.perf_counter() - route_copy_started) * 1000.0
+        device = routes[0].device
+        planner = CPUHCCLBatchedPlanner(
+            self._cpu_exact_planner_for_layer(layers[0]),
+            reducer=lambda tensor: self._cpu_hccl_reduce(state, tensor, device),
+        )
+        result = planner.plan_layers(
+            cpu_routes,
+            layouts,
+            owners,
+            source_ranks=self.ep_rank,
+            max_swaps=self.expert_swap_max_pairs_per_layer,
+            max_replicas=self.max_replica_rounds,
+            layer_seeds=[zlib.crc32(layer.key.encode("utf-8")) for layer in layers],
+            step=state.source_step,
+            communication_scales=[1.0] * len(layers),
+            forward_compute_per_assignment=[0.0] * len(layers),
+            forward_compute_constant=[0.0] * len(layers),
+        )
+        latency_ms = (time.perf_counter() - state.submitted_at) * 1000.0
+        active_ms = max(
+            0.0,
+            route_copy_ms + result.timing.total_ms - state.collective_gate_wait_ms,
+        )
+        return _CPUBatchedPlanResult(
+            source_step=state.source_step,
+            placement_versions=state.placement_versions,
+            plans=result.plans,
+            route_copy_ms=route_copy_ms,
+            active_ms=active_ms,
+            latency_ms=latency_ms,
+            timing=result.timing,
+        )
+
+    def _submit_cpu_batched_plan(self, step: int) -> None:
+        """Start the 48-layer host job after the final forward route is available."""
+
+        if self._cpu_planner_mode != "background" or self._pipeline_shutdown:
+            return
+        if not self._pipeline_is_final_microstep():
+            return
+        if self.expert_swap_interval <= 0 or int(step) % self.expert_swap_interval != 0:
+            return
+        layers = self._cpu_batched_plan_layers(step)
+        if not layers:
+            return
+        executor = self._cpu_plan_executor
+        if executor is None:
+            raise RuntimeError("Background CPU planner executor is unavailable.")
+        with self._pipeline_lock:
+            if self._cpu_batch_state is not None:
+                if self._cpu_batch_state.source_step == int(step):
+                    return
+                raise RuntimeError("A previous CPU planner job was not consumed before the next submission.")
+            if any(layer.last_planned_step == int(step) for layer in layers):
+                return
+            for layer in layers:
+                layer.last_planned_step = int(step)
+            state = _CPUBatchedPlanState(
+                source_step=int(step),
+                placement_versions=tuple(int(layer.placement_version) for layer in layers),
+                submitted_at=time.perf_counter(),
+                background=True,
+            )
+            self._cpu_batch_state = state
+        routes = tuple(layer.latest_selected_experts.detach() for layer in layers)  # type: ignore[union-attr]
+        layouts = tuple(self._layer_layout(layer).clone() for layer in layers)
+        owners = tuple(layer.logical_to_physical.detach().cpu().clone() for layer in layers)
+        route_ready_event = self._pipeline_ready_event(routes[-1].device)
+        future = executor.submit(
+            self._cpu_batched_plan_worker,
+            state,
+            layers,
+            routes,
+            layouts,
+            owners,
+            route_ready_event,
+        )
+        state.future = future
+
+    def _submit_cpu_process_plan(self, step: int, *, background: bool) -> _CPUBatchedPlanState | None:
+        """Copy routes once into shared memory and enqueue the isolated process."""
+
+        if self._pipeline_shutdown:
+            return None
+        if not self._pipeline_is_final_microstep():
+            return None
+        if self.expert_swap_interval <= 0 or int(step) % self.expert_swap_interval != 0:
+            return None
+        layers = self._cpu_batched_plan_layers(step)
+        if not layers:
+            return None
+        runtime = self._ensure_cpu_process_runtime()
+        with self._pipeline_lock:
+            if self._cpu_batch_state is not None:
+                if self._cpu_batch_state.source_step == int(step):
+                    return self._cpu_batch_state
+                raise RuntimeError("A previous CPU planner process job was not consumed.")
+            if any(layer.last_planned_step == int(step) for layer in layers):
+                return None
+            for layer in layers:
+                layer.last_planned_step = int(step)
+            state = _CPUBatchedPlanState(
+                source_step=int(step),
+                placement_versions=tuple(int(layer.placement_version) for layer in layers),
+                submitted_at=time.perf_counter(),
+                background=bool(background),
+                process_slot=int(step) % 2,
+            )
+            self._cpu_batch_state = state
+
+        share_started = time.perf_counter()
+        shared_routes = tuple(
+            runtime.share_cpu_tensor(layer.latest_selected_experts)  # type: ignore[arg-type]
+            for layer in layers
+        )
+        state.route_share_ms = (time.perf_counter() - share_started) * 1000.0
+        runtime.submit(
+            slot=state.process_slot,
+            source_step=state.source_step,
+            planner=self._cpu_exact_planner_for_layer(layers[0]),
+            selected_experts=shared_routes,
+            slot_to_logical=tuple(self._layer_layout(layer).clone() for layer in layers),
+            owner_slots=tuple(layer.logical_to_physical.detach().cpu().clone() for layer in layers),
+            source_rank=self.ep_rank,
+            max_swaps=self.expert_swap_max_pairs_per_layer,
+            max_replicas=self.max_replica_rounds,
+            layer_seeds=tuple(zlib.crc32(layer.key.encode("utf-8")) for layer in layers),
+            communication_scales=(1.0,) * len(layers),
+            compute_slopes=(0.0,) * len(layers),
+            compute_constants=(0.0,) * len(layers),
+        )
+        return state
+
+    def _service_cpu_process_collective(self, state: _CPUBatchedPlanState) -> None:
+        """Execute only the isolated child's packed reduction in the parent."""
+
+        runtime = self._ensure_cpu_process_runtime()
+        request_wait_started = time.perf_counter()
+        collective_started: float | None = None
+        try:
+            source_step, local_payload = runtime.wait_collective(state.process_slot)
+            state.collective_ready_host_wait_ms += (time.perf_counter() - request_wait_started) * 1000.0
+            state.collective_ready.set()
+            collective_started = time.perf_counter()
+            if source_step != state.source_step:
+                raise RuntimeError(
+                    f"CPU planner collective source step {source_step} does not match {state.source_step}."
+                )
+            order = self._pipeline_layer_order or tuple(self.layers)
+            device = self._pipeline_device(self.layers[order[0]])
+            if device.type == "cpu" or self._pipeline_planner_group is None or self.ep_size <= 1:
+                state.collective_enqueued.set()
+            else:
+                device_api = get_torch_device()
+                device_api.set_device(device)
+                stream = self._pipeline_stream("planner", device)
+                if stream is None:
+                    raise RuntimeError("CPU planner process reduction requires a device planner stream.")
+                with device_api.stream(stream):
+                    device_payload = local_payload.to(device=device, non_blocking=True)
+                    dist.all_reduce(
+                        device_payload,
+                        op=dist.ReduceOp.SUM,
+                        group=self._pipeline_planner_group,
+                    )
+                    done_event = self._pipeline_stage_event()
+                    state.collective_done_event = done_event
+                state.collective_enqueued.set()
+                if done_event is not None:
+                    self._synchronize_pipeline_event(done_event.event)
+                else:
+                    stream.synchronize()
+                local_payload.copy_(device_payload.to(device="cpu"))
+            runtime.complete_collective(state.process_slot)
+        except BaseException as error:
+            state.collective_error = error
+            state.collective_enqueued.set()
+            runtime.complete_collective(state.process_slot)
+            raise
+        finally:
+            if collective_started is not None:
+                state.process_collective_active_ms = (time.perf_counter() - collective_started) * 1000.0
+
+    def _cpu_process_result(self, state: _CPUBatchedPlanState) -> _CPUBatchedPlanResult:
+        runtime = self._ensure_cpu_process_runtime()
+        completion = runtime.wait_result(state.process_slot)
+        if completion.source_step != state.source_step or completion.result is None:
+            raise RuntimeError("CPU planner process returned a stale or empty result.")
+        timing = completion.result.timing
+        active_ms = max(
+            0.0,
+            state.route_share_ms
+            + timing.total_ms
+            - timing.statistic_collective_ms
+            + state.process_collective_active_ms,
+        )
+        return _CPUBatchedPlanResult(
+            source_step=state.source_step,
+            placement_versions=state.placement_versions,
+            plans=completion.result.plans,
+            route_copy_ms=state.route_share_ms,
+            active_ms=active_ms,
+            latency_ms=(time.perf_counter() - state.submitted_at) * 1000.0,
+            timing=timing,
+        )
+
+    def _collect_cpu_process_plan(self, step: int) -> str:
+        blocking = self._cpu_planner_mode == "process_blocking"
+        blocking_started = time.perf_counter()
+        with self._pipeline_lock:
+            state = self._cpu_batch_state
+        if state is None and blocking:
+            state = self._submit_cpu_process_plan(step, background=False)
+        if state is None or state.source_step != int(step):
+            self.latest_pair = "none"
+            return self.latest_pair
+
+        wait_started = time.perf_counter()
+        if state.process_collective_future is None:
+            self._service_cpu_process_collective(state)
+        else:
+            state.process_collective_future.result()
+        result = self._cpu_process_result(state)
+        deadline_wait_ms = (time.perf_counter() - wait_started) * 1000.0
+        exposed_ms = (
+            (time.perf_counter() - blocking_started) * 1000.0
+            if blocking
+            else state.route_share_ms + state.collective_close_host_wait_ms + deadline_wait_ms
+        )
+        with self._pipeline_lock:
+            if self._cpu_batch_state is state:
+                self._cpu_batch_state = None
+        return self._accept_cpu_batched_result(state, result, exposed_ms=exposed_ms)
+
+    def _run_blocking_cpu_batched_plan(
+        self,
+        step: int,
+        layers: tuple[ExpertLayerState, ...],
+    ) -> tuple[_CPUBatchedPlanState, _CPUBatchedPlanResult]:
+        state = _CPUBatchedPlanState(
+            source_step=int(step),
+            placement_versions=tuple(int(layer.placement_version) for layer in layers),
+            submitted_at=time.perf_counter(),
+            background=False,
+        )
+        state.collective_gate.set()
+        routes = tuple(layer.latest_selected_experts.detach() for layer in layers)  # type: ignore[union-attr]
+        result = self._cpu_batched_plan_worker(
+            state,
+            layers,
+            routes,
+            tuple(self._layer_layout(layer).clone() for layer in layers),
+            tuple(layer.logical_to_physical.detach().cpu().clone() for layer in layers),
+            self._pipeline_ready_event(routes[-1].device),
+        )
+        return state, result
+
+    def _accept_cpu_batched_result(
+        self,
+        state: _CPUBatchedPlanState,
+        result: _CPUBatchedPlanResult,
+        *,
+        exposed_ms: float,
+    ) -> str:
+        order = self._pipeline_layer_order or tuple(self.layers)
+        if len(order) != len(result.plans):
+            raise RuntimeError("CPU planner returned a different number of layer plans.")
+        committed: list[str] = []
+        accepted = 0
+        for index, (layer_key, plan) in enumerate(zip(order, result.plans, strict=True)):
+            layer = self.layers[layer_key]
+            layer.last_plan = plan
+            self._record_plan_metrics(plan)
+            if result.source_step != state.source_step or result.placement_versions[index] != int(
+                layer.placement_version
+            ):
+                self._accumulate_metric("hiermoe/cpu_planner_stale", 1)
+            elif plan.actions:
+                self._pipeline_pending_plans[layer_key] = _PendingPipelinePlan(
+                    source_step=result.source_step,
+                    placement_version=result.placement_versions[index],
+                    plan=plan,
+                )
+                committed.extend(f"{layer_key}:{action.format()}" for action in plan.actions)
+                accepted += 1
+
+        timing = result.timing
+        collective_active_ms = (
+            state.process_collective_active_ms
+            if self._uses_cpu_process_planner()
+            else max(
+                0.0,
+                float(timing.statistic_collective_ms) - state.collective_gate_wait_ms,
+            )
+        )
+        self._accumulate_metric("hiermoe/cpu_planner_jobs", 1)
+        self._accumulate_metric("hiermoe/cpu_planner_layers", len(result.plans))
+        self._accumulate_metric("hiermoe/cpu_planner_accepted", accepted)
+        self._accumulate_metric("hiermoe/cpu_planner_route_copy_ms", result.route_copy_ms)
+        self._accumulate_metric("hiermoe/cpu_planner_active_ms", result.active_ms)
+        self._accumulate_metric("hiermoe/cpu_planner_latency_ms", result.latency_ms)
+        self._accumulate_metric("hiermoe/cpu_planner_exposed_ms", exposed_ms)
+        self._accumulate_metric("hiermoe/cpu_planner_context_ms", timing.context_ms)
+        self._accumulate_metric("hiermoe/cpu_planner_local_prepare_ms", timing.local_prepare_ms)
+        self._accumulate_metric("hiermoe/cpu_planner_statistic_pack_ms", timing.statistic_pack_ms)
+        self._accumulate_metric("hiermoe/cpu_planner_collective_ms", collective_active_ms)
+        self._accumulate_metric("hiermoe/cpu_planner_score_ms", timing.owner_score_ms)
+        self._accumulate_metric("hiermoe/cpu_planner_finalization_ms", timing.finalization_ms)
+        self._accumulate_metric("hiermoe/cpu_planner_payload_bytes", timing.local_payload_bytes)
+        self._accumulate_metric("hiermoe/cpu_planner_route_share_ms", state.route_share_ms)
+        self._accumulate_metric(
+            "hiermoe/cpu_planner_collective_ready_host_wait_ms",
+            state.collective_ready_host_wait_ms,
+        )
+        self._accumulate_metric(
+            "hiermoe/cpu_planner_collective_close_host_wait_ms",
+            state.collective_close_host_wait_ms,
+        )
+        if result.active_ms > 0.0:
+            self._placement_metrics["hiermoe/cpu_planner_hidden_ratio"] = max(
+                0.0,
+                min(1.0, 1.0 - exposed_ms / result.active_ms),
+            )
+        self.latest_pair = ",".join(committed) if committed else "none"
+        return self.latest_pair
+
+    def _collect_cpu_batched_plan(self, step: int) -> str:
+        if self._cpu_planner_mode == "blocking":
+            layers = self._cpu_batched_plan_layers(step)
+            if not layers:
+                self.latest_pair = "none"
+                return self.latest_pair
+            wait_started = time.perf_counter()
+            state, result = self._run_blocking_cpu_batched_plan(step, layers)
+            exposed_ms = (time.perf_counter() - wait_started) * 1000.0
+            return self._accept_cpu_batched_result(state, result, exposed_ms=exposed_ms)
+
+        with self._pipeline_lock:
+            state = self._cpu_batch_state
+        if state is None or state.source_step != int(step) or state.future is None:
+            self.latest_pair = "none"
+            return self.latest_pair
+        # Fallback for short/atypical backward graphs that did not reach the
+        # designated collective window.
+        state.collective_gate.set()
+        wait_started = time.perf_counter()
+        result = state.future.result()
+        deadline_wait_ms = (time.perf_counter() - wait_started) * 1000.0
+        exposed_ms = state.collective_ready_host_wait_ms + state.collective_close_host_wait_ms + deadline_wait_ms
+        with self._pipeline_lock:
+            if self._cpu_batch_state is state:
+                self._cpu_batch_state = None
+        return self._accept_cpu_batched_result(state, result, exposed_ms=exposed_ms)
 
     def _submit_pipeline_plan(
         self,
@@ -3047,6 +4090,11 @@ class ExpertSwapManager:
                 prepare_stage_callback=prepare_checkpoint,
             )[0]
             timing.score_end = self._pipeline_stage_event()
+            with self._pipeline_lock:
+                windows = self._pipeline_planner_windows.get(layer_key)
+                if windows is not None:
+                    windows.score_done_event = timing.score_end
+                    windows.score_done.set()
             return plan
 
         plan = self._run_pipeline_stream_task("planner", device, ready_event, run)
@@ -3082,30 +4130,20 @@ class ExpertSwapManager:
         device: torch.device,
         timing: _PipelinePlannerStageTiming | None = None,
     ) -> torch.Tensor:
-        """Confine the planner collective to the layer's expert-compute window."""
+        """Hand the reduction to the single ordered collective launcher."""
 
         if timing is not None:
             timing.prepare_end = self._pipeline_stage_event()
         with self._pipeline_lock:
             windows = self._pipeline_planner_windows[layer_key]
-        windows.collective_gate.wait()
-        with self._pipeline_lock:
-            dispatch_done = self._pipeline_planner_dispatch_events.get(layer_key)
+            windows.collective_tensor = tensor
+            windows.collective_device = device
+            windows.collective_timing = timing
+            windows.collective_tensor_ready.set()
+        windows.collective_result_ready.wait()
+        if windows.collective_error is not None:
+            raise windows.collective_error
         stream = self._pipeline_stream("planner", device)
-        if stream is not None and dispatch_done is not None:
-            stream.wait_event(dispatch_done)
-        if timing is not None:
-            timing.collective_start = self._pipeline_stage_event()
-        try:
-            reduced = self._planner_reduce_sum(tensor, self._pipeline_planner_group)
-            if timing is not None:
-                timing.collective_end = self._pipeline_stage_event()
-            if stream is not None:
-                stream.synchronize()
-        except BaseException:
-            windows.collective_done.set()
-            raise
-        windows.collective_done.set()
         windows.score_gate.wait()
         with self._pipeline_lock:
             compute_done = self._pipeline_planner_compute_events.get(layer_key)
@@ -3113,11 +4151,57 @@ class ExpertSwapManager:
             stream.wait_event(compute_done)
         if timing is not None:
             timing.score_start = self._pipeline_stage_event()
-        return reduced
+        return tensor
+
+    def _launch_pipeline_planner_collective(
+        self,
+        layer_key: str,
+        windows: _PipelinePlannerWindows,
+    ) -> None:
+        """Launch one layer's HCCL reduction from the globally ordered thread."""
+
+        self._wait_pipeline_host_event(layer_key, windows.collective_tensor_ready)
+        with self._pipeline_lock:
+            if self._pipeline_planner_windows.get(layer_key) is not windows:
+                return
+            tensor = windows.collective_tensor
+            device = windows.collective_device
+            timing = windows.collective_timing
+            dispatch_done = self._pipeline_planner_dispatch_events.get(layer_key)
+        if tensor is None or device is None:
+            windows.collective_done.set()
+            windows.collective_result_ready.set()
+            return
+        if device.type == "cpu":
+            stream = None
+            stream_context = nullcontext()
+        else:
+            device_api = get_torch_device()
+            device_api.set_device(device)
+            stream = self._pipeline_stream("planner", device)
+            stream_context = device_api.stream(stream)
+        try:
+            with stream_context:
+                if stream is not None and dispatch_done is not None:
+                    stream.wait_event(dispatch_done)
+                if timing is not None:
+                    timing.collective_start = self._pipeline_stage_event()
+                self._planner_reduce_sum(tensor, self._pipeline_planner_group)
+                if timing is not None:
+                    timing.collective_end = self._pipeline_stage_event()
+            with self._pipeline_lock:
+                if self._pipeline_planner_windows.get(layer_key) is windows:
+                    windows.collective_done_event = None if timing is None else timing.collective_end
+        except BaseException as error:
+            windows.collective_error = error
+            raise
+        finally:
+            windows.collective_done.set()
+            windows.collective_result_ready.set()
 
     @staticmethod
     def _wait_pipeline_stage(event: Event, future: Future[Any]) -> None:
-        while not event.wait(timeout=0.001):
+        while not event.wait(timeout=_PIPELINE_HOST_EVENT_POLL_SECONDS):
             if future.done():
                 future.result()
 
@@ -3125,6 +4209,41 @@ class ExpertSwapManager:
         """Run the planner collective after combine backward and during expert GEMM."""
 
         if not self.fixed_pipeline_overlap:
+            return
+        if self._cpu_planner_mode == "process_background":
+            order = self._pipeline_layer_order or tuple(self.layers)
+            if not order or layer_key != order[0]:
+                return
+            with self._pipeline_lock:
+                state = self._cpu_batch_state
+            if state is None or state.source_step != self._pipeline_step:
+                return
+            executor = self._pipeline_collective_executor
+            if executor is None:
+                raise RuntimeError("CPU planner process collective executor is unavailable.")
+            with self._pipeline_lock:
+                if state.process_collective_future is None:
+                    state.process_collective_future = executor.submit(
+                        self._service_cpu_process_collective,
+                        state,
+                    )
+            return
+        if self._cpu_planner_mode == "background":
+            order = self._pipeline_layer_order or tuple(self.layers)
+            if not order or layer_key != order[0]:
+                return
+            with self._pipeline_lock:
+                state = self._cpu_batch_state
+            if state is None or state.source_step != self._pipeline_step or state.future is None:
+                return
+            wait_started = time.perf_counter()
+            while not state.collective_ready.wait(timeout=_PIPELINE_HOST_EVENT_POLL_SECONDS):
+                if state.future.done():
+                    state.future.result()
+                if self._pipeline_shutdown:
+                    return
+            state.collective_ready_host_wait_ms += (time.perf_counter() - wait_started) * 1000.0
+            state.collective_gate.set()
             return
         layer = self.layers.get(layer_key)
         combine_done = None if layer is None else self._pipeline_ready_event(self._pipeline_device(layer))
@@ -3134,24 +4253,108 @@ class ExpertSwapManager:
                 self._pipeline_planner_dispatch_events[layer_key] = combine_done
         if windows is not None:
             windows.collective_gate.set()
+            executor = self._pipeline_collective_executor
+            if executor is None:
+                raise RuntimeError("HierMoE pipeline collective executor is unavailable.")
+            with self._pipeline_lock:
+                if windows.collective_future is None:
+                    windows.collective_future = executor.submit(
+                        self._launch_pipeline_planner_collective,
+                        layer_key,
+                        windows,
+                    )
 
     def close_pipeline_planner_collective_window(self, layer_key: str) -> None:
         """Enforce collective completion before dispatch-backward uses the EP communicator."""
 
         if not self.fixed_pipeline_overlap:
             return
+        if self._cpu_planner_mode == "process_background":
+            order = self._pipeline_layer_order or tuple(self.layers)
+            if not order or layer_key != order[0]:
+                return
+            with self._pipeline_lock:
+                state = self._cpu_batch_state
+            if state is None or state.source_step != self._pipeline_step:
+                return
+            wait_started = time.perf_counter()
+            while not state.collective_enqueued.wait(timeout=_PIPELINE_HOST_EVENT_POLL_SECONDS):
+                future = state.process_collective_future
+                if future is not None and future.done():
+                    future.result()
+                if self._pipeline_shutdown:
+                    return
+            state.collective_close_host_wait_ms += (time.perf_counter() - wait_started) * 1000.0
+            if state.collective_error is not None:
+                raise state.collective_error
+            done_event = state.collective_done_event
+            layer = self.layers.get(layer_key)
+            if layer is not None and done_event is not None and done_event.event is not None:
+                device = self._pipeline_device(layer)
+                if device.type != "cpu":
+                    device_api = get_torch_device()
+                    try:
+                        current_stream = device_api.current_stream(device)
+                    except TypeError:
+                        current_stream = device_api.current_stream()
+                    current_stream.wait_event(done_event.event)
+            return
+        if self._cpu_planner_mode == "background":
+            order = self._pipeline_layer_order or tuple(self.layers)
+            if not order or layer_key != order[0]:
+                return
+            with self._pipeline_lock:
+                state = self._cpu_batch_state
+            if state is None or state.source_step != self._pipeline_step or state.future is None:
+                return
+            wait_started = time.perf_counter()
+            while not state.collective_enqueued.wait(timeout=_PIPELINE_HOST_EVENT_POLL_SECONDS):
+                if state.future.done():
+                    state.future.result()
+                if self._pipeline_shutdown:
+                    return
+            state.collective_close_host_wait_ms += (time.perf_counter() - wait_started) * 1000.0
+            if state.collective_error is not None:
+                raise state.collective_error
+            done_event = state.collective_done_event
+            layer = self.layers.get(layer_key)
+            if layer is not None and done_event is not None and done_event.event is not None:
+                device = self._pipeline_device(layer)
+                if device.type != "cpu":
+                    device_api = get_torch_device()
+                    try:
+                        current_stream = device_api.current_stream(device)
+                    except TypeError:
+                        current_stream = device_api.current_stream()
+                    current_stream.wait_event(done_event.event)
+            return
         with self._pipeline_lock:
             windows = self._pipeline_planner_windows.get(layer_key)
             future = self._pipeline_plan_futures.get(layer_key)
         if windows is None or future is None:
             return
+        deadline_event = self._pipeline_stage_event()
         wait_started = time.perf_counter()
         self._wait_pipeline_stage(windows.collective_done, future)
-        exposed_ms = (time.perf_counter() - wait_started) * 1000.0
-        self._accumulate_metric("hiermoe/pipeline_planner_collective_exposed_ms", exposed_ms)
-        self._accumulate_metric("hiermoe/pipeline_planner_exposed_ms", exposed_ms)
-        if exposed_ms > 0.01:
-            self._accumulate_metric("hiermoe/pipeline_planner_collective_window_miss", 1)
+        host_wait_ms = (time.perf_counter() - wait_started) * 1000.0
+        with self._pipeline_lock:
+            if self._pipeline_planner_windows.get(layer_key) is windows:
+                windows.collective_deadline_event = deadline_event
+                done_event = windows.collective_done_event
+            else:
+                done_event = None
+        layer = self.layers.get(layer_key)
+        if layer is not None and done_event is not None and done_event.event is not None:
+            device = self._pipeline_device(layer)
+            device_api = get_torch_device()
+            try:
+                current_stream = device_api.current_stream(device)
+            except TypeError:
+                current_stream = device_api.current_stream()
+            current_stream.wait_event(done_event.event)
+        self._accumulate_metric("hiermoe/pipeline_planner_collective_host_gate_wait_ms", host_wait_ms)
+        if host_wait_ms > 0.01:
+            self._accumulate_metric("hiermoe/pipeline_planner_collective_host_gate_miss", 1)
 
     def open_pipeline_planner_score_window(self, layer_key: str) -> None:
         """Run candidate scoring during dispatch-backward Stage1 payload A2A."""
@@ -3171,21 +4374,25 @@ class ExpertSwapManager:
         windows.score_gate.set()
 
     def close_pipeline_planner_score_window(self, layer_key: str) -> None:
-        """Keep scoring out of dispatch-backward local routing work."""
+        """Record the preferred score window without adding a layer barrier.
+
+        Candidate scoring only consumes the previous step's route and its
+        correctness deadline is the next-step plan collection.  Waiting here
+        would turn every layer's short A2A window into a host barrier and
+        prevent the planner queue from carrying unfinished C4 work diagonally
+        across later layers.
+        """
 
         if not self.fixed_pipeline_overlap:
             return
         with self._pipeline_lock:
-            future = self._pipeline_plan_futures.get(layer_key)
-        if future is None:
+            windows = self._pipeline_planner_windows.get(layer_key)
+        if windows is None:
             return
-        wait_started = time.perf_counter()
-        future.result()
-        exposed_ms = (time.perf_counter() - wait_started) * 1000.0
-        self._accumulate_metric("hiermoe/pipeline_planner_score_exposed_ms", exposed_ms)
-        self._accumulate_metric("hiermoe/pipeline_planner_exposed_ms", exposed_ms)
-        if exposed_ms > 0.01:
-            self._accumulate_metric("hiermoe/pipeline_planner_score_window_miss", 1)
+        deadline_event = self._pipeline_stage_event()
+        with self._pipeline_lock:
+            if self._pipeline_planner_windows.get(layer_key) is windows:
+                windows.score_deadline_event = deadline_event
 
     def _collect_pipeline_plans(self, step: int) -> str:
         with self._pipeline_lock:
@@ -3198,7 +4405,12 @@ class ExpertSwapManager:
         raw_ms = 0.0
         deadline_exposed_ms = 0.0
         prepare_exposed_ms = 0.0
+        collective_exposed_ms = 0.0
+        score_exposed_ms = 0.0
+        score_window_overrun_ms = 0.0
         prepare_window_exposed_ms = [0.0] * len(_PIPELINE_PREPARE_CUT_POINTS)
+        collective_window_misses = 0
+        score_window_misses = 0
         deadline_misses = 0
         latency_ms = 0.0
         prepare_device_ms = 0.0
@@ -3222,6 +4434,18 @@ class ExpertSwapManager:
                 prepare_exposed_ms += layer_prepare_exposed_ms
                 for window_index, value in enumerate(per_window):
                     prepare_window_exposed_ms[window_index] += value
+                layer_collective_exposed_ms = self._pipeline_stage_exposure_ms(
+                    windows.collective_deadline_event,
+                    windows.collective_done_event,
+                )
+                layer_score_window_overrun_ms = self._pipeline_stage_exposure_ms(
+                    windows.score_deadline_event,
+                    windows.score_done_event,
+                )
+                collective_exposed_ms += layer_collective_exposed_ms
+                score_window_overrun_ms += layer_score_window_overrun_ms
+                collective_window_misses += int(layer_collective_exposed_ms > 0.01)
+                score_window_misses += int(layer_score_window_overrun_ms > 0.01)
             raw_ms += result.raw_ms
             latency_ms += result.latency_ms
             prepare_device_ms += result.prepare_device_ms
@@ -3272,6 +4496,11 @@ class ExpertSwapManager:
                 prepare_substage_thread_cpu_ms[stage],
             )
         self._accumulate_metric("hiermoe/pipeline_planner_prepare_exposed_ms", prepare_exposed_ms)
+        self._accumulate_metric("hiermoe/pipeline_planner_collective_exposed_ms", collective_exposed_ms)
+        self._accumulate_metric("hiermoe/pipeline_planner_score_window_overrun_ms", score_window_overrun_ms)
+        self._accumulate_metric("hiermoe/pipeline_planner_score_exposed_ms", score_exposed_ms)
+        self._accumulate_metric("hiermoe/pipeline_planner_collective_window_miss", collective_window_misses)
+        self._accumulate_metric("hiermoe/pipeline_planner_score_window_miss", score_window_misses)
         for window_index, value in enumerate(prepare_window_exposed_ms):
             self._accumulate_metric(
                 f"hiermoe/pipeline_planner_prepare_window_{window_index}_exposed_ms",
@@ -3281,7 +4510,7 @@ class ExpertSwapManager:
         self._accumulate_metric("hiermoe/pipeline_planner_deadline_miss", deadline_misses)
         self._accumulate_metric(
             "hiermoe/pipeline_planner_exposed_ms",
-            prepare_exposed_ms + deadline_exposed_ms,
+            prepare_exposed_ms + collective_exposed_ms + score_exposed_ms + deadline_exposed_ms,
         )
         exposed_total = float(self._placement_metrics.get("hiermoe/pipeline_planner_exposed_ms", 0.0))
         if raw_ms > 0.0:
@@ -3377,7 +4606,7 @@ class ExpertSwapManager:
         return True
 
     def advance_pipeline_after_combine(self, _layer_key: str) -> None:
-        if not self.fixed_pipeline_overlap:
+        if not self.fixed_pipeline_overlap or self._ablation_migration_mode != "hidden":
             return
         # Candidate scoring is a compute-only stage whose deadline is the next
         # step, not the end of the current layer. Let the single planner queue
@@ -3393,6 +4622,18 @@ class ExpertSwapManager:
     def wait_pipeline_migration_before_layer(self, layer_key: str) -> None:
         if not self.fixed_pipeline_overlap or layer_key not in self._pipeline_pending_plans:
             return
+        if self._ablation_migration_mode == "blocking":
+            pending = self._pipeline_pending_plans[layer_key]
+            result = self._pipeline_migration_worker(layer_key, pending, None)
+            with self._pipeline_lock:
+                self._pipeline_pending_plans.pop(layer_key, None)
+            self._accumulate_metric("hiermoe/pipeline_migration_jobs", 1)
+            self._accumulate_metric("hiermoe/pipeline_migration_raw_ms", result.raw_ms)
+            self._accumulate_metric("hiermoe/pipeline_migration_exposed_ms", result.raw_ms)
+            self._placement_metrics["hiermoe/pipeline_migration_hidden_ratio"] = 0.0
+            if result.raw_ms > 0.01:
+                self._accumulate_metric("hiermoe/pipeline_migration_deadline_miss", 1)
+            return
         while layer_key in self._pipeline_pending_plans:
             with self._pipeline_lock:
                 active = tuple(self._pipeline_migration_futures)
@@ -3402,7 +4643,7 @@ class ExpertSwapManager:
             self._finish_pipeline_migration(active[0], wait=True)
 
     def _register_pipeline_gradient_hooks(self, layer: ExpertLayerState) -> None:
-        if not self.fixed_pipeline_overlap:
+        if not self.fixed_pipeline_overlap or self._ablation_grad_mode != "hidden":
             return
         for param_index, param in enumerate((layer.gate_up_proj, layer.down_proj)):
             if id(param) in self._pipeline_grad_hook_params:
@@ -3439,7 +4680,12 @@ class ExpertSwapManager:
         param_index: int,
         ready_event: Any | None = None,
     ) -> None:
-        if not self.fixed_pipeline_overlap or self._pipeline_shutdown or not self._pipeline_is_final_microstep():
+        if (
+            not self.fixed_pipeline_overlap
+            or self._ablation_grad_mode != "hidden"
+            or self._pipeline_shutdown
+            or not self._pipeline_is_final_microstep()
+        ):
             return
         with self._pipeline_lock:
             index = int(param_index)
@@ -3472,7 +4718,11 @@ class ExpertSwapManager:
     def close_pipeline_gradient_window_before_dispatch(self, _layer_key: str) -> None:
         """Drain background gradient communication before training dispatch backward."""
 
-        if not self.fixed_pipeline_overlap or not self._pipeline_is_final_microstep():
+        if (
+            not self.fixed_pipeline_overlap
+            or self._ablation_grad_mode != "hidden"
+            or not self._pipeline_is_final_microstep()
+        ):
             return
         with self._pipeline_grad_submit_lock:
             with self._pipeline_lock:
@@ -3497,7 +4747,11 @@ class ExpertSwapManager:
     def open_pipeline_gradient_window_after_dispatch(self, layer_key: str) -> None:
         """Admit this layer's redundant-gradient sync after dispatch backward."""
 
-        if not self.fixed_pipeline_overlap or not self._pipeline_is_final_microstep():
+        if (
+            not self.fixed_pipeline_overlap
+            or self._ablation_grad_mode != "hidden"
+            or not self._pipeline_is_final_microstep()
+        ):
             return
         with self._pipeline_grad_submit_lock:
             with self._pipeline_lock:
@@ -3618,12 +4872,18 @@ class ExpertSwapManager:
         self._pipeline_shutdown = True
         with self._pipeline_lock:
             windows = tuple(self._pipeline_planner_windows.values())
+            cpu_state = self._cpu_batch_state
+        if cpu_state is not None:
+            cpu_state.collective_gate.set()
         for window in windows:
             for gate in window.prepare_gates:
                 gate.set()
             for enqueued in window.prepare_enqueued:
                 enqueued.set()
             window.collective_gate.set()
+            if window.collective_future is None:
+                window.collective_done.set()
+                window.collective_result_ready.set()
             window.score_gate.set()
         for future in tuple(self._pipeline_plan_futures.values()):
             future.result()
@@ -3631,15 +4891,25 @@ class ExpertSwapManager:
             future.result()
         for future in tuple(self._pipeline_grad_futures.values()):
             future.result()
+        if cpu_state is not None and cpu_state.future is not None:
+            cpu_state.future.result()
+        if self._cpu_process_runtime is not None:
+            self._cpu_process_runtime.close()
+            self._cpu_process_runtime = None
         for handle in self._pipeline_grad_hook_handles:
             handle.remove()
         for executor in (
             self._pipeline_plan_executor,
+            self._pipeline_collective_executor,
             self._pipeline_migration_executor,
             self._pipeline_grad_executor,
+            self._cpu_plan_executor,
         ):
             if executor is not None:
                 executor.shutdown(wait=True, cancel_futures=False)
+
+    def destroy_pipeline_process_groups(self) -> None:
+        """No-op while all fixed-pipeline communication reuses the EP group."""
 
     def bind_optimizer(self, optimizer: Any) -> None:
         self.optimizer = optimizer
@@ -3774,6 +5044,8 @@ class ExpertSwapManager:
                 self.register_layer(key, module)
         if _FIXED_R2_LAYOUT:
             self.install_fixed_r2_layout()
+        if self._ablation_replay_mode == "static":
+            self._install_static_ablation_layout()
         if self._pending_state is not None:
             self.load_state_dict(self._pending_state)
             self._pending_state = None
@@ -3815,10 +5087,15 @@ class ExpertSwapManager:
             target_layout = torch.full((layer.num_physical_slots,), -1, dtype=torch.long)
             target_layout[first_slots] = logical
             target_layout[second_slots] = logical
+            source_route_lut = first_slots.view(1, -1).expand(self.ep_size, -1).clone()
+            source_route_lut[half_ep:] = second_slots
 
             current_layout = layer.slot_to_logical.detach().cpu()
             if torch.equal(current_layout, target_layout):
                 self._refresh_layer_mapping_from_slots(layer, tuple(int(slot) for slot in first_slots.tolist()))
+                if self._forward_reuse_cover_patch_remap:
+                    layer.source_logical_to_physical = source_route_lut
+                    layer._device_source_mapping_cache.clear()
                 layer.fixed_r2_layout = True
                 continue
 
@@ -3858,6 +5135,9 @@ class ExpertSwapManager:
             layer.active_quota_policy = ()
             layer.pending_physical_routes = None
             layer.pending_route_data_ptr = 0
+            if self._forward_reuse_cover_patch_remap:
+                layer.source_logical_to_physical = source_route_lut
+                layer._device_source_mapping_cache.clear()
             layer.fixed_r2_layout = True
 
         logger.info_rank0("HierMoE installed the fixed R2 layout for %s layer(s).", len(self.layers))
@@ -4051,6 +5331,10 @@ class ExpertSwapManager:
         del chosen, redundant_groups
         if layer.slot_to_logical is None:
             raise RuntimeError(f"HierMoE layer {layer.key} has no physical slot layout.")
+        if self._forward_reuse_cover_patch_remap and layer.source_logical_to_physical is not None:
+            mapping = layer.source_mapping_for_device(selected.device, self.ep_rank)
+            physical = mapping.index_select(0, selected.reshape(-1)).view_as(selected)
+            return physical.squeeze(-1) if original_ndim == 1 else physical
         if layer.active_quota_policy:
             mapping = assign_tokens_to_copies_with_quota(
                 selected,
@@ -4065,6 +5349,15 @@ class ExpertSwapManager:
             )
             physical = mapping.physical_slots
             return physical.squeeze(-1) if original_ndim == 1 else physical
+        copy_slots, copy_mask = layer.copy_slots_for_device(selected.device)
+        if layer.fixed_r2_layout and _FORCE_FIXED_R2_MIRRORED_REMAP:
+            physical = assign_tokens_to_mirrored_r2(
+                selected,
+                copy_slots,
+                source_ranks=self.ep_rank,
+                num_ranks=self.ep_size,
+            )
+            return physical.squeeze(-1) if original_ndim == 1 else physical
         if self.expert_swap_selector == "hiermoe_greedy_cover_p1":
             physical = assign_tokens_to_copies_greedy(
                 selected,
@@ -4078,7 +5371,6 @@ class ExpertSwapManager:
                 max_copies=self.greedy_max_copies_per_expert,
             )
             return physical.squeeze(-1) if original_ndim == 1 else physical
-        copy_slots, copy_mask = layer.copy_slots_for_device(selected.device)
         if layer.fixed_r2_layout:
             physical = assign_tokens_to_mirrored_r2(
                 selected,
@@ -4119,8 +5411,29 @@ class ExpertSwapManager:
             layer.latest_route_step = int(step)
         layer.latest_hidden_size = int(hidden_size)
         layer.latest_bytes_per_element = int(bytes_per_element)
-        if self.fixed_pipeline_overlap and step is not None:
-            self._submit_pipeline_plan(layer, selected_experts, int(step))
+        if (
+            self.fixed_pipeline_overlap
+            and self._ablation_replay_mode == "off"
+            and not self._npu_layer_owner_blocking
+            and self._online_freeze_cost_mode == "off"
+            and not self._forward_reuse_cover
+            and step is not None
+        ):
+            if self._cpu_planner_mode == "background":
+                self._submit_cpu_batched_plan(int(step))
+            elif self._cpu_planner_mode == "process_background":
+                self._submit_cpu_process_plan(int(step), background=True)
+            elif self._cpu_planner_mode == "off":
+                self._submit_pipeline_plan(layer, selected_experts, int(step))
+
+    def record_forward_physical_routes(self, layer_key: str, physical_routes: torch.Tensor) -> None:
+        """Keep the physical routes already consumed by the trainable Forward."""
+
+        if not self._forward_reuse_cover and not self._cost_model_verify:
+            return
+        layer = self.layers.get(layer_key)
+        if layer is not None:
+            layer.latest_physical_routes = physical_routes.detach()
 
     def mark_route_step(self, layer_key: str, step: int) -> None:
         layer = self.layers.get(layer_key)
@@ -4156,6 +5469,7 @@ class ExpertSwapManager:
         combine_start: AcceleratorEvent,
         combine_end: AcceleratorEvent,
         selected_dim: int | None = None,
+        communication_events: dict[str, tuple[AcceleratorEvent, AcceleratorEvent]] | None = None,
     ) -> None:
         del selected_dim
         layer = self.layers.get(layer_key)
@@ -4167,7 +5481,7 @@ class ExpertSwapManager:
             layout.scatter_(0, layer.logical_to_physical.to(torch.long), logical)
         else:
             layout = layer.slot_to_logical.detach().cpu().clone()
-        layer.pending_timing = _PendingLayerTiming(
+        timing = _PendingLayerTiming(
             step=int(step),
             selected_experts=selected_experts.detach(),
             slot_to_logical=layout,
@@ -4179,6 +5493,30 @@ class ExpertSwapManager:
             combine_start=combine_start,
             combine_end=combine_end,
         )
+        layer.pending_timing = timing
+        if self._cost_model_verify and int(step) in {
+            int(self._online_freeze_calibration_step),
+            int(self._online_freeze_calibration_step) + 1,
+        }:
+            physical_routes = layer.latest_physical_routes
+            if physical_routes is None or physical_routes.shape != selected_experts.shape:
+                raise RuntimeError(
+                    f"Cost-model verification did not capture the Forward physical routes for {layer_key}."
+                )
+            layer.cost_model_timings.append(
+                _CostModelTiming(
+                    step=int(step),
+                    physical_routes=physical_routes.detach(),
+                    local_assignment_count=tokens_per_local_expert.detach().sum().to(dtype=torch.float32),
+                    communication_events=communication_events,
+                    dispatch_start=dispatch_start,
+                    dispatch_end=dispatch_end,
+                    compute_start=compute_start,
+                    compute_end=compute_end,
+                    combine_start=combine_start,
+                    combine_end=combine_end,
+                )
+            )
 
     def record_local_expert_token_counts(self, layer_key: str, tokens_per_local_expert: torch.Tensor) -> None:
         layer = self.layers.get(layer_key)
@@ -4187,6 +5525,8 @@ class ExpertSwapManager:
         counts = tokens_per_local_expert.detach()
         if counts.ndim != 1 or int(counts.numel()) != int(layer.num_local_experts):
             return
+        if self._forward_reuse_cover:
+            layer.latest_tokens_per_local_expert = counts
         if layer.accumulated_tokens_per_local_expert is None:
             layer.accumulated_tokens_per_local_expert = counts.clone()
         else:
@@ -5097,10 +6437,12 @@ class ExpertSwapManager:
 
     @torch.no_grad()
     def sync_redundant_gradients(self) -> None:
-        if self.fixed_pipeline_overlap:
+        if self.fixed_pipeline_overlap and self._ablation_grad_mode == "hidden":
             with _full_timing_range("hiermoe_redundant_grad_sync_deadline"):
                 self._finish_pipeline_gradient_sync()
             return
+        started = time.perf_counter()
+        jobs = 0
         with _full_timing_range("hiermoe_redundant_grad_sync"):
             self._zero_inactive_slot_grads()
             self._debug_log_redundant_copy_stats("before_grad_sync", include_grads=True)
@@ -5110,6 +6452,7 @@ class ExpertSwapManager:
                 schedule = self._replica_grad_schedule_for_layer(layer)
                 if not schedule.groups:
                     continue
+                jobs += 1
                 contributions = self._replica_grad_contributions(layer, schedule)
                 if schedule.pairwise:
                     self._sync_pairwise_replica_gradients(schedule, contributions)
@@ -5117,6 +6460,15 @@ class ExpertSwapManager:
                     self._sync_owner_replica_gradients(schedule, contributions)
             self._debug_log_redundant_copy_stats("after_grad_sync", include_grads=True)
             self._clear_accumulated_token_counts()
+        if self.fixed_pipeline_overlap:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            self._accumulate_metric("hiermoe/pipeline_grad_sync_jobs", jobs)
+            self._accumulate_metric("hiermoe/pipeline_grad_sync_raw_ms", elapsed_ms)
+            self._accumulate_metric("hiermoe/pipeline_grad_sync_deadline_exposed_ms", elapsed_ms)
+            self._accumulate_metric("hiermoe/pipeline_grad_sync_exposed_ms", elapsed_ms)
+            self._placement_metrics["hiermoe/pipeline_grad_sync_hidden_ratio"] = 0.0
+            if elapsed_ms > 0.01:
+                self._accumulate_metric("hiermoe/pipeline_grad_sync_deadline_miss", 1)
 
     def redundant_grad_norm_masks(self) -> dict[int, torch.Tensor]:
         masks: dict[int, torch.Tensor] = {}
@@ -5299,6 +6651,727 @@ class ExpertSwapManager:
             key=lambda row: float(torch.square(row[0] * x + row[1] - y).sum().item()),
         )
 
+    @staticmethod
+    def _fit_positive_through_origin(samples: Sequence[tuple[float, float]]) -> float:
+        """Fit y = slope * x through the origin with a non-negative slope."""
+
+        finite = [(x, y) for x, y in samples if math.isfinite(x) and math.isfinite(y) and x > 0.0 and y >= 0.0]
+        if not finite:
+            return 0.0
+        x = torch.tensor([row[0] for row in finite], dtype=torch.float64)
+        y = torch.tensor([row[1] for row in finite], dtype=torch.float64)
+        denominator = float(torch.dot(x, x).item())
+        if denominator <= 0.0:
+            return 0.0
+        return max(0.0, float(torch.dot(x, y).item()) / denominator)
+
+    @staticmethod
+    def _fit_nonnegative_linear_model(
+        feature_rows: Sequence[Sequence[float]],
+        targets: Sequence[float],
+    ) -> tuple[tuple[float, ...], float]:
+        """Fit a small non-negative affine model by enumerating active sets."""
+
+        if len(feature_rows) != len(targets) or not feature_rows:
+            raise ValueError("Linear cost-model fitting requires non-empty paired samples.")
+        feature_count = len(feature_rows[0])
+        if feature_count <= 0 or any(len(row) != feature_count for row in feature_rows):
+            raise ValueError("Linear cost-model feature rows must have one consistent non-zero width.")
+        finite_rows = [
+            (tuple(float(value) for value in row), float(target))
+            for row, target in zip(feature_rows, targets, strict=True)
+            if all(math.isfinite(float(value)) and float(value) >= 0.0 for value in row)
+            and math.isfinite(float(target))
+            and float(target) >= 0.0
+        ]
+        if not finite_rows:
+            return tuple(0.0 for _ in range(feature_count)), 0.0
+        x = torch.tensor([row for row, _target in finite_rows], dtype=torch.float64)
+        y = torch.tensor([target for _row, target in finite_rows], dtype=torch.float64)
+        best: tuple[float, tuple[float, ...], float] | None = None
+        # With at most three physical features, exact active-set enumeration is
+        # deterministic and avoids introducing a SciPy dependency.
+        for mask in range(1 << feature_count):
+            active = [index for index in range(feature_count) if mask & (1 << index)]
+            for use_intercept in (False, True):
+                columns = [x[:, index] for index in active]
+                if use_intercept:
+                    columns.append(torch.ones_like(y))
+                if columns:
+                    design = torch.stack(columns, dim=1)
+                    solution = torch.linalg.lstsq(design, y).solution
+                    if bool((solution < 0.0).any().item()):
+                        continue
+                    fitted = design @ solution
+                else:
+                    solution = torch.empty((0,), dtype=torch.float64)
+                    fitted = torch.zeros_like(y)
+                coefficients = [0.0 for _ in range(feature_count)]
+                for position, feature_index in enumerate(active):
+                    coefficients[feature_index] = float(solution[position].item())
+                intercept = float(solution[-1].item()) if use_intercept else 0.0
+                error = float(torch.square(fitted - y).sum().item())
+                candidate = (error, tuple(coefficients), intercept)
+                if best is None or candidate[0] < best[0]:
+                    best = candidate
+        assert best is not None
+        return best[1], best[2]
+
+    @staticmethod
+    def _predict_linear_model(
+        feature_rows: Sequence[Sequence[float]],
+        coefficients: Sequence[float],
+        intercept: float,
+    ) -> list[float]:
+        return [
+            float(intercept)
+            + sum(
+                float(coefficient) * float(value)
+                for coefficient, value in zip(coefficients, row, strict=True)
+            )
+            for row in feature_rows
+        ]
+
+    @staticmethod
+    def _cost_model_diagnostics(
+        actual_values: Sequence[float],
+        predicted_values: Sequence[float],
+    ) -> dict[str, float]:
+        """Return deterministic regression diagnostics for one modeled phase."""
+
+        actual = torch.tensor(tuple(actual_values), dtype=torch.float64)
+        predicted = torch.tensor(tuple(predicted_values), dtype=torch.float64)
+        if actual.numel() == 0 or actual.shape != predicted.shape:
+            raise ValueError("Cost-model diagnostics require non-empty paired samples.")
+        residual = predicted - actual
+        squared_error = torch.square(residual)
+        centered = actual - actual.mean()
+        total_variance = float(torch.square(centered).sum().item())
+        r_squared = 1.0 - float(squared_error.sum().item()) / total_variance if total_variance > 0.0 else float("nan")
+        relative = residual.abs() / actual.abs().clamp_min(1.0e-6)
+        return {
+            "r_squared": r_squared,
+            "mape_percent": float(relative.mean().item()) * 100.0,
+            "rmse_ms": float(torch.sqrt(squared_error.mean()).item()),
+            "max_abs_error_ms": float(residual.abs().max().item()),
+            "actual_min_ms": float(actual.min().item()),
+            "actual_max_ms": float(actual.max().item()),
+            "actual_mean_ms": float(actual.mean().item()),
+            "predicted_min_ms": float(predicted.min().item()),
+            "predicted_max_ms": float(predicted.max().item()),
+            "predicted_mean_ms": float(predicted.mean().item()),
+        }
+
+    @torch.no_grad()
+    def _cost_model_step_observations(
+        self,
+        layers: Sequence[ExpertLayerState],
+        *,
+        step: int,
+    ) -> dict[str, Any]:
+        """Aggregate exact Forward-route features and measured NPU times."""
+
+        ordered_layers = sorted(layers, key=lambda value: value.key)
+        if not ordered_layers:
+            raise RuntimeError("Cost-model verification requires registered expert layers.")
+        common_device = _local_tensor_view(ordered_layers[0].gate_up_proj).device
+        local_sample_counts = torch.tensor(
+            [sum(int(timing.step) == int(step) for timing in layer.cost_model_timings) for layer in ordered_layers],
+            dtype=torch.int64,
+            device=common_device,
+        )
+        if self.ep_group is not None and self.ep_size > 1:
+            gathered_counts = torch.empty(
+                (self.ep_size * len(ordered_layers),),
+                dtype=local_sample_counts.dtype,
+                device=common_device,
+            )
+            dist.all_gather_into_tensor(gathered_counts, local_sample_counts, group=self.ep_group)
+            gathered_counts = gathered_counts.view(self.ep_size, len(ordered_layers))
+        else:
+            gathered_counts = local_sample_counts.view(1, -1)
+        if bool((gathered_counts != gathered_counts[0]).any().item()):
+            raise RuntimeError(
+                f"Cost-model verification sample counts differ across EP ranks at step {step}: "
+                f"{gathered_counts.detach().cpu().tolist()}."
+            )
+        if bool((local_sample_counts <= 0).any().item()):
+            raise RuntimeError(
+                f"Cost-model verification has missing layer samples at step {step}: "
+                f"{local_sample_counts.detach().cpu().tolist()}."
+            )
+
+        synchronize()
+        local_packed_rows: list[torch.Tensor] = []
+        local_assignment_packed_rows: list[torch.Tensor] = []
+        local_timing_rows: list[tuple[float, ...]] = []
+        layer_row_ranges: list[tuple[GreedyCommunicationPlanner, int, int]] = []
+        row_start = 0
+        communication_event_names = (
+            "stage1_a2a",
+            "stage2_a2a",
+            "combine_stage2_a2a",
+            "combine_stage1_a2a",
+        )
+        for layer in ordered_layers:
+            timings = [timing for timing in layer.cost_model_timings if int(timing.step) == int(step)]
+            if not all(
+                timing.dispatch_start.elapsed_time(timing.dispatch_end) >= 0.0
+                and timing.compute_start.elapsed_time(timing.compute_end) >= 0.0
+                and timing.combine_start.elapsed_time(timing.combine_end) >= 0.0
+                for timing in timings
+            ):
+                raise RuntimeError(f"Cost-model verification found an invalid timing event in {layer.key}.")
+            planner = self._planner_for_layer(
+                layer,
+                communication_scale=1.0,
+                forward_compute_per_assignment=0.0,
+                forward_compute_constant=0.0,
+            )
+            if not isinstance(planner, GreedyCommunicationPlanner):
+                raise RuntimeError("Cost-model verification requires GreedyCommunicationPlanner.")
+            routes = [timing.physical_routes for timing in timings]
+            if all(route.shape == routes[0].shape for route in routes):
+                stacked_routes = torch.stack(routes, dim=0)
+                packed = planner._local_packed_counts(stacked_routes)
+                assignment_packed = planner._local_packed_assignment_counts(stacked_routes)
+            else:
+                packed = torch.cat([planner._local_packed_counts(route) for route in routes], dim=0)
+                assignment_packed = torch.cat(
+                    [planner._local_packed_assignment_counts(route) for route in routes],
+                    dim=0,
+                )
+            local_packed_rows.append(packed)
+            local_assignment_packed_rows.append(assignment_packed)
+            for timing in timings:
+                stage_times = [-1.0 for _ in communication_event_names]
+                if timing.communication_events is not None and all(
+                    name in timing.communication_events for name in communication_event_names
+                ):
+                    stage_times = [
+                        timing.communication_events[name][0].elapsed_time(
+                            timing.communication_events[name][1]
+                        )
+                        for name in communication_event_names
+                    ]
+                local_timing_rows.append(
+                    (
+                        timing.dispatch_start.elapsed_time(timing.dispatch_end)
+                        + timing.combine_start.elapsed_time(timing.combine_end),
+                        timing.compute_start.elapsed_time(timing.compute_end),
+                        float(timing.local_assignment_count.item()),
+                        *stage_times,
+                    )
+                )
+            row_end = row_start + len(timings)
+            layer_row_ranges.append((planner, row_start, row_end))
+            row_start = row_end
+
+        local_packed = torch.cat(local_packed_rows, dim=0)
+        local_assignment_packed = torch.cat(local_assignment_packed_rows, dim=0)
+        if self.ep_group is not None and self.ep_size > 1:
+            source_packed = torch.empty(
+                (self.ep_size * row_start, local_packed.shape[1]),
+                dtype=local_packed.dtype,
+                device=common_device,
+            )
+            dist.all_gather_into_tensor(source_packed, local_packed.contiguous(), group=self.ep_group)
+            source_packed = source_packed.view(self.ep_size, row_start, local_packed.shape[1])
+            source_assignment_packed = torch.empty_like(source_packed)
+            dist.all_gather_into_tensor(
+                source_assignment_packed,
+                local_assignment_packed.contiguous(),
+                group=self.ep_group,
+            )
+            source_assignment_packed = source_assignment_packed.view(
+                self.ep_size,
+                row_start,
+                local_assignment_packed.shape[1],
+            )
+        else:
+            source_packed = local_packed.unsqueeze(0)
+            source_assignment_packed = local_assignment_packed.unsqueeze(0)
+        global_packed = source_packed.sum(dim=0)
+
+        communication_units = torch.empty(
+            (row_start,),
+            dtype=torch.float32,
+            device=common_device,
+        )
+        receive_only_communication_units = torch.empty_like(communication_units)
+        level_count = len(layer_row_ranges[0][0]._count_widths())
+        source_send_maxima = torch.empty(
+            (row_start, level_count),
+            dtype=torch.float32,
+            device=common_device,
+        )
+        destination_receive_maxima = torch.empty_like(source_send_maxima)
+        traffic_features: dict[str, torch.Tensor] = {}
+        for planner, start, end in layer_row_ranges:
+            receive_only_communication_units[start:end] = planner._communication_cost_details(
+                global_packed[start:end]
+            )[1]
+            (
+                _communication,
+                communication_units[start:end],
+                source_send_maxima[start:end],
+                destination_receive_maxima[start:end],
+                _selected_dim,
+            ) = planner._source_aware_communication_cost_details(source_packed[:, start:end])
+            layer_features = planner._hierarchical_traffic_features(
+                source_packed[:, start:end],
+                source_assignment_packed[:, start:end],
+            )
+            for name, values in layer_features.items():
+                target = traffic_features.get(name)
+                if target is None:
+                    target = torch.empty((row_start,), dtype=torch.float32, device=common_device)
+                    traffic_features[name] = target
+                target[start:end] = values
+
+        local_timings = torch.tensor(local_timing_rows, dtype=torch.float32, device=common_device)
+        if self.ep_group is not None and self.ep_size > 1:
+            gathered_timings = torch.empty(
+                (self.ep_size * row_start, local_timings.shape[1]),
+                dtype=local_timings.dtype,
+                device=common_device,
+            )
+            dist.all_gather_into_tensor(gathered_timings, local_timings, group=self.ep_group)
+            gathered_timings = gathered_timings.view(self.ep_size, row_start, local_timings.shape[1])
+        else:
+            gathered_timings = local_timings.view(1, row_start, local_timings.shape[1])
+
+        actual_communication = gathered_timings[:, :, 0].max(dim=0).values
+        actual_compute = gathered_timings[:, :, 1].max(dim=0).values
+        peak_assignments = gathered_timings[:, :, 2].max(dim=0).values
+        stage_timings = gathered_timings[:, :, 3:]
+        raw_a2a_available = bool((stage_timings >= 0.0).all().item())
+        actual_stage_a2a = (
+            stage_timings.max(dim=0).values if raw_a2a_available else torch.empty((0, 0), device=common_device)
+        )
+        actual_raw_a2a = (
+            actual_stage_a2a.sum(dim=1) if raw_a2a_available else torch.empty((0,), device=common_device)
+        )
+        return {
+            "sample_count": row_start,
+            "compute_fit_sample_count": int(self.ep_size * row_start),
+            "communication_units": communication_units.detach().cpu().tolist(),
+            "receive_only_communication_units": receive_only_communication_units.detach().cpu().tolist(),
+            "communication_level_names": [
+                "rank",
+                *[
+                    f"group_{int(size)}"
+                    for size in self.hierarchy.group_sizes[: max(0, int(self.hierarchy.selected_dim) - 1)]
+                ],
+            ],
+            "source_send_maxima": source_send_maxima.detach().cpu().tolist(),
+            "destination_receive_maxima": destination_receive_maxima.detach().cpu().tolist(),
+            "traffic_features": {
+                name: values.detach().cpu().tolist() for name, values in traffic_features.items()
+            },
+            "peak_assignments": peak_assignments.detach().cpu().tolist(),
+            "actual_communication_ms": actual_communication.detach().cpu().tolist(),
+            "actual_compute_ms": actual_compute.detach().cpu().tolist(),
+            "actual_raw_a2a_ms": actual_raw_a2a.detach().cpu().tolist(),
+            "actual_stage_a2a_ms": actual_stage_a2a.detach().cpu().tolist(),
+            "actual_stage_a2a_names": list(communication_event_names),
+            "paired_assignments": gathered_timings[:, :, 2].reshape(-1).detach().cpu().tolist(),
+            "paired_compute_ms": gathered_timings[:, :, 1].reshape(-1).detach().cpu().tolist(),
+        }
+
+    def _record_cost_model_report(self, phase: str, report: dict[str, Any]) -> None:
+        prefix = f"hiermoe/cost_model_{phase}"
+        self._accumulate_metric(f"{prefix}_samples", int(report["sample_count"]))
+        self._accumulate_metric(f"{prefix}_communication_r2", float(report["communication"]["r_squared"]))
+        self._accumulate_metric(
+            f"{prefix}_communication_mape_percent",
+            float(report["communication"]["mape_percent"]),
+        )
+        self._accumulate_metric(
+            f"{prefix}_receive_only_communication_r2",
+            float(report["receive_only_communication"]["r_squared"]),
+        )
+        self._accumulate_metric(
+            f"{prefix}_receive_only_communication_mape_percent",
+            float(report["receive_only_communication"]["mape_percent"]),
+        )
+        self._accumulate_metric(f"{prefix}_compute_r2", float(report["compute"]["r_squared"]))
+        self._accumulate_metric(f"{prefix}_compute_mape_percent", float(report["compute"]["mape_percent"]))
+        self._accumulate_metric(f"{prefix}_joint_r2", float(report["joint"]["r_squared"]))
+        self._accumulate_metric(f"{prefix}_joint_mape_percent", float(report["joint"]["mape_percent"]))
+        self._accumulate_metric(
+            f"{prefix}_communication_units_min",
+            float(report["communication_units"]["min"]),
+        )
+        self._accumulate_metric(
+            f"{prefix}_communication_units_max",
+            float(report["communication_units"]["max"]),
+        )
+        self._accumulate_metric(
+            f"{prefix}_peak_assignments_min",
+            float(report["peak_assignments"]["min"]),
+        )
+        self._accumulate_metric(
+            f"{prefix}_peak_assignments_max",
+            float(report["peak_assignments"]["max"]),
+        )
+        logger.info_rank0("HierMoE cost model %s report: %s", phase, json.dumps(report, sort_keys=True))
+
+    @torch.no_grad()
+    def _run_cost_model_verification(self, layers: Sequence[ExpertLayerState], step: int) -> str:
+        calibration_step = int(self._online_freeze_calibration_step)
+        validation_step = calibration_step + 1
+        if int(step) < calibration_step or int(step) > validation_step:
+            self.latest_pair = "none"
+            return self.latest_pair
+
+        started = time.perf_counter()
+        observations = self._cost_model_step_observations(layers, step=int(step))
+        communication_units = list(observations["communication_units"])
+        receive_only_communication_units = list(
+            observations.get("receive_only_communication_units", communication_units)
+        )
+        peak_assignments = list(observations["peak_assignments"])
+        actual_communication = list(observations["actual_communication_ms"])
+        actual_compute = list(observations["actual_compute_ms"])
+        actual_raw_a2a = list(observations.get("actual_raw_a2a_ms", ()))
+        traffic_features = {
+            str(name): list(values)
+            for name, values in dict(observations.get("traffic_features", {})).items()
+        }
+        base_feature_models = {
+            "legacy_source_aware": ("legacy_source_aware",),
+            "stage_unique_endpoint": ("stage_unique_endpoint_link_units",),
+            "stage_payload_endpoint": ("stage_payload_endpoint_link_units",),
+            "stage_payload_endpoint_edge": (
+                "stage_payload_endpoint_link_units",
+                "stage_payload_edge_link_units",
+            ),
+            "stage_payload_inter_intra": (
+                "stage1_payload_endpoint_bytes",
+                "stage2_payload_endpoint_bytes",
+            ),
+            "stage_payload_lane_shared_node": (
+                "stage_payload_endpoint_link_units",
+                "stage_shared_node_endpoint_link_units",
+            ),
+            "stage_remote_payload_endpoint": ("stage_remote_payload_endpoint_link_units",),
+            "stage_remote_payload_endpoint_self": (
+                "stage_remote_payload_endpoint_link_units",
+                "stage_self_payload_link_units",
+            ),
+            "stage_remote_payload_endpoint_edge": (
+                "stage_remote_payload_endpoint_link_units",
+                "stage_remote_payload_edge_link_units",
+            ),
+        }
+        feature_values = {"legacy_source_aware": communication_units, **traffic_features}
+        model_rows = {
+            name: [
+                [float(feature_values[feature][row]) for feature in features]
+                for row in range(len(actual_communication))
+            ]
+            for name, features in base_feature_models.items()
+        }
+        joint_model_rows = {
+            name: [
+                [*row, float(peak_assignments[index])]
+                for index, row in enumerate(rows)
+            ]
+            for name, rows in model_rows.items()
+        }
+
+        if int(step) == calibration_step:
+            communication_slope, communication_constant = self._fit_nonnegative_compute_model(
+                list(zip(communication_units, actual_communication, strict=True))
+            )
+            compute_slope, compute_constant = self._fit_nonnegative_compute_model(
+                list(
+                    zip(
+                        observations["paired_assignments"],
+                        observations["paired_compute_ms"],
+                        strict=True,
+                    )
+                )
+            )
+            self._cost_model_verify_coefficients = (
+                communication_slope,
+                communication_constant,
+                compute_slope,
+                compute_constant,
+            )
+            self._cost_model_verify_receive_only_coefficients = self._fit_nonnegative_compute_model(
+                list(zip(receive_only_communication_units, actual_communication, strict=True))
+            )
+            actual_joint_targets = [
+                communication + compute
+                for communication, compute in zip(actual_communication, actual_compute, strict=True)
+            ]
+            feature_coefficients: dict[str, dict[str, tuple[tuple[float, ...], float]]] = {
+                "communication": {
+                    name: self._fit_nonnegative_linear_model(rows, actual_communication)
+                    for name, rows in model_rows.items()
+                },
+                "joint": {
+                    name: self._fit_nonnegative_linear_model(rows, actual_joint_targets)
+                    for name, rows in joint_model_rows.items()
+                },
+            }
+            if actual_raw_a2a:
+                feature_coefficients["raw_a2a"] = {
+                    name: self._fit_nonnegative_linear_model(rows, actual_raw_a2a)
+                    for name, rows in model_rows.items()
+                }
+            self._cost_model_verify_feature_coefficients = feature_coefficients
+            phase = "calibration"
+        else:
+            if self._cost_model_verify_coefficients is None:
+                raise RuntimeError("Cost-model validation has no coefficients from the calibration step.")
+            if self._cost_model_verify_receive_only_coefficients is None:
+                raise RuntimeError("Cost-model validation has no receive-only coefficients from the calibration step.")
+            if self._cost_model_verify_feature_coefficients is None:
+                raise RuntimeError("Cost-model validation has no traffic-feature coefficients.")
+            communication_slope, communication_constant, compute_slope, compute_constant = (
+                self._cost_model_verify_coefficients
+            )
+            phase = "validation"
+
+        assert self._cost_model_verify_receive_only_coefficients is not None
+        receive_only_slope, receive_only_constant = self._cost_model_verify_receive_only_coefficients
+        predicted_communication = [
+            communication_slope * value + communication_constant for value in communication_units
+        ]
+        receive_only_predicted_communication = [
+            receive_only_slope * value + receive_only_constant for value in receive_only_communication_units
+        ]
+        predicted_compute = [compute_slope * value + compute_constant for value in peak_assignments]
+        actual_joint = [
+            communication + compute
+            for communication, compute in zip(actual_communication, actual_compute, strict=True)
+        ]
+        predicted_joint = [
+            communication + compute
+            for communication, compute in zip(predicted_communication, predicted_compute, strict=True)
+        ]
+        assert self._cost_model_verify_feature_coefficients is not None
+        feature_model_report: dict[str, dict[str, Any]] = {}
+        target_rows: dict[str, tuple[dict[str, list[list[float]]], list[float]]] = {
+            "communication": (model_rows, actual_communication),
+            "joint": (
+                joint_model_rows,
+                [
+                    communication + compute
+                    for communication, compute in zip(actual_communication, actual_compute, strict=True)
+                ],
+            ),
+        }
+        if actual_raw_a2a and "raw_a2a" in self._cost_model_verify_feature_coefficients:
+            target_rows["raw_a2a"] = (model_rows, actual_raw_a2a)
+        for target_name, (rows_by_model, targets) in target_rows.items():
+            target_report: dict[str, Any] = {}
+            for model_name, rows in rows_by_model.items():
+                coefficients, intercept = self._cost_model_verify_feature_coefficients[target_name][model_name]
+                predicted = self._predict_linear_model(rows, coefficients, intercept)
+                target_report[model_name] = {
+                    "feature_names": [
+                        *base_feature_models[model_name],
+                        *(["peak_assignments"] if target_name == "joint" else []),
+                    ],
+                    "coefficients": list(coefficients),
+                    "intercept_ms": float(intercept),
+                    **self._cost_model_diagnostics(targets, predicted),
+                }
+            feature_model_report[target_name] = target_report
+        report: dict[str, Any] = {
+            "step": int(step),
+            "sample_count": int(observations["sample_count"]),
+            "compute_fit_sample_count": int(observations["compute_fit_sample_count"]),
+            "coefficients": {
+                "communication_ms_per_model_unit": communication_slope,
+                "communication_constant_ms": communication_constant,
+                "compute_ms_per_assignment": compute_slope,
+                "compute_constant_ms": compute_constant,
+                "receive_only_communication_ms_per_model_unit": receive_only_slope,
+                "receive_only_communication_constant_ms": receive_only_constant,
+            },
+            "communication_units": {
+                "min": min(communication_units),
+                "max": max(communication_units),
+                "mean": sum(communication_units) / len(communication_units),
+            },
+            "peak_assignments": {
+                "min": min(peak_assignments),
+                "max": max(peak_assignments),
+                "mean": sum(peak_assignments) / len(peak_assignments),
+            },
+            "communication": self._cost_model_diagnostics(actual_communication, predicted_communication),
+            "receive_only_communication": self._cost_model_diagnostics(
+                actual_communication,
+                receive_only_predicted_communication,
+            ),
+            "compute": self._cost_model_diagnostics(actual_compute, predicted_compute),
+            "joint": self._cost_model_diagnostics(actual_joint, predicted_joint),
+            "traffic_feature_models": feature_model_report,
+            "traffic_feature_ranges": {
+                name: {
+                    "min": min(float(value) for value in values),
+                    "max": max(float(value) for value in values),
+                    "mean": sum(float(value) for value in values) / len(values),
+                }
+                for name, values in traffic_features.items()
+            },
+            "elapsed_ms": (time.perf_counter() - started) * 1000.0,
+        }
+        if actual_raw_a2a:
+            report["raw_a2a_ms"] = {
+                "min": min(actual_raw_a2a),
+                "max": max(actual_raw_a2a),
+                "mean": sum(actual_raw_a2a) / len(actual_raw_a2a),
+                "stage_names": list(observations.get("actual_stage_a2a_names", ())),
+            }
+        level_names = list(observations.get("communication_level_names", ()))
+        source_send_rows = list(observations.get("source_send_maxima", ()))
+        destination_receive_rows = list(observations.get("destination_receive_maxima", ()))
+        if level_names and source_send_rows and destination_receive_rows:
+            report["communication_bottlenecks"] = {
+                level: {
+                    "source_send_min": min(float(row[level_index]) for row in source_send_rows),
+                    "source_send_max": max(float(row[level_index]) for row in source_send_rows),
+                    "source_send_mean": sum(float(row[level_index]) for row in source_send_rows)
+                    / len(source_send_rows),
+                    "destination_receive_min": min(float(row[level_index]) for row in destination_receive_rows),
+                    "destination_receive_max": max(float(row[level_index]) for row in destination_receive_rows),
+                    "destination_receive_mean": sum(float(row[level_index]) for row in destination_receive_rows)
+                    / len(destination_receive_rows),
+                    "source_dominant_samples": sum(
+                        float(source_row[level_index]) > float(destination_row[level_index])
+                        for source_row, destination_row in zip(
+                            source_send_rows,
+                            destination_receive_rows,
+                            strict=True,
+                        )
+                    ),
+                }
+                for level_index, level in enumerate(level_names)
+            }
+        self._record_cost_model_report(phase, report)
+        for layer in layers:
+            layer.cost_model_timings = [timing for timing in layer.cost_model_timings if int(timing.step) != int(step)]
+        if int(step) == validation_step:
+            self._cost_model_verify_complete = True
+        self.latest_pair = "none"
+        return self.latest_pair
+
+    @torch.no_grad()
+    def _prepare_online_freeze_calibrations(
+        self,
+        layers: Sequence[ExpertLayerState],
+        *,
+        step: int,
+        started: float,
+    ) -> None:
+        """Fit one shared two-term cost model from the profiled fixed-R2 step."""
+
+        records: list[tuple[ExpertLayerState, _PendingLayerTiming, float, float, float]] = []
+        compute_samples: list[tuple[float, float]] = []
+        communication_samples: list[tuple[float, float]] = []
+        for layer in sorted(layers, key=lambda value: value.key):
+            timing = layer.pending_timing
+            if timing is None or timing.step != int(step) or not self._events_ready(timing):
+                continue
+            selected = timing.selected_experts
+            planner = self._planner_for_layer(
+                layer,
+                communication_scale=1.0,
+                forward_compute_per_assignment=1.0,
+                forward_compute_constant=0.0,
+            )
+            copy_slots, _copy_mask = layer.copy_slots_for_device(selected.device)
+            reference = planner.score_layout(
+                selected,
+                timing.slot_to_logical,
+                source_ranks=self.ep_rank,
+                owner_slots=layer.logical_to_physical,
+                step=timing.step,
+                layer_seed=zlib.crc32(layer.key.encode("utf-8")),
+                max_copies=int(copy_slots.shape[1]),
+            )
+            local_values = torch.tensor(
+                [
+                    timing.dispatch_start.elapsed_time(timing.dispatch_end)
+                    + timing.combine_start.elapsed_time(timing.combine_end),
+                    timing.compute_start.elapsed_time(timing.compute_end),
+                    timing.local_assignment_count,
+                ],
+                dtype=torch.float32,
+                device=selected.device,
+            )
+            if self.ep_group is not None and self.ep_size > 1:
+                gathered_flat = torch.empty(
+                    (self.ep_size * int(local_values.numel()),),
+                    dtype=local_values.dtype,
+                    device=local_values.device,
+                )
+                dist.all_gather_into_tensor(gathered_flat, local_values, group=self.ep_group)
+                gathered = gathered_flat.view(self.ep_size, int(local_values.numel()))
+            else:
+                gathered = local_values.view(1, -1)
+
+            communication_units = float(reference.communication_model_units)
+            forward_communication_ms = float(gathered[:, 0].max().item())
+            peak_assignments = float(gathered[:, 2].max().item())
+            if communication_units <= 0.0 or peak_assignments <= 0.0:
+                continue
+            communication_samples.append((communication_units, forward_communication_ms))
+            compute_samples.extend(
+                (float(row[2].item()), float(row[1].item())) for row in gathered if float(row[2].item()) > 0.0
+            )
+            records.append((layer, timing, communication_units, peak_assignments, forward_communication_ms))
+
+        if len(records) != len(layers):
+            self._accumulate_metric(
+                "hiermoe/placement_calibration_ms",
+                (time.perf_counter() - started) * 1000.0,
+            )
+            return
+
+        forward_pair_per_unit = self._fit_positive_through_origin(communication_samples)
+        compute_slope, compute_constant = self._fit_nonnegative_compute_model(compute_samples)
+        if compute_slope <= 0.0:
+            compute_slope = self._fit_positive_through_origin(compute_samples)
+            compute_constant = 0.0
+
+        full_communication_per_unit = self._online_freeze_communication_ratio * forward_pair_per_unit
+        full_compute_per_assignment = self._online_freeze_compute_ratio * compute_slope
+        full_compute_constant = self._online_freeze_compute_ratio * compute_constant
+        planner_communication_scale = full_communication_per_unit / 4.0
+        if self._online_freeze_cost_mode == "joint":
+            planner_compute_slope = full_compute_per_assignment / 3.0
+            planner_compute_constant = full_compute_constant / 3.0
+        else:
+            planner_compute_slope = 0.0
+            planner_compute_constant = 0.0
+
+        for layer, timing, _units, _assignments, _communication_ms in records:
+            layer.planner_calibration = _PlannerCalibration(
+                source_step=timing.step,
+                communication_scale=planner_communication_scale,
+                forward_compute_per_assignment=planner_compute_slope,
+                forward_compute_constant=planner_compute_constant,
+            )
+            layer.pending_timing = None
+
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self._accumulate_metric("hiermoe/placement_calibration_ms", elapsed_ms)
+        self._accumulate_metric("hiermoe/placement_calibrated_layers", len(records))
+        self._accumulate_metric("hiermoe/placement_calibration_communication_samples", len(communication_samples))
+        self._accumulate_metric("hiermoe/placement_calibration_compute_samples", len(compute_samples))
+        self._accumulate_metric("hiermoe/placement_forward_pair_ms_per_model_unit", forward_pair_per_unit)
+        self._accumulate_metric("hiermoe/placement_forward_compute_ms_per_assignment", compute_slope)
+        self._accumulate_metric("hiermoe/placement_forward_compute_constant_ms", compute_constant)
+        self._accumulate_metric("hiermoe/placement_full_communication_ms_per_model_unit", full_communication_per_unit)
+        self._accumulate_metric("hiermoe/placement_full_compute_ms_per_assignment", full_compute_per_assignment)
+
     @torch.no_grad()
     def prepare_calibrations(self, step: int) -> None:
         started = time.perf_counter()
@@ -5333,6 +7406,13 @@ class ExpertSwapManager:
                 self._accumulate_metric(
                     "hiermoe/placement_calibration_ms",
                     (time.perf_counter() - started) * 1000.0,
+                )
+                return
+            if self._online_freeze_cost_mode != "off":
+                self._prepare_online_freeze_calibrations(
+                    uncalibrated,
+                    step=int(step),
+                    started=started,
                 )
                 return
         elif not self.layer_calibration_enabled():
@@ -6091,6 +8171,535 @@ class ExpertSwapManager:
         return committed
 
     @torch.no_grad()
+    def _plan_npu_layer_owner_layers(self, layers: list[ExpertLayerState], step: int) -> list[str]:
+        """Run exact layer-owner planning and migration synchronously at the step boundary."""
+
+        if not layers:
+            return []
+        if self.ep_group is None or self.ep_size <= 1:
+            raise RuntimeError("NPU layer-owner planning requires a distributed EP process group.")
+        consensus_device = _local_tensor_view(layers[0].gate_up_proj).device
+        globally_ready = _placement_group_all_true_mask(
+            [layer.latest_selected_experts is not None for layer in layers],
+            device=consensus_device,
+            ep_size=self.ep_size,
+            ep_group=self.ep_group,
+        )
+        ready = [layer for layer, is_ready in zip(layers, globally_ready, strict=True) if is_ready]
+        if len(ready) != len(layers):
+            return []
+        if any(bool((self._layer_layout(layer) < 0).any().item()) for layer in ready):
+            raise RuntimeError("Blocking NPU layer-owner planning only supports initialized layouts.")
+        structural_signature = {
+            (
+                layer.latest_hidden_size,
+                layer.latest_bytes_per_element,
+                layer.num_local_experts,
+                layer.num_experts,
+            )
+            for layer in ready
+        }
+        if len(structural_signature) != 1:
+            raise RuntimeError("Blocking NPU layer-owner planning requires structurally identical MoE layers.")
+
+        calibrations = [layer.planner_calibration for layer in ready]
+        communication_scales = [
+            1.0 if calibration is None else calibration.communication_scale for calibration in calibrations
+        ]
+        compute_slopes = [
+            0.0 if calibration is None else calibration.forward_compute_per_assignment for calibration in calibrations
+        ]
+        compute_constants = [
+            0.0 if calibration is None else calibration.forward_compute_constant for calibration in calibrations
+        ]
+        planner = self._planner_for_layer(
+            ready[0],
+            communication_scale=communication_scales[0],
+            forward_compute_per_assignment=compute_slopes[0],
+            forward_compute_constant=compute_constants[0],
+        )
+        if not isinstance(planner, GreedyCommunicationPlanner):
+            raise RuntimeError("NPU layer-owner planning requires GreedyCommunicationPlanner.")
+
+        from .npu_layer_owner_planner import NPULayerOwnerPlanner
+
+        # Keep the planner metric independent of asynchronous optimizer work
+        # queued earlier in the training step. This barrier does not change the
+        # blocking experiment's total exposed work; it only gives that work the
+        # correct timing attribution.
+        synchronize()
+        started = time.perf_counter()
+        with _full_timing_range("hiermoe_npu_layer_owner_plan"):
+            result = NPULayerOwnerPlanner(
+                planner,
+                process_group=self.ep_group,
+                statistic_collective=self._npu_layer_owner_collective,
+            ).plan_layers(
+                [layer.latest_selected_experts for layer in ready],
+                [self._layer_layout(layer) for layer in ready],
+                [layer.logical_to_physical for layer in ready],
+                source_rank=self.ep_rank,
+                max_swaps=self.expert_swap_max_pairs_per_layer,
+                max_replicas=self.max_replica_rounds,
+                layer_seeds=[zlib.crc32(layer.key.encode("utf-8")) for layer in ready],
+                step=step,
+                communication_scales=communication_scales,
+                forward_compute_per_assignment=compute_slopes,
+                forward_compute_constant=compute_constants,
+            )
+        synchronize()
+        planning_ms = (time.perf_counter() - started) * 1000.0
+        timing = result.timing
+        self._accumulate_metric("hiermoe/npu_layer_owner_planning_ms", planning_ms)
+        self._accumulate_metric("hiermoe/npu_layer_owner_context_ms", timing.context_ms)
+        self._accumulate_metric("hiermoe/npu_layer_owner_local_prepare_ms", timing.local_prepare_ms)
+        self._accumulate_metric("hiermoe/npu_layer_owner_statistic_pack_ms", timing.statistic_pack_ms)
+        self._accumulate_metric("hiermoe/npu_layer_owner_collective_ms", timing.statistic_collective_ms)
+        self._accumulate_metric("hiermoe/npu_layer_owner_score_ms", timing.owner_score_ms)
+        self._accumulate_metric("hiermoe/npu_layer_owner_decision_ms", timing.decision_collective_ms)
+        self._accumulate_metric("hiermoe/npu_layer_owner_finalization_ms", timing.finalization_ms)
+        self._accumulate_metric("hiermoe/npu_layer_owner_sent_bytes", timing.sent_statistic_bytes)
+        self._accumulate_metric("hiermoe/npu_layer_owner_received_bytes", timing.received_statistic_bytes)
+        self._accumulate_metric("hiermoe/npu_layer_owner_layers", len(ready))
+        self._accumulate_metric("hiermoe/npu_layer_owner_owned_layers", timing.owned_layer_count)
+
+        for layer, plan in zip(ready, result.plans, strict=True):
+            layer.last_plan = plan
+            self._record_plan_metrics(plan)
+
+        migration_started = time.perf_counter()
+        committed: list[str] = []
+        accepted = 0
+        with _full_timing_range("hiermoe_npu_layer_owner_migration"):
+            for layer, plan in zip(ready, result.plans, strict=True):
+                committed.extend(
+                    self._execute_placement_plan(
+                        layer,
+                        plan,
+                        timing_prefix="hiermoe_npu_layer_owner_migration",
+                        transfer_group=self.ep_group,
+                        force_staged_transfer=False,
+                        fast_sparse_transfer=True,
+                    )
+                )
+                accepted += int(bool(plan.actions))
+        synchronize()
+        migration_ms = (time.perf_counter() - migration_started) * 1000.0
+        self._accumulate_metric("hiermoe/npu_layer_owner_migration_ms", migration_ms)
+        self._accumulate_metric("hiermoe/npu_layer_owner_accepted", accepted)
+        return committed
+
+    def _forward_cover_level_weights(self, layer: ExpertLayerState) -> tuple[float, ...]:
+        """Return beta-weighted rank and hierarchy-group marginal costs."""
+
+        payload_bytes = max(1, int(layer.latest_hidden_size) * int(layer.latest_bytes_per_element))
+        valid_sizes = [
+            int(size)
+            for size in self.hierarchy.group_sizes[: max(0, int(self.hierarchy.selected_dim) - 1)]
+            if 1 < int(size) < self.ep_size and self.ep_size % int(size) == 0
+        ]
+        if not valid_sizes:
+            weight = float(self.ep_size * payload_bytes) * float(self.perf_model.a2a.beta)
+            return (weight if weight > 0.0 else 1.0,)
+
+        group_weights: list[float] = []
+        previous_size = 1
+        for level_index, size in enumerate(valid_sizes):
+            link = self.perf_model.inter[min(level_index, len(self.perf_model.inter) - 1)]
+            group_weights.append(float((size / previous_size) * payload_bytes) * float(link.beta))
+            previous_size = size
+        rank_weight = float((self.ep_size / previous_size) * payload_bytes) * float(self.perf_model.intra.beta)
+        weights = (rank_weight, *group_weights)
+        if all(weight <= 0.0 for weight in weights):
+            return (1.0,) * len(weights)
+        return tuple(max(0.0, weight) for weight in weights)
+
+    @torch.no_grad()
+    def _execute_forward_cover_actions(
+        self,
+        selections: Sequence[tuple[ExpertLayerState, PlacementAction]],
+    ) -> list[str]:
+        """Batch all selected layer covers into one sparse P2P wave per dtype."""
+
+        if not selections:
+            return []
+        grouped_entries: dict[tuple[int, int], list[_CoverTensorEntry]] = defaultdict(list)
+        prepared: list[tuple[ExpertLayerState, torch.Tensor, torch.Tensor, PlacementAction]] = []
+        for layer, action in selections:
+            if action.kind != "replica":
+                raise RuntimeError("Forward-reuse planning only supports replica cover actions.")
+            layout = self._layer_layout(layer)
+            if int(layout[action.src_slot].item()) != int(action.src_logical) or int(
+                layout[action.dst_slot].item()
+            ) != int(action.dst_logical):
+                raise RuntimeError(
+                    f"Forward-reuse cover does not match the current layout for {layer.key}: {action.format()}."
+                )
+            updated = layout.clone()
+            updated[int(action.dst_slot)] = int(action.src_logical)
+            updated_owners = layer.logical_to_physical.clone()
+            victim = int(action.dst_logical)
+            if int(updated_owners[victim].item()) == int(action.dst_slot):
+                remaining = torch.nonzero(updated == victim, as_tuple=False).flatten()
+                if remaining.numel() == 0:
+                    raise RuntimeError(
+                        f"Forward-reuse cover would remove the last copy of expert {victim} in {layer.key}."
+                    )
+                updated_owners[victim] = int(remaining.min().item())
+            validated, validated_owners = self._validate_placement_layout(
+                layer,
+                updated,
+                updated_owners,
+            )
+            src_rank = int(action.src_slot) // int(layer.num_local_experts)
+            dst_rank = int(action.dst_slot) // int(layer.num_local_experts)
+            grouped_entries[(src_rank, dst_rank)].extend(
+                self._slot_op_cover_entries_from_tensors(
+                    self._slot_op_state_tensors(layer),
+                    num_local_experts=layer.num_local_experts,
+                    src_slot=int(action.src_slot),
+                    dst_slot=int(action.dst_slot),
+                )
+            )
+            prepared.append((layer, validated, validated_owners, action))
+
+        self._execute_sparse_group_slot_transfers(
+            grouped_entries,
+            process_group=self.ep_group,
+        )
+        committed: list[str] = []
+        for layer, updated, updated_owners, action in prepared:
+            if self._forward_reuse_cover_patch_remap:
+                source_lut = layer.source_logical_to_physical
+                if source_lut is None:
+                    raise RuntimeError(f"Forward-reuse cover has no source-rank route LUT for {layer.key}.")
+                source_lut = source_lut.clone()
+                victim = int(action.dst_logical)
+                victim_fallback = int(updated_owners[victim].item())
+                source_lut[:, victim] = torch.where(
+                    source_lut[:, victim] == int(action.dst_slot),
+                    torch.full_like(source_lut[:, victim], victim_fallback),
+                    source_lut[:, victim],
+                )
+                destination_rank = int(action.dst_slot) // int(layer.num_local_experts)
+                source_lut[destination_rank, int(action.src_logical)] = int(action.dst_slot)
+                layer.source_logical_to_physical = source_lut
+            layer.slot_to_logical = updated
+            layer.logical_to_physical = updated_owners
+            layer.fixed_r2_layout = False
+            layer.active_quota_policy = ()
+            self._refresh_layer_mapping_from_slots(layer, updated_owners)
+            layer.placement_version += 1
+            committed.append(f"{layer.key}:{action.format()}")
+        return committed
+
+    @torch.no_grad()
+    def _plan_forward_reuse_cover_layers(self, layers: Sequence[ExpertLayerState], step: int) -> list[str]:
+        """Select at most one positive-gain cover per layer from current Forward state."""
+
+        if not layers:
+            return []
+        common_device = _local_tensor_view(layers[0].gate_up_proj).device
+        synchronize()
+        planning_started = time.perf_counter()
+        decision_rows = torch.zeros((len(layers), 8), dtype=torch.float32, device=common_device)
+        owned_layers = 0
+        for layer_index, layer in enumerate(layers):
+            layout = self._layer_layout(layer)
+            active_layout = layout[layout >= 0]
+            copy_counts = torch.bincount(active_layout, minlength=layer.num_experts)
+            target_ranks = tuple(
+                rank
+                for rank in range(self.ep_size)
+                if any(
+                    int(layout[slot].item()) >= 0 and int(copy_counts[int(layout[slot].item())].item()) > 1
+                    for slot in range(
+                        rank * layer.num_local_experts,
+                        (rank + 1) * layer.num_local_experts,
+                    )
+                )
+            )
+            if not target_ranks:
+                continue
+            owner_rank = target_ranks[(int(layer_index) + int(step)) % len(target_ranks)]
+            if owner_rank != self.ep_rank:
+                continue
+            owned_layers += 1
+            selected = layer.latest_selected_experts
+            physical = layer.latest_physical_routes
+            local_counts = layer.latest_tokens_per_local_expert
+            if selected is None or physical is None or local_counts is None:
+                continue
+            if selected.shape != physical.shape:
+                continue
+            proposal = propose_forward_reuse_cover(
+                selected_experts=selected,
+                physical_routes=physical,
+                slot_to_logical=layout,
+                owner_slots=layer.logical_to_physical,
+                local_slot_assignments=local_counts,
+                source_rank=self.ep_rank,
+                slots_per_rank=layer.num_local_experts,
+                hierarchy_group_sizes=self.hierarchy.group_sizes[: max(0, int(self.hierarchy.selected_dim) - 1)],
+                num_experts=layer.num_experts,
+                max_copies=self.greedy_max_copies_per_expert,
+                level_weights=self._forward_cover_level_weights(layer),
+                compute_weight=self._forward_reuse_cover_compute_weight,
+                minimum_gain=self._forward_reuse_cover_min_gain,
+            )
+            if proposal.action is None:
+                continue
+            action = proposal.action
+            decision_rows[layer_index] = torch.tensor(
+                [
+                    1.0,
+                    float(action.src_slot + 1),
+                    float(action.dst_slot + 1),
+                    float(action.src_logical + 1),
+                    float(action.dst_logical + 1),
+                    float(proposal.estimated_gain),
+                    float(proposal.communication_gain),
+                    float(proposal.assignment_delta),
+                ],
+                dtype=torch.float32,
+                device=common_device,
+            )
+
+        proposal_collective_started = time.perf_counter()
+        if self.ep_group is not None and self.ep_size > 1:
+            dist.all_reduce(decision_rows, op=dist.ReduceOp.SUM, group=self.ep_group)
+        synchronize()
+        proposal_collective_ms = (time.perf_counter() - proposal_collective_started) * 1000.0
+
+        rows = decision_rows.detach().to(device="cpu")
+        proposals: list[tuple[int, ExpertLayerState, PlacementAction]] = []
+        for layer_index, (layer, row) in enumerate(zip(layers, rows, strict=True)):
+            if int(row[0].item()) <= 0:
+                continue
+            action = PlacementAction(
+                kind="replica",
+                src_slot=int(row[1].item()) - 1,
+                dst_slot=int(row[2].item()) - 1,
+                src_logical=int(row[3].item()) - 1,
+                dst_logical=int(row[4].item()) - 1,
+            )
+            proposals.append((layer_index, layer, action))
+
+        if self._forward_reuse_cover_fast:
+            # The layer owner selected a positive local action directly from
+            # the physical routes consumed by Forward.  Synchronize only this
+            # tiny action table: do not rebuild candidate-by-group statistics
+            # or run the second global validation collective.
+            planning_ms = (time.perf_counter() - planning_started) * 1000.0
+            selections = [(layer, action) for _layer_index, layer, action in proposals]
+            migration_started = time.perf_counter()
+            with _full_timing_range("hiermoe_forward_reuse_cover_migration"):
+                committed = self._execute_forward_cover_actions(selections)
+            synchronize()
+            migration_ms = (time.perf_counter() - migration_started) * 1000.0
+            self._accumulate_metric("hiermoe/forward_cover_planning_ms", planning_ms)
+            self._accumulate_metric(
+                "hiermoe/forward_cover_decision_collective_ms",
+                proposal_collective_ms,
+            )
+            self._accumulate_metric(
+                "hiermoe/forward_cover_proposal_collective_ms",
+                proposal_collective_ms,
+            )
+            self._accumulate_metric("hiermoe/forward_cover_validation_compute_ms", 0.0)
+            self._accumulate_metric("hiermoe/forward_cover_validation_collective_ms", 0.0)
+            self._accumulate_metric("hiermoe/forward_cover_migration_ms", migration_ms)
+            self._accumulate_metric("hiermoe/forward_cover_owned_layers", owned_layers)
+            self._accumulate_metric("hiermoe/forward_cover_proposed", len(proposals))
+            self._accumulate_metric("hiermoe/forward_cover_accepted", len(committed))
+            self._accumulate_metric("hiermoe/forward_cover_validation_affected_tokens", 0)
+            self._accumulate_metric(
+                "hiermoe/forward_cover_estimated_gain",
+                float(decision_rows[:, 5].sum().item()),
+            )
+            self._accumulate_metric(
+                "hiermoe/forward_cover_communication_gain",
+                float(decision_rows[:, 6].sum().item()),
+            )
+            self._accumulate_metric(
+                "hiermoe/forward_cover_assignment_delta",
+                float(decision_rows[:, 7].sum().item()),
+            )
+            return committed
+
+        hierarchy_sizes = self.hierarchy.group_sizes[: max(0, int(self.hierarchy.selected_dim) - 1)]
+        communication_width = self.ep_size + sum(
+            self.ep_size // int(size)
+            for size in hierarchy_sizes
+            if 1 < int(size) < self.ep_size and self.ep_size % int(size) == 0
+        )
+        validation_rows = torch.zeros(
+            (len(layers), 2 * communication_width + 2 * self.ep_size),
+            dtype=torch.float32,
+            device=common_device,
+        )
+        validation_compute_started = time.perf_counter()
+        affected_token_counts = [0] * len(proposals)
+
+        def validate(proposal_index: int, layer_index: int, layer: ExpertLayerState, action: PlacementAction) -> None:
+            selected = layer.latest_selected_experts
+            physical = layer.latest_physical_routes
+            if selected is None or physical is None:
+                return
+            local_validation = forward_cover_local_validation_stats(
+                selected_experts=selected,
+                physical_routes=physical,
+                slot_to_logical=self._layer_layout(layer),
+                action=action,
+                source_rank=self.ep_rank,
+                slots_per_rank=layer.num_local_experts,
+                hierarchy_group_sizes=hierarchy_sizes,
+                num_experts=layer.num_experts,
+                max_copies=self.greedy_max_copies_per_expert,
+                step=max(0, int(layer.latest_route_step)),
+                layer_seed=zlib.crc32(layer.key.encode("utf-8")),
+                patch_remap=self._forward_reuse_cover_patch_remap,
+                victim_fallback_slot=int(layer.logical_to_physical[int(action.dst_logical)].item()),
+            )
+            validation_rows[layer_index, :communication_width] = local_validation.baseline_communication_counts
+            validation_rows[layer_index, communication_width : 2 * communication_width] = (
+                local_validation.communication_count_delta
+            )
+            assignment_start = 2 * communication_width
+            validation_rows[layer_index, assignment_start : assignment_start + self.ep_size] = (
+                local_validation.baseline_assignment_counts
+            )
+            validation_rows[layer_index, assignment_start + self.ep_size :] = local_validation.assignment_count_delta
+            affected_token_counts[proposal_index] = local_validation.affected_tokens
+
+        validation_streams = []
+        if common_device.type != "cpu" and len(proposals) > 1:
+            device_api = get_torch_device()
+            try:
+                caller_stream = device_api.current_stream(common_device)
+            except TypeError:
+                caller_stream = device_api.current_stream()
+            stream_count = min(_GREEDY_LAYER_PARALLEL_STREAMS, len(proposals))
+            validation_streams = [
+                self._pipeline_stream(f"forward_cover_validation_{index}", common_device)
+                for index in range(stream_count)
+            ]
+            for stream in validation_streams:
+                assert stream is not None
+                stream.wait_stream(caller_stream)
+            for proposal_index, (layer_index, layer, action) in enumerate(proposals):
+                stream = validation_streams[proposal_index % stream_count]
+                assert stream is not None
+                with device_api.stream(stream):
+                    validate(proposal_index, layer_index, layer, action)
+            for stream in validation_streams:
+                assert stream is not None
+                caller_stream.wait_stream(stream)
+        else:
+            for proposal_index, (layer_index, layer, action) in enumerate(proposals):
+                validate(proposal_index, layer_index, layer, action)
+        synchronize()
+        validation_compute_ms = (time.perf_counter() - validation_compute_started) * 1000.0
+        local_affected_tokens = sum(affected_token_counts)
+
+        validation_collective_started = time.perf_counter()
+        if self.ep_group is not None and self.ep_size > 1:
+            dist.all_reduce(validation_rows, op=dist.ReduceOp.SUM, group=self.ep_group)
+        synchronize()
+        validation_collective_ms = (time.perf_counter() - validation_collective_started) * 1000.0
+
+        baseline_communication_counts = validation_rows[:, :communication_width]
+        candidate_communication_counts = (
+            baseline_communication_counts + validation_rows[:, communication_width : 2 * communication_width]
+        )
+        assignment_start = 2 * communication_width
+        baseline_assignment_counts = validation_rows[
+            :,
+            assignment_start : assignment_start + self.ep_size,
+        ]
+        candidate_assignment_counts = (
+            baseline_assignment_counts + validation_rows[:, assignment_start + self.ep_size :]
+        )
+        cost_planner = self._planner_for_layer(
+            layers[0],
+            communication_scale=1.0,
+            forward_compute_per_assignment=0.0,
+            process_group=self.ep_group,
+        )
+        if not isinstance(cost_planner, GreedyCommunicationPlanner):
+            raise RuntimeError("Forward cover global validation requires the greedy planner cost model.")
+        baseline_communication = cost_planner._communication_cost_details(baseline_communication_counts)[0]
+        candidate_communication = cost_planner._communication_cost_details(candidate_communication_counts)[0]
+        baseline_peak_assignments = baseline_assignment_counts.max(dim=1).values
+        candidate_peak_assignments = candidate_assignment_counts.max(dim=1).values
+        communication_gain_rows = (
+            baseline_communication - candidate_communication
+        ) / baseline_communication.clamp_min(1.0e-6)
+        assignment_gain_rows = (
+            baseline_peak_assignments - candidate_peak_assignments
+        ) / baseline_peak_assignments.clamp_min(1.0)
+        global_gain_rows = communication_gain_rows + self._forward_reuse_cover_compute_weight * assignment_gain_rows
+        proposal_mask = decision_rows[:, 0] > 0
+        accepted_mask = (
+            proposal_mask & torch.isfinite(global_gain_rows) & (global_gain_rows > self._forward_reuse_cover_min_gain)
+        )
+        validation_summary = (
+            torch.stack(
+                (
+                    accepted_mask.to(torch.float32),
+                    global_gain_rows,
+                    communication_gain_rows,
+                    assignment_gain_rows,
+                    baseline_communication,
+                    candidate_communication,
+                    baseline_peak_assignments,
+                    candidate_peak_assignments,
+                ),
+                dim=1,
+            )
+            .detach()
+            .to(device="cpu")
+        )
+
+        proposal_by_layer = {layer_index: (layer, action) for layer_index, layer, action in proposals}
+        selections: list[tuple[ExpertLayerState, PlacementAction]] = []
+        estimated_gain = 0.0
+        communication_gain = 0.0
+        assignment_delta = 0.0
+        for layer_index, summary in enumerate(validation_summary):
+            proposed = proposal_by_layer.get(layer_index)
+            if proposed is None or int(summary[0].item()) <= 0:
+                continue
+            selections.append(proposed)
+            estimated_gain += float(summary[1].item())
+            communication_gain += float(summary[2].item())
+            assignment_delta += float(summary[7].item() - summary[6].item())
+
+        planning_ms = (time.perf_counter() - planning_started) * 1000.0
+        collective_ms = proposal_collective_ms + validation_collective_ms
+
+        migration_started = time.perf_counter()
+        with _full_timing_range("hiermoe_forward_reuse_cover_migration"):
+            committed = self._execute_forward_cover_actions(selections)
+        synchronize()
+        migration_ms = (time.perf_counter() - migration_started) * 1000.0
+
+        self._accumulate_metric("hiermoe/forward_cover_planning_ms", planning_ms)
+        self._accumulate_metric("hiermoe/forward_cover_decision_collective_ms", collective_ms)
+        self._accumulate_metric("hiermoe/forward_cover_proposal_collective_ms", proposal_collective_ms)
+        self._accumulate_metric("hiermoe/forward_cover_validation_compute_ms", validation_compute_ms)
+        self._accumulate_metric("hiermoe/forward_cover_validation_collective_ms", validation_collective_ms)
+        self._accumulate_metric("hiermoe/forward_cover_migration_ms", migration_ms)
+        self._accumulate_metric("hiermoe/forward_cover_owned_layers", owned_layers)
+        self._accumulate_metric("hiermoe/forward_cover_proposed", len(proposals))
+        self._accumulate_metric("hiermoe/forward_cover_accepted", len(committed))
+        self._accumulate_metric("hiermoe/forward_cover_validation_affected_tokens", local_affected_tokens)
+        self._accumulate_metric("hiermoe/forward_cover_estimated_gain", estimated_gain)
+        self._accumulate_metric("hiermoe/forward_cover_communication_gain", communication_gain)
+        self._accumulate_metric("hiermoe/forward_cover_assignment_delta", assignment_delta)
+        return committed
+
+    @torch.no_grad()
     def _plan_legacy_batched_layers(self, layers: list[ExpertLayerState]) -> list[str]:
         from .legacy_batched_selector import LegacyBatchedSelector
 
@@ -6134,14 +8743,92 @@ class ExpertSwapManager:
         return committed
 
     @torch.no_grad()
+    def _reset_redundant_slots_for_online_freeze(self, layers: Sequence[ExpertLayerState]) -> None:
+        """Keep canonical owners and expose every redundant R2 slot for greedy filling."""
+
+        for layer in layers:
+            if layer.slot_to_logical is None:
+                raise RuntimeError(f"Online freeze requires a slot layout for layer {layer.key}.")
+            owners = layer.logical_to_physical.detach().to(device="cpu", dtype=torch.long)
+            if int(torch.unique(owners).numel()) != layer.num_experts:
+                raise RuntimeError(f"Online freeze found non-unique owner slots in layer {layer.key}.")
+            layout = torch.full((layer.num_physical_slots,), -1, dtype=torch.long)
+            logical = torch.arange(layer.num_experts, dtype=torch.long)
+            layout.scatter_(0, owners, logical)
+            empty_slots = int((layout < 0).sum().item())
+            if empty_slots != self.replica_slot_capacity:
+                raise RuntimeError(
+                    f"Online freeze expected {self.replica_slot_capacity} redundant slots in layer {layer.key}, "
+                    f"found {empty_slots}."
+                )
+            layer.slot_to_logical = layout
+            layer.fixed_r2_layout = False
+            layer.active_quota_policy = ()
+            layer.pending_physical_routes = None
+            layer.pending_route_data_ptr = 0
+            layer.invalidate_cache()
+
+    @torch.no_grad()
+    def _run_online_freeze_step(self, step: int) -> str:
+        calibration_step = self._online_freeze_calibration_step
+        if int(step) < calibration_step:
+            self.latest_pair = "none"
+            return self.latest_pair
+        if int(step) > calibration_step:
+            self.latest_pair = "none"
+            return self.latest_pair
+
+        self.prepare_calibrations(int(step))
+        layers = [self.layers[layer_key] for layer_key in sorted(self.layers)]
+        if any(layer.planner_calibration is None for layer in layers):
+            raise RuntimeError(
+                f"Online freeze calibration did not complete at step {step}; "
+                "the profiled layer events were not ready on every EP rank."
+            )
+        self._reset_redundant_slots_for_online_freeze(layers)
+        with _full_timing_range("hiermoe_online_freeze_plan"):
+            committed = self._plan_historical_layers(layers, int(step))
+        expected_actions = len(layers) * self.replica_slot_capacity
+        if len(committed) != expected_actions:
+            raise RuntimeError(f"Online freeze committed {len(committed)} cover actions, expected {expected_actions}.")
+        self._accumulate_metric("hiermoe/online_freeze_cover_count", len(committed))
+        self.latest_pair = ",".join(committed)
+        return self.latest_pair
+
+    @torch.no_grad()
     def maybe_swap(self, step: int) -> str:
         self._begin_metrics_step(step)
+        if self._ablation_replay_mode != "off":
+            return self._queue_ablation_replay_step(int(step))
+        if self._cost_model_verify:
+            layers = [self.layers[layer_key] for layer_key in sorted(self.layers)]
+            return self._run_cost_model_verification(layers, int(step))
+        if self._online_freeze_cost_mode != "off":
+            return self._run_online_freeze_step(int(step))
+        if self._forward_reuse_cover:
+            if int(step) <= 0 or self.expert_swap_interval <= 0 or int(step) % self.expert_swap_interval != 0:
+                self.latest_pair = "none"
+                return self.latest_pair
+            layers = [self.layers[layer_key] for layer_key in sorted(self.layers)]
+            with _full_timing_range("hiermoe_forward_reuse_cover_plan"):
+                committed = self._plan_forward_reuse_cover_layers(layers, int(step))
+            self.latest_pair = ",".join(committed) if committed else "none"
+            return self.latest_pair
         if self.fixed_pipeline_overlap:
             if any(bool((self._layer_layout(layer) < 0).any().item()) for layer in self.layers.values()):
                 layers = [self.layers[layer_key] for layer_key in self.layers]
                 committed = self._plan_historical_layers(layers, int(step))
                 self.latest_pair = ",".join(committed) if committed else "none"
                 return self.latest_pair
+            if self._npu_layer_owner_blocking:
+                layers = [self.layers[layer_key] for layer_key in self._pipeline_layer_order or tuple(self.layers)]
+                committed = self._plan_npu_layer_owner_layers(layers, int(step))
+                self.latest_pair = ",".join(committed) if committed else "none"
+                return self.latest_pair
+            if self._uses_cpu_process_planner():
+                return self._collect_cpu_process_plan(int(step))
+            if self._cpu_planner_mode != "off":
+                return self._collect_cpu_batched_plan(int(step))
             return self._collect_pipeline_plans(int(step))
 
         if (

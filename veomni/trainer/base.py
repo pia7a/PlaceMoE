@@ -60,6 +60,7 @@ from ..distributed.moe.hiermoe import (
     bind_hiermoe_optimizer,
     configure_hiermoe,
     configure_hiermoe_pipeline_microstep,
+    destroy_hiermoe_pipeline_process_groups,
     disable_hiermoe_placement,
     maybe_log_hiermoe_metrics,
     maybe_run_hiermoe_expert_swap,
@@ -757,6 +758,7 @@ class BaseTrainer(Stateful, ABC):
         shutdown_hiermoe_pipeline()
         helper.empty_cache()
         dist.barrier()
+        destroy_hiermoe_pipeline_process_groups()
         dist.destroy_process_group()
 
     def train(self):

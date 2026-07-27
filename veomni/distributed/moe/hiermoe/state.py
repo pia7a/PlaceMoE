@@ -336,6 +336,12 @@ def shutdown_hiermoe_pipeline() -> None:
         state.expert_swap_manager.shutdown_pipeline()
 
 
+def destroy_hiermoe_pipeline_process_groups() -> None:
+    state = _STATE
+    if state is not None and state.expert_swap_manager is not None:
+        state.expert_swap_manager.destroy_pipeline_process_groups()
+
+
 def get_hiermoe_redundant_grad_norm_masks() -> dict[int, Any]:
     state = _STATE
     if state is None or state.expert_swap_manager is None:
