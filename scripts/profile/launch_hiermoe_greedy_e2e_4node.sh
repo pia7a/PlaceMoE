@@ -52,12 +52,25 @@ online_freeze_cost_mode=off
 online_freeze_calibration_step=${HIERMOE_ONLINE_FREEZE_CALIBRATION_STEP_OVERRIDE:-1}
 online_freeze_communication_ratio=${HIERMOE_ONLINE_FREEZE_COMMUNICATION_RATIO_OVERRIDE:-3.1}
 online_freeze_compute_ratio=${HIERMOE_ONLINE_FREEZE_COMPUTE_RATIO_OVERRIDE:-4.19}
+online_freeze_inter_ms_per_byte=${HIERMOE_ONLINE_FREEZE_INTER_MS_PER_BYTE_OVERRIDE:-6.765449326279194e-08}
+online_freeze_intra_ms_per_byte=${HIERMOE_ONLINE_FREEZE_INTRA_MS_PER_BYTE_OVERRIDE:-5.02482606728045e-09}
+online_freeze_route_ms_per_assignment=${HIERMOE_ONLINE_FREEZE_ROUTE_MS_PER_ASSIGNMENT_OVERRIDE:-8.746548178958447e-05}
+online_freeze_traffic_intercept_ms=${HIERMOE_ONLINE_FREEZE_TRAFFIC_INTERCEPT_MS_OVERRIDE:-16.771503695343263}
 cost_model_verify=0
 forward_reuse_cover=0
 forward_reuse_cover_patch_remap=0
 forward_reuse_cover_fast=0
 forward_reuse_cover_compute_weight=${HIERMOE_FORWARD_REUSE_COVER_COMPUTE_WEIGHT_OVERRIDE:-1.0}
+forward_reuse_cover_compute_ms_per_assignment=${HIERMOE_FORWARD_REUSE_COVER_COMPUTE_MS_PER_ASSIGNMENT_OVERRIDE:-2.82807e-05}
 forward_reuse_cover_min_gain=${HIERMOE_FORWARD_REUSE_COVER_MIN_GAIN_OVERRIDE:-0.0}
+forward_reuse_cover_rounds=${HIERMOE_FORWARD_REUSE_COVER_ROUNDS_OVERRIDE:-1}
+forward_reuse_cover_only_step=${HIERMOE_FORWARD_REUSE_COVER_ONLY_STEP_OVERRIDE:--1}
+forward_reuse_cover_victim_mode=${HIERMOE_FORWARD_REUSE_COVER_VICTIM_MODE_OVERRIDE:-minimum}
+forward_reuse_cover_service_scope=${HIERMOE_FORWARD_REUSE_COVER_SERVICE_SCOPE_OVERRIDE:-rank}
+forward_reuse_cover_confirm_samples=${HIERMOE_FORWARD_REUSE_COVER_CONFIRM_SAMPLES_OVERRIDE:-1}
+forward_reuse_cover_aggregate_service_group=${HIERMOE_FORWARD_REUSE_COVER_AGGREGATE_SERVICE_GROUP_OVERRIDE:-0}
+forward_reuse_cover_proposal_topk=${HIERMOE_FORWARD_REUSE_COVER_PROPOSAL_TOPK_OVERRIDE:-1}
+forward_reuse_cover_empty_seeding=0
 hiermoe_internal_timing=${VEOMNI_HIERMOE_INTERNAL_TIMING_OVERRIDE:-0}
 force_fixed_r2_mirrored_remap=0
 full_profile_start_step=3
@@ -205,6 +218,13 @@ case "${variant}" in
     full_profile_start_step=4
     if [[ "${variant}" == "online_freeze_comm" ]]; then
       online_freeze_cost_mode=communication
+      # The communication-only control does not have A_max to absorb local
+      # route/pack work, so it uses the two-feature coefficients fitted
+      # directly to the complete communication region.
+      online_freeze_inter_ms_per_byte=${HIERMOE_ONLINE_FREEZE_INTER_MS_PER_BYTE_OVERRIDE:-6.5085072685786e-08}
+      online_freeze_intra_ms_per_byte=${HIERMOE_ONLINE_FREEZE_INTRA_MS_PER_BYTE_OVERRIDE:-2.0419282740722182e-08}
+      online_freeze_route_ms_per_assignment=0.0
+      online_freeze_traffic_intercept_ms=${HIERMOE_ONLINE_FREEZE_TRAFFIC_INTERCEPT_MS_OVERRIDE:-14.45356840775864}
     else
       online_freeze_cost_mode=joint
     fi
@@ -257,6 +277,23 @@ case "${variant}" in
     forward_reuse_cover=1
     forward_reuse_cover_patch_remap=1
     ;;
+  forward_reuse_cover_empty_seed)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    max_pairs=0
+    redundant_slots=4
+    replica_rounds=1
+    fixed_r2=0
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    ablation_migration_mode=blocking
+    ablation_grad_mode=hidden
+    forward_reuse_cover=1
+    forward_reuse_cover_patch_remap=1
+    forward_reuse_cover_empty_seeding=1
+    ;;
   forward_reuse_cover_fast)
     hiermoe_enable=true
     token_dedup=true
@@ -273,6 +310,60 @@ case "${variant}" in
     forward_reuse_cover=1
     forward_reuse_cover_patch_remap=1
     forward_reuse_cover_fast=1
+    ;;
+  forward_reuse_cover_patch_static)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    max_pairs=0
+    redundant_slots=4
+    replica_rounds=0
+    fixed_r2=1
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    ablation_replay_mode=static
+    ablation_migration_mode=blocking
+    ablation_grad_mode=hidden
+    forward_reuse_cover=1
+    forward_reuse_cover_patch_remap=1
+    ;;
+  forward_reuse_cover_empty_static|hierarchical_primary_static|hierarchical_full_static)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    max_pairs=0
+    redundant_slots=4
+    replica_rounds=0
+    fixed_r2=0
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    ablation_replay_mode=static
+    ablation_migration_mode=blocking
+    ablation_grad_mode=hidden
+    forward_reuse_cover=1
+    forward_reuse_cover_patch_remap=1
+    forward_reuse_cover_empty_seeding=1
+    ;;
+  forward_reuse_cover_patch_multiround)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    max_pairs=0
+    redundant_slots=4
+    replica_rounds=1
+    fixed_r2=1
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    ablation_migration_mode=blocking
+    ablation_grad_mode=hidden
+    forward_reuse_cover=1
+    forward_reuse_cover_patch_remap=1
+    forward_reuse_cover_rounds=${HIERMOE_FORWARD_REUSE_COVER_ROUNDS_OVERRIDE:-32}
+    forward_reuse_cover_only_step=${HIERMOE_FORWARD_REUSE_COVER_ONLY_STEP_OVERRIDE:-2}
+    forward_reuse_cover_victim_mode=${HIERMOE_FORWARD_REUSE_COVER_VICTIM_MODE_OVERRIDE:-minimum}
     ;;
   r2_planner)
     hiermoe_enable=true
@@ -376,12 +467,25 @@ common_env=(
   -e "VEOMNI_HIERMOE_ONLINE_FREEZE_CALIBRATION_STEP=${online_freeze_calibration_step}"
   -e "VEOMNI_HIERMOE_ONLINE_FREEZE_COMMUNICATION_RATIO=${online_freeze_communication_ratio}"
   -e "VEOMNI_HIERMOE_ONLINE_FREEZE_COMPUTE_RATIO=${online_freeze_compute_ratio}"
+  -e "VEOMNI_HIERMOE_ONLINE_FREEZE_INTER_MS_PER_BYTE=${online_freeze_inter_ms_per_byte}"
+  -e "VEOMNI_HIERMOE_ONLINE_FREEZE_INTRA_MS_PER_BYTE=${online_freeze_intra_ms_per_byte}"
+  -e "VEOMNI_HIERMOE_ONLINE_FREEZE_ROUTE_MS_PER_ASSIGNMENT=${online_freeze_route_ms_per_assignment}"
+  -e "VEOMNI_HIERMOE_ONLINE_FREEZE_TRAFFIC_INTERCEPT_MS=${online_freeze_traffic_intercept_ms}"
   -e "VEOMNI_HIERMOE_COST_MODEL_VERIFY=${cost_model_verify}"
   -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER=${forward_reuse_cover}"
   -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_PATCH_REMAP=${forward_reuse_cover_patch_remap}"
   -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_FAST=${forward_reuse_cover_fast}"
   -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_COMPUTE_WEIGHT=${forward_reuse_cover_compute_weight}"
+  -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_COMPUTE_MS_PER_ASSIGNMENT=${forward_reuse_cover_compute_ms_per_assignment}"
   -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_MIN_GAIN=${forward_reuse_cover_min_gain}"
+  -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_ROUNDS=${forward_reuse_cover_rounds}"
+  -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_ONLY_STEP=${forward_reuse_cover_only_step}"
+  -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_VICTIM_MODE=${forward_reuse_cover_victim_mode}"
+  -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_SERVICE_SCOPE=${forward_reuse_cover_service_scope}"
+  -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_CONFIRM_SAMPLES=${forward_reuse_cover_confirm_samples}"
+  -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_AGGREGATE_SERVICE_GROUP=${forward_reuse_cover_aggregate_service_group}"
+  -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_PROPOSAL_TOPK=${forward_reuse_cover_proposal_topk}"
+  -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_EMPTY_SEEDING=${forward_reuse_cover_empty_seeding}"
   -e "VEOMNI_HIERMOE_FORCE_FIXED_R2_MIRRORED_REMAP=${force_fixed_r2_mirrored_remap}"
   -e "HIERMOE_FIT_PERF_MODEL_ON_STARTUP=0"
   -e "HIERMOE_PERF_MODEL_PATH=${perf_model_path}"

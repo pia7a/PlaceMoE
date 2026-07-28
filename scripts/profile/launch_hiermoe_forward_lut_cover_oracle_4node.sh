@@ -5,32 +5,34 @@ set -uo pipefail
 host_root=/home/tzq/npu_profile_outputs/hiermoe_greedy_swap_cover_20260722
 container_root=/workspace/output/hiermoe_greedy_swap_cover_20260722
 source_root=${container_root}/src
-route_dir=/workspace/output/hiermoe_p4_route_replay_20260720/routes
-benchmark=${source_root}/scripts/profile/benchmark_hiermoe_traffic_cost_model.py
+benchmark=${source_root}/scripts/profile/benchmark_hiermoe_forward_lut_cover_oracle.py
+route_root=${source_root}/route_captures/qwen3vl_greedy_ep32_mb4_gbs128_dedup_8step_route_history_8step_20260724
+input_layout=${source_root}/results/recursive_classifier_refined_v2_ep32_48layers_layout_20260728.json
+anchor=${source_root}/results/cover_oracle_layer26_round1_ep32_20260728.json
 key=/home/tzq/KeyPair-3bce.pem
 master_addr=192.168.0.55
-master_port=${MASTER_PORT:-30083}
-run_name=${RUN_NAME:-traffic_cost_model_ep32_48layers}
-warmup=${WARMUP:-1}
-iterations=${ITERATIONS:-3}
-layout_json=${LAYOUT_JSON:-}
-variants=${VARIANTS:-owners,mirrored_r2,node_local,quarter_cyclic,hot,random}
+master_port=${MASTER_PORT:-29862}
+run_name=${RUN_NAME:-forward_lut_cover_oracle_ep32_48layers}
+layer_start=${LAYER_START:-0}
+layers=${LAYERS:-48}
+optimize_steps=${OPTIMIZE_STEPS:-2,3,4,5}
+validation_steps=${VALIDATION_STEPS:-6,7}
 
 benchmark_args=(
-  --route-dir="${route_dir}"
-  --layers=48
-  --warmup="${warmup}"
-  --iterations="${iterations}"
+  --input-layout="${input_layout}"
+  --route-root="${route_root}"
+  --optimize-steps="${optimize_steps}"
+  --validation-steps="${validation_steps}"
+  --layer-start="${layer_start}"
+  --layers="${layers}"
+  --ep-size=32
   --ranks-per-node=8
+  --service-group-size=8
   --num-experts=128
-  --hidden-size=2048
-  --slot-increment=4
-  --max-copies=8
-  --variants="${variants}"
+  --slots-per-rank=8
+  --max-copies=4
+  --anchor="${anchor}"
 )
-if [[ -n "${layout_json}" ]]; then
-  benchmark_args+=(--layout-json="${layout_json}")
-fi
 
 launch_remote() {
   local host=$1
@@ -39,7 +41,6 @@ launch_remote() {
   ssh -i "${key}" -o StrictHostKeyChecking=no "root@${host}" \
     docker exec \
     -e "PYTHONPATH=${source_root}" \
-    -e "VEOMNI_HIERMOE_INTERNAL_TIMING=1" \
     -w "${source_root}" \
     "${container}" \
     torchrun --nnodes=4 --nproc-per-node=8 --node-rank="${node_rank}" \
@@ -58,7 +59,6 @@ rank3_pid=$!
 
 docker exec \
   -e "PYTHONPATH=${source_root}" \
-  -e "VEOMNI_HIERMOE_INTERNAL_TIMING=1" \
   -w "${source_root}" \
   tzq_npu_coremoe_verify_20260717 \
   torchrun --nnodes=4 --nproc-per-node=8 --node-rank=0 \
@@ -74,6 +74,6 @@ wait "${rank2_pid}"
 rank2_rc=$?
 wait "${rank3_pid}"
 rank3_rc=$?
-
-echo "run=${run_name} rank0_rc=${rank0_rc} rank1_rc=${rank1_rc} rank2_rc=${rank2_rc} rank3_rc=${rank3_rc}"
+printf 'run=%s rank0_rc=%s rank1_rc=%s rank2_rc=%s rank3_rc=%s\n' \
+  "${run_name}" "${rank0_rc}" "${rank1_rc}" "${rank2_rc}" "${rank3_rc}"
 exit $((rank0_rc || rank1_rc || rank2_rc || rank3_rc))

@@ -13,6 +13,8 @@ from pathlib import Path
 import torch
 
 from veomni.distributed.moe.hiermoe.forward_cover_planner import (
+    _local_assignment_counts,
+    _local_packed_counts,
     forward_cover_local_validation_stats,
     patch_forward_cover_routes,
     propose_forward_reuse_cover,
@@ -109,7 +111,19 @@ def main() -> None:
     torch.npu.synchronize()
     samples = []
     validation_samples = []
+    cached_validation_samples = []
     patch_samples = []
+    cached_baseline_communication = _local_packed_counts(
+        physical,
+        slots_per_rank=slots_per_rank,
+        ep_size=args.ep_size,
+        hierarchy_group_sizes=(args.group_size,),
+    )
+    cached_baseline_assignments = _local_assignment_counts(
+        physical,
+        slots_per_rank=slots_per_rank,
+        ep_size=args.ep_size,
+    )
     proposal = None
     for _ in range(args.iterations):
         started = time.perf_counter()
@@ -148,6 +162,26 @@ def main() -> None:
             )
             torch.npu.synchronize()
             validation_samples.append((time.perf_counter() - validation_started) * 1000.0)
+            cached_validation_started = time.perf_counter()
+            forward_cover_local_validation_stats(
+                selected_experts=selected,
+                physical_routes=physical,
+                slot_to_logical=layout,
+                action=proposal.action,
+                source_rank=args.source_rank,
+                slots_per_rank=slots_per_rank,
+                hierarchy_group_sizes=(args.group_size,),
+                num_experts=num_experts,
+                max_copies=4,
+                step=0,
+                layer_seed=0,
+                patch_remap=args.patch_remap,
+                victim_fallback_slot=fallback_slot,
+                baseline_communication_counts=cached_baseline_communication,
+                baseline_assignment_counts=cached_baseline_assignments,
+            )
+            torch.npu.synchronize()
+            cached_validation_samples.append((time.perf_counter() - cached_validation_started) * 1000.0)
     assert proposal is not None
     payload = {
         "route": str(path),
@@ -161,6 +195,12 @@ def main() -> None:
         "validation_minimum_ms": None if not validation_samples else min(validation_samples),
         "validation_maximum_ms": None if not validation_samples else max(validation_samples),
         "validation_samples_ms": validation_samples,
+        "cached_validation_median_ms": (
+            None if not cached_validation_samples else statistics.median(cached_validation_samples)
+        ),
+        "cached_validation_minimum_ms": (None if not cached_validation_samples else min(cached_validation_samples)),
+        "cached_validation_maximum_ms": (None if not cached_validation_samples else max(cached_validation_samples)),
+        "cached_validation_samples_ms": cached_validation_samples,
         "patch_remap": args.patch_remap,
         "patch_median_ms": None if not patch_samples else statistics.median(patch_samples),
         "patch_minimum_ms": None if not patch_samples else min(patch_samples),

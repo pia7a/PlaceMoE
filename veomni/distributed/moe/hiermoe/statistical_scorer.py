@@ -2320,7 +2320,511 @@ def statistical_candidate_local_deltas(
     return (deltas, None) if return_route_tables else deltas
 
 
+@torch.no_grad()
+def statistical_forward_lut_cover_local_deltas(
+    planner: GreedyCommunicationPlanner,
+    selected: torch.Tensor,
+    rows: torch.Tensor,
+    *,
+    physical: torch.Tensor,
+    source_logical_to_physical: torch.Tensor,
+    victim_fallback_slots: torch.Tensor,
+    uniform_source_rank: int,
+    service_group_size: int,
+    num_experts: int,
+    routes_are_unique: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return exact local Cover deltas for the Forward-LUT remap rule.
+
+    This scorer deliberately has no replica/hash state space.  Forward has
+    already selected one physical slot for every ``(source rank, logical
+    expert)`` pair, so a Cover changes at most two deterministic routes:
+
+    * the inserted expert moves to the destination slot for source ranks in
+      the destination service group;
+    * the overwritten victim moves to its fallback slot only for source ranks
+      whose current LUT entry references that exact destination slot.
+
+    Unary absence statistics account for either change independently.  The
+    pair table adds the exact correction when both experts occur in one token,
+    preserving hierarchical token deduplication without materializing a
+    ``candidate × token × top-k`` route tensor.
+    """
+
+    selected = selected.to(dtype=torch.long)
+    physical = physical.to(device=selected.device, dtype=torch.long, non_blocking=True)
+    rows = rows.to(device=selected.device, dtype=torch.long, non_blocking=True)
+    source_lut = source_logical_to_physical.to(
+        device=selected.device,
+        dtype=torch.long,
+        non_blocking=True,
+    ).reshape(-1)
+    fallback_slots = victim_fallback_slots.to(
+        device=selected.device,
+        dtype=torch.long,
+        non_blocking=True,
+    ).reshape(-1)
+    if selected.ndim != 2 or physical.shape != selected.shape:
+        raise ValueError("selected and physical must be equal-shaped rank-2 tensors.")
+    if rows.ndim != 2 or int(rows.shape[1]) != 5:
+        raise ValueError("Cover rows must have shape [actions, 5].")
+    if int(source_lut.numel()) != int(num_experts):
+        raise ValueError("The source-rank LUT must contain one slot per logical expert.")
+    if int(fallback_slots.numel()) != int(rows.shape[0]):
+        raise ValueError("victim_fallback_slots must contain one entry per Cover row.")
+    if not 0 <= int(uniform_source_rank) < int(planner.ep_size):
+        raise ValueError("uniform_source_rank is outside the EP group.")
+    if (
+        int(service_group_size) <= 0
+        or int(service_group_size) > int(planner.ep_size)
+        or int(planner.ep_size) % int(service_group_size) != 0
+    ):
+        raise ValueError("service_group_size must be a positive divisor of ep_size.")
+    if rows.numel() == 0:
+        return (
+            physical.new_empty((0, sum(planner._count_widths())), dtype=torch.float32),
+            physical.new_empty((0, planner.ep_size), dtype=torch.float32),
+        )
+
+    lhs = rows[:, 3]
+    rhs = rows[:, 4]
+    if bool(((lhs < 0) | (lhs >= int(num_experts))).any().item()):
+        raise ValueError("A Cover source expert is outside the logical expert range.")
+    if bool(((rhs < 0) | (rhs >= int(num_experts))).any().item()):
+        raise ValueError("Forward-LUT Cover scoring requires an occupied victim slot.")
+    destination_slots = rows[:, 2]
+    num_slots = int(planner.ep_size) * int(planner.slots_per_rank)
+    if bool(((destination_slots < 0) | (destination_slots >= num_slots)).any().item()):
+        raise ValueError("A Cover destination slot is outside the physical layout.")
+    if bool(((fallback_slots < 0) | (fallback_slots >= num_slots)).any().item()):
+        raise ValueError("A victim fallback slot is outside the physical layout.")
+
+    # One deterministic route state per logical expert is the key reduction
+    # versus the generic replica/hash scorer.
+    state_count = 1
+    route_states = torch.zeros_like(selected)
+    unique_routes = None if routes_are_unique else _canonical_route_mask(selected)
+    pair_events = _build_dense_pair_events(
+        selected,
+        route_states,
+        unique_routes,
+        routes_are_unique=routes_are_unique,
+        num_experts=num_experts,
+        state_count=state_count,
+    )
+
+    baseline_ranks = torch.div(
+        source_lut,
+        planner.slots_per_rank,
+        rounding_mode="floor",
+    ).view(num_experts, state_count)
+    destination_ranks = torch.div(
+        destination_slots,
+        planner.slots_per_rank,
+        rounding_mode="floor",
+    )
+    fallback_ranks = torch.div(
+        fallback_slots,
+        planner.slots_per_rank,
+        rounding_mode="floor",
+    )
+    source_service_group = int(uniform_source_rank) // int(service_group_size)
+    lhs_relevant = (
+        torch.div(destination_ranks, int(service_group_size), rounding_mode="floor")
+        == source_service_group
+    )
+    lhs_old_ranks = baseline_ranks.index_select(0, lhs).reshape(-1)
+    rhs_old_ranks = baseline_ranks.index_select(0, rhs).reshape(-1)
+    lhs_new_ranks = torch.where(lhs_relevant, destination_ranks, lhs_old_ranks)
+    rhs_valid = source_lut.index_select(0, rhs) == destination_slots
+    rhs_new_ranks = torch.where(rhs_valid, fallback_ranks, rhs_old_ranks)
+
+    route_ranks_current = torch.div(
+        physical,
+        planner.slots_per_rank,
+        rounding_mode="floor",
+    )
+    level_sizes = (1,) + tuple(
+        int(size)
+        for size in planner.hierarchy.group_sizes[: max(0, int(planner.hierarchy.selected_dim) - 1)]
+    )
+    widths = tuple(planner.ep_size // size for size in level_sizes)
+    offsets: list[int] = []
+    offset = 0
+    for width in widths:
+        offsets.append(offset)
+        offset += width
+    packed_width = sum(widths)
+    packed_groups = torch.stack(
+        tuple(
+            torch.div(route_ranks_current, size, rounding_mode="floor") + group_offset
+            for size, group_offset in zip(level_sizes, offsets, strict=True)
+        ),
+        dim=2,
+    )
+    occupancy = torch.zeros(
+        (selected.shape[0], packed_width),
+        dtype=torch.int32,
+        device=selected.device,
+    )
+    occupancy_updates = (
+        torch.ones_like(packed_groups, dtype=torch.int32)
+        if routes_are_unique
+        else unique_routes.to(torch.int32).unsqueeze(2).expand_as(packed_groups)
+    )
+    occupancy.scatter_add_(
+        1,
+        packed_groups.reshape(selected.shape[0], -1),
+        occupancy_updates.reshape(selected.shape[0], -1),
+    )
+    absence = _dense_unary_absence_statistics(
+        selected,
+        route_states,
+        unique_routes,
+        packed_groups,
+        occupancy,
+        routes_are_unique=routes_are_unique,
+        num_experts=num_experts,
+        state_count=state_count,
+    )
+
+    def packed_candidate_groups(ranks: torch.Tensor) -> torch.Tensor:
+        return torch.stack(
+            tuple(
+                torch.div(ranks, size, rounding_mode="floor") + group_offset
+                for size, group_offset in zip(level_sizes, offsets, strict=True)
+            ),
+            dim=2,
+        )
+
+    baseline_groups = torch.stack(
+        tuple(
+            torch.div(baseline_ranks, size, rounding_mode="floor") + group_offset
+            for size, group_offset in zip(level_sizes, offsets, strict=True)
+        ),
+        dim=2,
+    )
+    lhs_new_groups = packed_candidate_groups(lhs_new_ranks.view(-1, state_count))
+    rhs_new_groups = packed_candidate_groups(rhs_new_ranks.view(-1, state_count))
+    communication_delta = torch.zeros(
+        (rows.shape[0], packed_width),
+        dtype=torch.float32,
+        device=selected.device,
+    )
+    _add_dense_unary_deltas(
+        communication_delta,
+        absence,
+        rows,
+        lhs_old_groups=baseline_groups.index_select(0, lhs),
+        lhs_new_groups=lhs_new_groups,
+        rhs_old_groups=baseline_groups.index_select(0, rhs),
+        rhs_new_groups=rhs_new_groups,
+        rhs_valid=rhs_valid,
+    )
+    if pair_events is not None:
+        pair_absence = _dense_pair_absence_statistics(
+            pair_events,
+            occupancy,
+            baseline_groups,
+        )
+        _add_dense_pair_deltas(
+            communication_delta,
+            pair_absence,
+            rows,
+            baseline_groups=baseline_groups,
+            lhs_new_groups=lhs_new_groups,
+            rhs_new_groups=rhs_new_groups,
+            rhs_valid=rhs_valid,
+        )
+
+    multiplicities = torch.bincount(
+        selected.reshape(-1),
+        minlength=int(num_experts),
+    ).to(torch.float32)
+    lhs_weights = multiplicities.index_select(0, lhs) * lhs_relevant.to(torch.float32)
+    rhs_weights = multiplicities.index_select(0, rhs) * rhs_valid.to(torch.float32)
+    assignment_delta = torch.zeros(
+        (rows.shape[0], planner.ep_size),
+        dtype=torch.float32,
+        device=selected.device,
+    )
+    for ranks, values in (
+        (lhs_old_ranks, -lhs_weights),
+        (lhs_new_ranks, lhs_weights),
+        (rhs_old_ranks, -rhs_weights),
+        (rhs_new_ranks, rhs_weights),
+    ):
+        assignment_delta.scatter_add_(1, ranks.view(-1, 1), values.view(-1, 1))
+    return communication_delta, assignment_delta
+
+
+@dataclass(frozen=True)
+class ForwardLUTCoverCompactStatistics:
+    """Candidate-independent sufficient statistics for exact LUT Cover.
+
+    Each hierarchy level stores the same compact ``zero/sole/cohit`` tables
+    used by the mature exact single-Swap selector.  A Forward-LUT Cover is a
+    two-expert chain
+
+    ``lhs: old -> victim_old`` and ``victim: victim_old -> fallback``.
+
+    Consequently only two directional cohit corrections are required; no
+    candidate-by-token or candidate-by-group pair table is materialized.
+    """
+
+    baseline_counts: tuple[torch.Tensor, ...]
+    zero_group_expert_hits: tuple[torch.Tensor, ...]
+    sole_expert_hits: tuple[torch.Tensor, ...]
+    sole_expert_cohits: tuple[torch.Tensor, ...]
+    group_by_logical: tuple[torch.Tensor, ...]
+    assignment_multiplicity: torch.Tensor
+
+
+@torch.no_grad()
+def prepare_forward_lut_cover_compact_statistics(
+    planner: GreedyCommunicationPlanner,
+    selected: torch.Tensor,
+    *,
+    source_logical_to_physical: torch.Tensor,
+    num_experts: int,
+) -> ForwardLUTCoverCompactStatistics:
+    """Build exact candidate-independent statistics from cached Forward data."""
+
+    selected = selected.to(dtype=torch.long)
+    source_lut = source_logical_to_physical.to(
+        device=selected.device,
+        dtype=torch.long,
+        non_blocking=True,
+    ).reshape(-1)
+    if selected.ndim != 2:
+        raise ValueError("selected must be a rank-2 [tokens, top-k] tensor.")
+    if int(source_lut.numel()) != int(num_experts):
+        raise ValueError("The source-rank LUT must contain one slot per logical expert.")
+    if bool(((selected < 0) | (selected >= int(num_experts))).any().item()):
+        raise ValueError("selected contains an out-of-range logical expert.")
+
+    token_expert_hits = torch.zeros(
+        (selected.shape[0], int(num_experts)),
+        dtype=torch.bool,
+        device=selected.device,
+    )
+    if selected.numel() > 0:
+        token_expert_hits.scatter_(1, selected, True)
+    hit_values = token_expert_hits.to(torch.float32)
+    route_ranks = torch.div(
+        source_lut,
+        int(planner.slots_per_rank),
+        rounding_mode="floor",
+    )
+    level_sizes = (1,) + tuple(
+        int(size)
+        for size in planner.hierarchy.group_sizes[: max(0, int(planner.hierarchy.selected_dim) - 1)]
+    )
+    baseline_counts: list[torch.Tensor] = []
+    zero_hits: list[torch.Tensor] = []
+    sole_hits: list[torch.Tensor] = []
+    sole_cohits: list[torch.Tensor] = []
+    groups_by_level: list[torch.Tensor] = []
+    for size in level_sizes:
+        groups = torch.div(route_ranks, size, rounding_mode="floor")
+        num_groups = int(planner.ep_size) // size
+        group_index = groups.view(1, -1).expand(selected.shape[0], -1)
+        token_group_counts = torch.zeros(
+            (selected.shape[0], num_groups),
+            dtype=torch.float32,
+            device=selected.device,
+        )
+        token_group_counts.scatter_add_(1, group_index, hit_values)
+        baseline_counts.append((token_group_counts > 0).sum(dim=0).to(torch.float32))
+        zero_hits.append(
+            (token_group_counts == 0).to(torch.float32).transpose(0, 1).matmul(hit_values)
+        )
+        own_group_counts = token_group_counts.index_select(1, groups)
+        sole_matrix = hit_values * (own_group_counts == 1).to(torch.float32)
+        sole_hits.append(sole_matrix.sum(dim=0))
+        sole_cohits.append(sole_matrix.transpose(0, 1).matmul(hit_values))
+        groups_by_level.append(groups)
+
+    return ForwardLUTCoverCompactStatistics(
+        baseline_counts=tuple(baseline_counts),
+        zero_group_expert_hits=tuple(zero_hits),
+        sole_expert_hits=tuple(sole_hits),
+        sole_expert_cohits=tuple(sole_cohits),
+        group_by_logical=tuple(groups_by_level),
+        assignment_multiplicity=torch.bincount(
+            selected.reshape(-1),
+            minlength=int(num_experts),
+        ).to(torch.float32),
+    )
+
+
+@torch.no_grad()
+def score_forward_lut_cover_compact_statistics(
+    planner: GreedyCommunicationPlanner,
+    statistics: ForwardLUTCoverCompactStatistics,
+    rows: torch.Tensor,
+    *,
+    source_logical_to_physical: torch.Tensor,
+    victim_fallback_slots: torch.Tensor,
+    uniform_source_rank: int,
+    service_group_size: int,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score every Cover exactly using only compact ``zero/sole/cohit`` tables."""
+
+    rows = rows.to(
+        device=statistics.assignment_multiplicity.device,
+        dtype=torch.long,
+        non_blocking=True,
+    )
+    source_lut = source_logical_to_physical.to(
+        device=rows.device,
+        dtype=torch.long,
+        non_blocking=True,
+    ).reshape(-1)
+    fallback_slots = victim_fallback_slots.to(
+        device=rows.device,
+        dtype=torch.long,
+        non_blocking=True,
+    ).reshape(-1)
+    if rows.ndim != 2 or int(rows.shape[1]) != 5:
+        raise ValueError("Cover rows must have shape [actions, 5].")
+    if int(source_lut.numel()) != int(num_experts):
+        raise ValueError("The source-rank LUT must contain one slot per logical expert.")
+    if int(fallback_slots.numel()) != int(rows.shape[0]):
+        raise ValueError("victim_fallback_slots must contain one entry per Cover row.")
+    if rows.numel() == 0:
+        return (
+            statistics.assignment_multiplicity.new_empty((0, sum(planner._count_widths()))),
+            statistics.assignment_multiplicity.new_empty((0, int(planner.ep_size))),
+        )
+
+    lhs = rows[:, 3]
+    rhs = rows[:, 4]
+    destination_slots = rows[:, 2]
+    destination_ranks = torch.div(
+        destination_slots,
+        int(planner.slots_per_rank),
+        rounding_mode="floor",
+    )
+    fallback_ranks = torch.div(
+        fallback_slots,
+        int(planner.slots_per_rank),
+        rounding_mode="floor",
+    )
+    baseline_ranks = torch.div(
+        source_lut,
+        int(planner.slots_per_rank),
+        rounding_mode="floor",
+    )
+    lhs_old_ranks = baseline_ranks.index_select(0, lhs)
+    rhs_old_ranks = baseline_ranks.index_select(0, rhs)
+    source_service_group = int(uniform_source_rank) // int(service_group_size)
+    lhs_new_ranks = torch.where(
+        torch.div(destination_ranks, int(service_group_size), rounding_mode="floor")
+        == source_service_group,
+        destination_ranks,
+        lhs_old_ranks,
+    )
+    rhs_new_ranks = torch.where(
+        source_lut.index_select(0, rhs) == destination_slots,
+        fallback_ranks,
+        rhs_old_ranks,
+    )
+
+    communication_deltas: list[torch.Tensor] = []
+    level_sizes = (1,) + tuple(
+        int(size)
+        for size in planner.hierarchy.group_sizes[: max(0, int(planner.hierarchy.selected_dim) - 1)]
+    )
+    for level, size in enumerate(level_sizes):
+        group_by_logical = statistics.group_by_logical[level]
+        zero = statistics.zero_group_expert_hits[level]
+        sole = statistics.sole_expert_hits[level]
+        cohit = statistics.sole_expert_cohits[level]
+        lhs_old = group_by_logical.index_select(0, lhs)
+        rhs_old = group_by_logical.index_select(0, rhs)
+        lhs_new = torch.div(lhs_new_ranks, size, rounding_mode="floor")
+        rhs_new = torch.div(rhs_new_ranks, size, rounding_mode="floor")
+        lhs_moves = lhs_old != lhs_new
+        rhs_moves = rhs_old != rhs_new
+        num_groups = int(statistics.baseline_counts[level].numel())
+        delta = torch.zeros(
+            (rows.shape[0], num_groups),
+            dtype=torch.float32,
+            device=rows.device,
+        )
+        action_indices = torch.arange(rows.shape[0], dtype=torch.long, device=rows.device)
+
+        def add(
+            groups: torch.Tensor,
+            values: torch.Tensor,
+            valid: torch.Tensor,
+            *,
+            _action_indices: torch.Tensor = action_indices,
+            _delta: torch.Tensor = delta,
+            _num_groups: int = num_groups,
+        ) -> None:
+            selected_actions = _action_indices[valid]
+            _delta.reshape(-1).index_add_(
+                0,
+                selected_actions * _num_groups + groups[valid],
+                values[valid],
+            )
+
+        lhs_loss = -sole.index_select(0, lhs)
+        lhs_gain = zero[lhs_new, lhs]
+        rhs_loss = -sole.index_select(0, rhs)
+        rhs_gain = zero[rhs_new, rhs]
+        add(lhs_old, lhs_loss, lhs_moves)
+        add(lhs_new, lhs_gain, lhs_moves)
+        add(rhs_old, rhs_loss, rhs_moves)
+        add(rhs_new, rhs_gain, rhs_moves)
+
+        both_move = lhs_moves & rhs_moves
+        # lhs enters the victim's old group.  A token for which victim was the
+        # sole old occupant and lhs co-occurs must remain present.
+        add(
+            rhs_old,
+            cohit[rhs, lhs],
+            both_move & (lhs_new == rhs_old),
+        )
+        # Symmetric correction when victim falls back into lhs's old group.
+        add(
+            lhs_old,
+            cohit[lhs, rhs],
+            both_move & (rhs_new == lhs_old),
+        )
+        communication_deltas.append(delta)
+
+    assignment_delta = torch.zeros(
+        (rows.shape[0], int(planner.ep_size)),
+        dtype=torch.float32,
+        device=rows.device,
+    )
+    lhs_weight = statistics.assignment_multiplicity.index_select(0, lhs)
+    rhs_weight = statistics.assignment_multiplicity.index_select(0, rhs)
+    for old_ranks, new_ranks, weights in (
+        (lhs_old_ranks, lhs_new_ranks, lhs_weight),
+        (rhs_old_ranks, rhs_new_ranks, rhs_weight),
+    ):
+        moves = old_ranks != new_ranks
+        action_indices = torch.arange(rows.shape[0], dtype=torch.long, device=rows.device)[moves]
+        assignment_delta.reshape(-1).index_add_(
+            0,
+            action_indices * int(planner.ep_size) + old_ranks[moves],
+            -weights[moves],
+        )
+        assignment_delta.reshape(-1).index_add_(
+            0,
+            action_indices * int(planner.ep_size) + new_ranks[moves],
+            weights[moves],
+        )
+    return torch.cat(communication_deltas, dim=1), assignment_delta
+
+
 __all__ = [
+    "ForwardLUTCoverCompactStatistics",
     "StatisticalPairContext",
     "StatisticalPrimitiveContext",
     "StatisticalPrimitiveResult",
@@ -2330,6 +2834,9 @@ __all__ = [
     "UniformStatisticalBaseline",
     "build_statistical_primitive_spec",
     "statistical_candidate_local_deltas",
+    "statistical_forward_lut_cover_local_deltas",
+    "prepare_forward_lut_cover_compact_statistics",
+    "score_forward_lut_cover_compact_statistics",
     "statistical_batched_selected_pair_local_deltas",
     "statistical_pair_interaction_bound_local",
     "statistical_primitive_fast_path_available",

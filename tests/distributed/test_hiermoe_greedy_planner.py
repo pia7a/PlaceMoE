@@ -60,6 +60,11 @@ def _planner(
     exact_primitive_topk: int = 0,
     post_shortlist_compact_pair: bool = False,
     exact_primitive_max_only: bool = False,
+    traffic_inter_ms_per_byte: float | None = None,
+    traffic_intra_ms_per_byte: float | None = None,
+    traffic_route_ms_per_assignment: float = 0.0,
+    traffic_communication_phase_multiplier: float = 1.0,
+    traffic_compute_phase_multiplier: float = 1.0,
 ) -> GreedyCommunicationPlanner:
     return GreedyCommunicationPlanner(
         hierarchy=Hierarchy(ep_size=4, group_sizes=(2, 4), source="test"),
@@ -79,6 +84,11 @@ def _planner(
         exact_primitive_topk=exact_primitive_topk,
         post_shortlist_compact_pair=post_shortlist_compact_pair,
         exact_primitive_max_only=exact_primitive_max_only,
+        traffic_inter_ms_per_byte=traffic_inter_ms_per_byte,
+        traffic_intra_ms_per_byte=traffic_intra_ms_per_byte,
+        traffic_route_ms_per_assignment=traffic_route_ms_per_assignment,
+        traffic_communication_phase_multiplier=traffic_communication_phase_multiplier,
+        traffic_compute_phase_multiplier=traffic_compute_phase_multiplier,
     )
 
 
@@ -168,6 +178,78 @@ def test_hierarchical_traffic_features_match_two_stage_payloads():
     torch.testing.assert_close(features["stage2_payload_edge_bytes"], torch.tensor([224.0]))
     torch.testing.assert_close(features["stage1_max_active_peers"], torch.tensor([1.0]))
     torch.testing.assert_close(features["stage2_max_active_peers"], torch.tensor([2.0]))
+
+
+def test_compact_endpoint_statistics_match_full_source_traffic_features():
+    planner = _planner(
+        traffic_inter_ms_per_byte=2.0,
+        traffic_intra_ms_per_byte=3.0,
+        traffic_route_ms_per_assignment=5.0,
+        traffic_communication_phase_multiplier=7.0,
+        traffic_compute_phase_multiplier=11.0,
+        forward_compute_per_assignment=13.0,
+        forward_compute_constant=17.0,
+    )
+    source_unique = torch.tensor(
+        [
+            [[2, 1, 3, 0, 2, 3], [0, 1, 1, 2, 1, 2]],
+            [[1, 0, 2, 2, 1, 3], [3, 1, 0, 1, 4, 1]],
+            [[0, 2, 1, 4, 2, 5], [1, 2, 3, 0, 3, 3]],
+            [[2, 3, 0, 1, 5, 1], [2, 0, 1, 3, 2, 4]],
+        ],
+        dtype=torch.float32,
+    )
+    source_assignments = source_unique + 1
+
+    local_rows = [
+        planner._local_traffic_endpoint_statistics(
+            source_unique[source_rank],
+            source_assignments[source_rank],
+            source_rank=source_rank,
+        )
+        for source_rank in range(planner.ep_size)
+    ]
+    compact = torch.stack(local_rows).sum(dim=0)
+    compact_metrics = planner._traffic_endpoint_cost_details(compact)
+    full_features = planner._hierarchical_traffic_features(source_unique, source_assignments)
+    peak_assignments = source_assignments[:, :, : planner.ep_size].sum(dim=0).amax(dim=1)
+
+    torch.testing.assert_close(
+        compact_metrics[0],
+        7.0
+        * (
+            2.0 * full_features["stage1_payload_endpoint_bytes"]
+            + 3.0 * full_features["stage2_payload_endpoint_bytes"]
+            + 5.0 * peak_assignments
+        ),
+    )
+    torch.testing.assert_close(compact_metrics[1], 11.0 * (13.0 * peak_assignments + 17.0))
+
+
+def test_traffic_cost_model_scores_empty_cover_initialization():
+    planner = _planner(
+        max_copies=2,
+        traffic_inter_ms_per_byte=2.0e-6,
+        traffic_intra_ms_per_byte=1.0e-6,
+        traffic_route_ms_per_assignment=1.0e-3,
+        forward_compute_per_assignment=2.0e-3,
+    )
+    selected = torch.tensor([[0, 1], [0, 2], [1, 3], [2, 3]], dtype=torch.long)
+    layout = torch.tensor([0, -1, 1, -1, 2, -1, 3, -1], dtype=torch.long)
+    owners = torch.tensor([0, 2, 4, 6], dtype=torch.long)
+
+    plan = planner.plan(
+        selected,
+        layout,
+        owners,
+        source_ranks=0,
+        max_swaps=0,
+        max_replicas=4,
+    )
+
+    assert len(plan.actions) == 4
+    assert all(action.kind == "replica" for action in plan.actions)
+    assert all(value >= 0 for value in plan.final_layout)
 
 
 def test_nonnegative_multifeature_fit_recovers_affine_model():

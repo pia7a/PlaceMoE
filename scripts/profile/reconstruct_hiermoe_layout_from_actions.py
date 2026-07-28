@@ -32,11 +32,32 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--ep-size", type=int, default=32)
     parser.add_argument("--num-experts", type=int, default=128)
     parser.add_argument("--slots-per-rank", type=int, default=8)
+    parser.add_argument("--layer-count", type=int, default=48)
+    parser.add_argument(
+        "--layer-template",
+        default="model.language_model.layers.{layer}.mlp.experts",
+    )
     parser.add_argument(
         "--through-action-step",
         type=int,
         default=None,
         help="Last selected-action step to replay. By default infer it from next-step migration completion.",
+    )
+    parser.add_argument(
+        "--clear-fixed-r2-redundant-slots",
+        action="store_true",
+        help=(
+            "Replay an online-freeze seed: start from fixed R2, clear every non-owner "
+            "R2 slot, then apply the logged replica actions."
+        ),
+    )
+    parser.add_argument(
+        "--canonical-empty-seed",
+        action="store_true",
+        help=(
+            "Start from the canonical one-owner-per-expert layout with every "
+            "reserved redundant slot empty."
+        ),
     )
     return parser.parse_args()
 
@@ -104,6 +125,28 @@ def _fixed_r2_layout(ep_size: int, num_experts: int, slots_per_rank: int) -> tup
     return layout, owners
 
 
+def _canonical_empty_layout(
+    ep_size: int,
+    num_experts: int,
+    slots_per_rank: int,
+) -> tuple[list[int], list[int]]:
+    if ep_size <= 0 or num_experts % ep_size:
+        raise ValueError(f"Canonical layout requires num_experts divisible by ep_size, got {num_experts}/{ep_size}.")
+    base_slots_per_rank = num_experts // ep_size
+    if slots_per_rank < base_slots_per_rank:
+        raise ValueError(
+            f"Canonical layout needs at least {base_slots_per_rank} slots/rank, got {slots_per_rank}."
+        )
+    layout = [-1] * (ep_size * slots_per_rank)
+    owners = [-1] * num_experts
+    for logical in range(num_experts):
+        rank, local_slot = divmod(logical, base_slots_per_rank)
+        physical_slot = rank * slots_per_rank + local_slot
+        layout[physical_slot] = logical
+        owners[logical] = physical_slot
+    return layout, owners
+
+
 def _replay_action(layout: list[int], owners: list[int], kind: str, body: str) -> None:
     if kind == "swap":
         lhs_text, rhs_text = body.split("<->", maxsplit=1)
@@ -123,7 +166,13 @@ def _replay_action(layout: list[int], owners: list[int], kind: str, body: str) -
             raise ValueError(f"Replica destination slot is out of range: {body}.")
         if layout[owners[logical]] != logical:
             raise ValueError(f"Replica source owner is invalid for expert {logical}.")
+        victim = layout[dst_slot]
         layout[dst_slot] = logical
+        if victim >= 0 and owners[victim] == dst_slot:
+            remaining = [slot for slot, value in enumerate(layout) if value == victim]
+            if not remaining:
+                raise ValueError(f"Replica {body} removes the final copy of victim expert {victim}.")
+            owners[victim] = min(remaining)
         return
     logical_text, slot_text = body.split("@", maxsplit=1)
     logical, slot = int(logical_text), int(slot_text)
@@ -134,6 +183,8 @@ def _replay_action(layout: list[int], owners: list[int], kind: str, body: str) -
 
 def main() -> None:
     args = _parse_args()
+    if args.clear_fixed_r2_redundant_slots and args.canonical_empty_seed:
+        raise ValueError("--clear-fixed-r2-redundant-slots and --canonical-empty-seed are mutually exclusive.")
     records = _read_records(args.log)
     through_step = (
         _infer_committed_action_step(records) if args.through_action_step is None else int(args.through_action_step)
@@ -142,15 +193,38 @@ def main() -> None:
     if not action_steps or action_steps[-1] != through_step:
         raise ValueError(f"No actions found for requested through-action-step={through_step}.")
 
-    layer_names = sorted({layer for step in action_steps for layer, _kind, _body in records[step].actions})
+    logged_layers = {layer for step in action_steps for layer, _kind, _body in records[step].actions}
+    configured_layers = {
+        args.layer_template.format(layer=layer)
+        for layer in range(args.layer_count)
+    }
+    layer_names = sorted(logged_layers | configured_layers)
     layouts: dict[str, list[int]] = {}
     owners_by_layer: dict[str, list[int]] = {}
     action_counts: dict[str, int] = {}
     for layer in layer_names:
-        layout, owners = _fixed_r2_layout(args.ep_size, args.num_experts, args.slots_per_rank)
+        if args.canonical_empty_seed:
+            layout, owners = _canonical_empty_layout(args.ep_size, args.num_experts, args.slots_per_rank)
+        else:
+            layout, owners = _fixed_r2_layout(args.ep_size, args.num_experts, args.slots_per_rank)
         layouts[layer] = layout
         owners_by_layer[layer] = owners
         action_counts[layer] = 0
+
+    prefix_actions: list[dict[str, str]] = []
+    if args.clear_fixed_r2_redundant_slots:
+        for layer in layer_names:
+            layout = layouts[layer]
+            owners = set(owners_by_layer[layer])
+            for slot, logical in enumerate(layout):
+                if slot in owners:
+                    continue
+                if logical < 0:
+                    raise ValueError(f"Fixed R2 redundant slot {slot} is unexpectedly empty for {layer}.")
+                body = f"{logical}@{slot}"
+                _replay_action(layout, owners_by_layer[layer], "empty", body)
+                prefix_actions.append({"layer": layer, "kind": "empty", "body": body})
+                action_counts[layer] += 1
 
     for step in action_steps:
         for layer, kind, body in records[step].actions:
@@ -177,11 +251,18 @@ def main() -> None:
         ]
         for step in action_steps
     }
+    if prefix_actions:
+        prefix_step = min(action_steps) - 1
+        actions_by_step[str(prefix_step)] = prefix_actions
     output = {
         "schema_version": 1,
         "source": {
             "rank0_log": str(args.log.resolve()),
-            "initial_layout": "fixed_r2",
+            "initial_layout": (
+                "fixed_r2_then_clear_redundant"
+                if args.clear_fixed_r2_redundant_slots
+                else ("canonical_empty" if args.canonical_empty_seed else "fixed_r2")
+            ),
             "committed_action_steps": action_steps,
             "excluded_pending_action_steps": pending_steps,
             "commit_inference": "action step S is committed only when step S+1 reports all layer migrations and no stale migration",

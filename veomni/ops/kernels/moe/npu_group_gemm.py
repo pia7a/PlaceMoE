@@ -221,9 +221,8 @@ def npu_ep_fused_moe_forward(
             start_event=region_start,
             end_event=region_end,
         )
-        if capture_placement_timing:
+        if placement_manager is not None and layer_key is not None:
             assert layer_key is not None
-            assert placement_manager is not None
             placement_manager.record_dispatch_statistics(
                 layer_key=layer_key,
                 step=state.current_step,

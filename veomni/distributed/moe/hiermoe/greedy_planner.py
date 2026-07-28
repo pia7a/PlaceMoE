@@ -266,6 +266,11 @@ class GreedyCommunicationPlanner:
         exact_primitive_topk: int = 0,
         post_shortlist_compact_pair: bool = False,
         exact_primitive_max_only: bool = False,
+        traffic_inter_ms_per_byte: float | None = None,
+        traffic_intra_ms_per_byte: float | None = None,
+        traffic_route_ms_per_assignment: float = 0.0,
+        traffic_communication_phase_multiplier: float = 1.0,
+        traffic_compute_phase_multiplier: float = 1.0,
     ) -> None:
         if smooth_max_gamma <= 0:
             raise ValueError("smooth_max_gamma must be positive.")
@@ -298,6 +303,14 @@ class GreedyCommunicationPlanner:
         self.exact_primitive_topk = max(0, int(exact_primitive_topk))
         self.post_shortlist_compact_pair = bool(post_shortlist_compact_pair)
         self.exact_primitive_max_only = bool(exact_primitive_max_only)
+        if (traffic_inter_ms_per_byte is None) != (traffic_intra_ms_per_byte is None):
+            raise ValueError("Traffic inter/intra coefficients must either both be set or both be omitted.")
+        self.traffic_cost_enabled = traffic_inter_ms_per_byte is not None
+        self.traffic_inter_ms_per_byte = float(traffic_inter_ms_per_byte or 0.0)
+        self.traffic_intra_ms_per_byte = float(traffic_intra_ms_per_byte or 0.0)
+        self.traffic_route_ms_per_assignment = float(traffic_route_ms_per_assignment)
+        self.traffic_communication_phase_multiplier = float(traffic_communication_phase_multiplier)
+        self.traffic_compute_phase_multiplier = float(traffic_compute_phase_multiplier)
         enabled_topk_modes = sum(
             int(value)
             for value in (
@@ -319,6 +332,17 @@ class GreedyCommunicationPlanner:
             raise ValueError("forward_compute_per_assignment must be non-negative.")
         if self.forward_compute_constant < 0.0:
             raise ValueError("forward_compute_constant must be non-negative.")
+        if (
+            min(
+                self.traffic_inter_ms_per_byte,
+                self.traffic_intra_ms_per_byte,
+                self.traffic_route_ms_per_assignment,
+                self.traffic_communication_phase_multiplier,
+                self.traffic_compute_phase_multiplier,
+            )
+            < 0.0
+        ):
+            raise ValueError("Traffic cost-model coefficients and phase multipliers must be non-negative.")
 
     @property
     def ep_size(self) -> int:
@@ -397,9 +421,7 @@ class GreedyCommunicationPlanner:
         """
 
         if unique_matrix.shape != assignment_matrix.shape or unique_matrix.ndim != 4:
-            raise ValueError(
-                "Stage traffic matrices must have the same [batch, group, source, destination] shape."
-            )
+            raise ValueError("Stage traffic matrices must have the same [batch, group, source, destination] shape.")
         unique = unique_matrix.to(torch.float32)
         assignments = assignment_matrix.to(torch.float32)
         unique_send = unique.sum(dim=3)
@@ -408,9 +430,7 @@ class GreedyCommunicationPlanner:
         assignment_receive = assignments.sum(dim=2)
 
         dispatch_send_bytes = float(hidden_bytes) * unique_send + float(metadata_bytes) * assignment_send
-        dispatch_receive_bytes = (
-            float(hidden_bytes) * unique_receive + float(metadata_bytes) * assignment_receive
-        )
+        dispatch_receive_bytes = float(hidden_bytes) * unique_receive + float(metadata_bytes) * assignment_receive
         dispatch_endpoint_bytes = torch.maximum(
             dispatch_send_bytes.amax(dim=(1, 2)),
             dispatch_receive_bytes.amax(dim=(1, 2)),
@@ -421,9 +441,7 @@ class GreedyCommunicationPlanner:
         )
         combine_endpoint_bytes = float(hidden_bytes) * unique_endpoint
 
-        dispatch_edge_bytes = (
-            float(hidden_bytes) * unique + float(metadata_bytes) * assignments
-        ).amax(dim=(1, 2, 3))
+        dispatch_edge_bytes = (float(hidden_bytes) * unique + float(metadata_bytes) * assignments).amax(dim=(1, 2, 3))
         combine_edge_bytes = float(hidden_bytes) * unique.amax(dim=(1, 2, 3))
         active_send_peers = (unique > 0).sum(dim=3, dtype=torch.float32).amax(dim=(1, 2))
         active_receive_peers = (unique > 0).sum(dim=2, dtype=torch.float32).amax(dim=(1, 2))
@@ -441,14 +459,12 @@ class GreedyCommunicationPlanner:
         remote_assignment_send = remote_assignments.sum(dim=3)
         remote_assignment_receive = remote_assignments.sum(dim=2)
         remote_dispatch_endpoint_bytes = torch.maximum(
-            (
-                float(hidden_bytes) * remote_unique_send
-                + float(metadata_bytes) * remote_assignment_send
-            ).amax(dim=(1, 2)),
-            (
-                float(hidden_bytes) * remote_unique_receive
-                + float(metadata_bytes) * remote_assignment_receive
-            ).amax(dim=(1, 2)),
+            (float(hidden_bytes) * remote_unique_send + float(metadata_bytes) * remote_assignment_send).amax(
+                dim=(1, 2)
+            ),
+            (float(hidden_bytes) * remote_unique_receive + float(metadata_bytes) * remote_assignment_receive).amax(
+                dim=(1, 2)
+            ),
         )
         remote_unique_endpoint = torch.maximum(
             remote_unique_send.amax(dim=(1, 2)),
@@ -461,8 +477,7 @@ class GreedyCommunicationPlanner:
         diagonal_unique = unique.diagonal(dim1=2, dim2=3)
         diagonal_assignments = assignments.diagonal(dim1=2, dim2=3)
         self_endpoint_bytes = (
-            2.0 * float(hidden_bytes) * diagonal_unique
-            + float(metadata_bytes) * diagonal_assignments
+            2.0 * float(hidden_bytes) * diagonal_unique + float(metadata_bytes) * diagonal_assignments
         ).amax(dim=(1, 2))
         return {
             "unique_endpoint_tokens": unique_endpoint,
@@ -573,8 +588,7 @@ class GreedyCommunicationPlanner:
             + float(intra_link.beta) * stage2["full_endpoint_bytes"]
         )
         payload_edge_link_units = (
-            float(inter_link.beta) * stage1["full_edge_bytes"]
-            + float(intra_link.beta) * stage2["full_edge_bytes"]
+            float(inter_link.beta) * stage1["full_edge_bytes"] + float(intra_link.beta) * stage2["full_edge_bytes"]
         )
         shared_node_link_units = (
             float(inter_link.beta) * stage1_node["full_endpoint_bytes"]
@@ -609,6 +623,238 @@ class GreedyCommunicationPlanner:
             "stage1_max_active_peers": stage1["max_active_peers"],
             "stage2_max_active_peers": stage2["max_active_peers"],
         }
+
+    def _local_traffic_endpoint_statistics(
+        self,
+        unique_counts: torch.Tensor,
+        assignment_counts: torch.Tensor,
+        *,
+        source_rank: int,
+    ) -> torch.Tensor:
+        """Build compact source-aware sufficient statistics for both A2A stages.
+
+        The full traffic matrix is unnecessary for endpoint-bottleneck
+        scoring. For each stage and payload kind, only the per-source send and
+        per-destination receive totals are retained. SUM reduction across EP
+        ranks reconstructs the exact endpoint totals while preserving source
+        lane/node identity.
+        """
+
+        if unique_counts.ndim != 2 or assignment_counts.ndim != 2:
+            raise ValueError("Traffic counts must be two-dimensional.")
+        if int(unique_counts.shape[0]) != int(assignment_counts.shape[0]):
+            raise ValueError("Unique and assignment traffic counts must have the same batch size.")
+        if int(self.hierarchy.selected_dim) != 2 or len(self.hierarchy.group_sizes) < 2:
+            raise ValueError("Traffic endpoint scoring currently requires a two-stage hierarchy.")
+        intra_size = int(self.hierarchy.group_sizes[0])
+        if intra_size <= 1 or self.ep_size % intra_size != 0:
+            raise ValueError(f"Invalid intra-node size {intra_size} for EP size {self.ep_size}.")
+        if source_rank < 0 or source_rank >= self.ep_size:
+            raise ValueError(f"Invalid source rank {source_rank} for EP size {self.ep_size}.")
+        num_nodes = self.ep_size // intra_size
+        widths = self._count_widths()
+        if widths[:2] != (self.ep_size, num_nodes):
+            raise ValueError(f"Unexpected two-stage packed widths {widths}.")
+
+        unique_rank, unique_node = unique_counts.split(widths, dim=1)[:2]
+        if int(assignment_counts.shape[1]) == self.ep_size:
+            assignment_rank = assignment_counts
+            assignment_node = assignment_rank.view(-1, num_nodes, intra_size).sum(dim=2)
+        elif int(assignment_counts.shape[1]) == sum(widths):
+            assignment_rank, assignment_node = assignment_counts.split(widths, dim=1)[:2]
+        else:
+            raise ValueError(
+                f"Expected assignment width {self.ep_size} or {sum(widths)}, "
+                f"got {int(assignment_counts.shape[1])}."
+            )
+        batch = int(unique_counts.shape[0])
+        lane = int(source_rank) % intra_size
+
+        def stage1_rows(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            send = values.new_zeros((batch, self.ep_size))
+            send[:, int(source_rank)] = values.sum(dim=1)
+            receive = values.new_zeros((batch, self.ep_size))
+            indices = lane * num_nodes + torch.arange(num_nodes, device=values.device)
+            receive.scatter_(1, indices.view(1, -1).expand(batch, -1), values)
+            return send, receive
+
+        def stage2_rows(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            by_node = values.view(batch, num_nodes, intra_size).sum(dim=2)
+            send = values.new_zeros((batch, self.ep_size))
+            indices = torch.arange(num_nodes, device=values.device) * intra_size + lane
+            send.scatter_(1, indices.view(1, -1).expand(batch, -1), by_node)
+            return send, values
+
+        unique_stage1_send, unique_stage1_receive = stage1_rows(unique_node)
+        assignment_stage1_send, assignment_stage1_receive = stage1_rows(assignment_node)
+        unique_stage2_send, unique_stage2_receive = stage2_rows(unique_rank)
+        assignment_stage2_send, assignment_stage2_receive = stage2_rows(assignment_rank)
+        return torch.cat(
+            (
+                unique_stage1_send,
+                unique_stage1_receive,
+                assignment_stage1_send,
+                assignment_stage1_receive,
+                unique_stage2_send,
+                unique_stage2_receive,
+                assignment_stage2_send,
+                assignment_stage2_receive,
+            ),
+            dim=1,
+        )
+
+    def _traffic_endpoint_cost_details(
+        self,
+        endpoint_statistics: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Score globally reduced endpoint statistics with the hybrid model."""
+
+        if endpoint_statistics.ndim != 2 or int(endpoint_statistics.shape[1]) != 8 * self.ep_size:
+            raise ValueError(
+                f"Expected traffic endpoint width {8 * self.ep_size}, got {tuple(endpoint_statistics.shape)}."
+            )
+        (
+            unique_stage1_send,
+            unique_stage1_receive,
+            assignment_stage1_send,
+            assignment_stage1_receive,
+            unique_stage2_send,
+            unique_stage2_receive,
+            assignment_stage2_send,
+            assignment_stage2_receive,
+        ) = endpoint_statistics.split(self.ep_size, dim=1)
+        hidden_bytes = float(self.payload_bytes)
+
+        def full_endpoint_bytes(
+            unique_send: torch.Tensor,
+            unique_receive: torch.Tensor,
+            assignment_send: torch.Tensor,
+            assignment_receive: torch.Tensor,
+            metadata_bytes: int,
+        ) -> torch.Tensor:
+            dispatch = torch.maximum(
+                (hidden_bytes * unique_send + float(metadata_bytes) * assignment_send).amax(dim=1),
+                (hidden_bytes * unique_receive + float(metadata_bytes) * assignment_receive).amax(dim=1),
+            )
+            combine = hidden_bytes * torch.maximum(
+                unique_send.amax(dim=1),
+                unique_receive.amax(dim=1),
+            )
+            return dispatch + combine
+
+        stage1_bytes = full_endpoint_bytes(
+            unique_stage1_send,
+            unique_stage1_receive,
+            assignment_stage1_send,
+            assignment_stage1_receive,
+            3 * 4,
+        )
+        stage2_bytes = full_endpoint_bytes(
+            unique_stage2_send,
+            unique_stage2_receive,
+            assignment_stage2_send,
+            assignment_stage2_receive,
+            2 * 4,
+        )
+        peak_assignments, peak_compute_rank = assignment_stage2_receive.max(dim=1)
+        network = self.traffic_communication_phase_multiplier * (
+            self.traffic_inter_ms_per_byte * stage1_bytes + self.traffic_intra_ms_per_byte * stage2_bytes
+        )
+        local_route = (
+            self.traffic_communication_phase_multiplier * self.traffic_route_ms_per_assignment * peak_assignments
+        )
+        communication = self.communication_scale * (network + local_route)
+        compute = self.traffic_compute_phase_multiplier * (
+            self.forward_compute_per_assignment * peak_assignments + self.forward_compute_constant
+        )
+        units = (
+            self.traffic_inter_ms_per_byte * stage1_bytes
+            + self.traffic_intra_ms_per_byte * stage2_bytes
+            + self.traffic_route_ms_per_assignment * peak_assignments
+        )
+        # PlacementCost only uses this rank diagnostically. Preserve the
+        # actual destination-rank bottleneck rather than the byte magnitude.
+        peak_rank = (hidden_bytes * unique_stage2_receive + float(2 * 4) * assignment_stage2_receive).argmax(dim=1)
+        selected_dim = torch.full_like(peak_rank, 2)
+        return communication, compute, units, peak_rank, peak_compute_rank, selected_dim
+
+    def _global_traffic_action_costs(
+        self,
+        baseline_local: torch.Tensor,
+        candidate_local: torch.Tensor,
+        baseline_assignment_local: torch.Tensor,
+        candidate_assignment_local: torch.Tensor,
+        *,
+        source_rank: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reduce source-aware endpoint statistics and score all action rows."""
+
+        baseline_endpoints = self._local_traffic_endpoint_statistics(
+            baseline_local,
+            baseline_assignment_local,
+            source_rank=source_rank,
+        )
+        candidate_endpoints = self._local_traffic_endpoint_statistics(
+            candidate_local,
+            candidate_assignment_local,
+            source_rank=source_rank,
+        )
+
+        def costs(rows: torch.Tensor):
+            return self._traffic_endpoint_cost_details(rows)
+
+        if candidate_local.numel() == 0:
+            return costs(_reduce_sum(baseline_endpoints, self.reducer))
+        if not self._use_sharded_candidate_collective(baseline_endpoints.device):
+            return costs(_reduce_sum(torch.cat((baseline_endpoints, candidate_endpoints), dim=0), self.reducer))
+
+        assert self.process_group is not None
+        baseline_global = baseline_endpoints.clone()
+        dist.all_reduce(baseline_global, op=dist.ReduceOp.SUM, group=self.process_group)
+        baseline_metrics = costs(baseline_global)
+
+        group_size = dist.get_world_size(self.process_group)
+        num_candidates, width = candidate_endpoints.shape
+        shard_rows = (num_candidates + group_size - 1) // group_size
+        padded_rows = shard_rows * group_size
+        if padded_rows != num_candidates:
+            candidate_endpoints = torch.cat(
+                (
+                    candidate_endpoints,
+                    candidate_endpoints.new_zeros((padded_rows - num_candidates, width)),
+                ),
+                dim=0,
+            )
+        reduced_shard = candidate_endpoints.new_empty((shard_rows, width))
+        dist.reduce_scatter_tensor(
+            reduced_shard,
+            candidate_endpoints.contiguous(),
+            op=dist.ReduceOp.SUM,
+            group=self.process_group,
+        )
+        shard_metrics = costs(reduced_shard)
+        packed_metrics = torch.stack(
+            (
+                shard_metrics[0],
+                shard_metrics[1],
+                shard_metrics[2],
+                shard_metrics[3].to(shard_metrics[0].dtype),
+                shard_metrics[4].to(shard_metrics[0].dtype),
+                shard_metrics[5].to(shard_metrics[0].dtype),
+            ),
+            dim=1,
+        ).contiguous()
+        gathered_metrics = packed_metrics.new_empty((padded_rows, 6))
+        dist.all_gather_into_tensor(gathered_metrics, packed_metrics, group=self.process_group)
+        candidate_metrics = gathered_metrics[:num_candidates]
+        return (
+            torch.cat((baseline_metrics[0], candidate_metrics[:, 0]), dim=0),
+            torch.cat((baseline_metrics[1], candidate_metrics[:, 1]), dim=0),
+            torch.cat((baseline_metrics[2], candidate_metrics[:, 2]), dim=0),
+            torch.cat((baseline_metrics[3], candidate_metrics[:, 3].to(torch.long)), dim=0),
+            torch.cat((baseline_metrics[4], candidate_metrics[:, 4].to(torch.long)), dim=0),
+            torch.cat((baseline_metrics[5], candidate_metrics[:, 5].to(torch.long)), dim=0),
+        )
 
     def _communication_cost_details(
         self,
@@ -2099,15 +2345,31 @@ class GreedyCommunicationPlanner:
             step=step,
             layer_seed=layer_seed,
             num_experts=num_experts,
+            include_assignment_counts=True if self.traffic_cost_enabled else None,
         )
-        communication, compute, units, peak_rank, peak_compute_rank, selected_dim = self._global_action_costs(
-            prepared.baseline_local,
-            prepared.candidate_local,
-            prepared.baseline_assignment_local,
-            prepared.candidate_assignment_local,
-            prepared.affected_groups,
-            prepared.affected_assignment_ranks,
-        )
+        if self.traffic_cost_enabled:
+            if uniform_source_rank is None:
+                raise ValueError("Traffic endpoint scoring requires one uniform source rank per planner.")
+            if prepared.baseline_assignment_local is None or prepared.candidate_assignment_local is None:
+                raise RuntimeError("Traffic endpoint scoring requires non-deduplicated assignment counts.")
+            communication, compute, units, peak_rank, peak_compute_rank, selected_dim = (
+                self._global_traffic_action_costs(
+                    prepared.baseline_local,
+                    prepared.candidate_local,
+                    prepared.baseline_assignment_local,
+                    prepared.candidate_assignment_local,
+                    source_rank=uniform_source_rank,
+                )
+            )
+        else:
+            communication, compute, units, peak_rank, peak_compute_rank, selected_dim = self._global_action_costs(
+                prepared.baseline_local,
+                prepared.candidate_local,
+                prepared.baseline_assignment_local,
+                prepared.candidate_assignment_local,
+                prepared.affected_groups,
+                prepared.affected_assignment_ranks,
+            )
         return _ScoredLayouts(
             communication=communication,
             compute=compute,

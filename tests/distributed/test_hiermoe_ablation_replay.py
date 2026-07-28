@@ -123,6 +123,83 @@ def test_ablation_replay_builds_swap_from_current_owner_slots(tmp_path, monkeypa
     manager.shutdown_pipeline()
 
 
+def test_ablation_replay_cover_promotes_remaining_victim_copy(tmp_path, monkeypatch):
+    key = "layers.0.mlp.experts"
+    replay_path = tmp_path / "replay.json"
+    replay_path.write_text(
+        json.dumps(
+            {
+                "topology": {"ep_size": 2},
+                "replay": {
+                    "actions_by_step": {
+                        "1": [{"layer": key, "kind": "replica", "body": "2->0"}],
+                    }
+                },
+                "layers": {
+                    key: {
+                        "slot_to_logical": [2, 1, 0, 2, 3, 2],
+                    }
+                },
+            }
+        )
+    )
+    manager = _manager(monkeypatch, replay_path)
+    manager.register_layer(key, _FakeExperts())
+    layer = manager.layers[key]
+    layer.slot_to_logical = torch.tensor([0, 1, 0, 2, 3, 2], dtype=torch.long)
+    manager._refresh_layer_mapping_from_slots(layer, (0, 1, 3, 4))
+
+    plan = manager._build_ablation_replay_plan(layer, (("replica", "2->0"),))
+
+    assert plan.actions[0].src_slot == 3
+    assert plan.actions[0].dst_slot == 0
+    assert plan.actions[0].dst_logical == 0
+    assert plan.final_layout == (2, 1, 0, 2, 3, 2)
+    assert plan.final_owner_slots == (2, 1, 3, 4)
+    manager.shutdown_pipeline()
+
+
+def test_ablation_replay_installs_owner_and_source_route_metadata(tmp_path, monkeypatch):
+    key = "layers.0.mlp.experts"
+    replay_path = tmp_path / "replay.json"
+    replay_path.write_text(
+        json.dumps(
+            {
+                "topology": {"ep_size": 2},
+                "replay": {
+                    "actions_by_step": {
+                        "1": [{"layer": key, "kind": "replica", "body": "2->5"}],
+                    }
+                },
+                "layers": {
+                    key: {
+                        "slot_to_logical": [1, 0, -1, 2, 3, 2],
+                        "owner_slots": [1, 0, 3, 4],
+                        "source_logical_to_physical": [
+                            [1, 0, 3, 4],
+                            [1, 0, 5, 4],
+                        ],
+                    }
+                },
+            }
+        )
+    )
+    manager = _manager(monkeypatch, replay_path)
+    manager.register_layer(key, _FakeExperts())
+    layer = manager.layers[key]
+    layer.slot_to_logical = torch.tensor([1, 0, -1, 2, 3, 2], dtype=torch.long)
+
+    manager._install_static_ablation_route_metadata()
+    manager._validate_ablation_final_layout()
+
+    assert layer.logical_to_physical.tolist() == [1, 0, 3, 4]
+    assert layer.source_logical_to_physical.tolist() == [
+        [1, 0, 3, 4],
+        [1, 0, 5, 4],
+    ]
+    manager.shutdown_pipeline()
+
+
 def _blocking_gradient_sync_worker():
     expert_swap_module._ABLATION_REPLAY_MODE = "off"
     expert_swap_module._ABLATION_GRAD_MODE = "blocking"

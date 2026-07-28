@@ -52,8 +52,12 @@ class RankDedupDispatchContext:
     recv_unique_indices: torch.Tensor | None = None
     stage1_unique_send_splits: list[int] | None = None
     stage1_unique_recv_splits: list[int] | None = None
+    stage1_assignment_send_splits: list[int] | None = None
+    stage1_assignment_recv_splits: list[int] | None = None
     stage2_unique_send_splits: list[int] | None = None
     stage2_unique_recv_splits: list[int] | None = None
+    stage2_assignment_send_splits: list[int] | None = None
+    stage2_assignment_recv_splits: list[int] | None = None
     stage2_send_stage1_unique_indices: torch.Tensor | None = None
     stage3_group: dist.ProcessGroup | None = None
     stage3_unique_send_splits: list[int] | None = None
@@ -117,6 +121,16 @@ _BACKWARD_SCORE_WINDOW = "backward_dispatch_stage1_a2a"
 
 def _hiermoe_internal_event() -> AcceleratorEvent | None:
     return record_accelerator_event() if _HIERMOE_INTERNAL_TIMING else None
+
+
+def _finish_hiermoe_internal_event(
+    events: dict[str, tuple[AcceleratorEvent, AcceleratorEvent]] | None,
+    name: str,
+    start: AcceleratorEvent | None,
+) -> None:
+    end = _hiermoe_internal_event()
+    if events is not None and start is not None and end is not None:
+        events[name] = (start, end)
 
 
 class _BackwardA2AStart(torch.autograd.Function):
@@ -1396,9 +1410,11 @@ def _hierarchical_dedup_dispatch(
 ) -> tuple[torch.Tensor, RankDedupDispatchContext, torch.Tensor]:
     groups = _get_hierarchical_process_groups(ep_group, ep_size, ep_rank, intra_size)
     pipeline_manager = _fixed_pipeline_manager(layer_key)
-    backward_internal_timing_events = (
-        {} if _HIERMOE_INTERNAL_TIMING and hidden_states.requires_grad else None
+    internal_timing_events: dict[str, tuple[AcceleratorEvent, AcceleratorEvent]] | None = (
+        {} if _HIERMOE_INTERNAL_TIMING else None
     )
+    backward_internal_timing_events = {} if _HIERMOE_INTERNAL_TIMING and hidden_states.requires_grad else None
+    internal_start = _hiermoe_internal_event()
     span = _begin_internal_span("hiermoe_stage1_payload_build")
     try:
         (
@@ -1420,6 +1436,11 @@ def _hierarchical_dedup_dispatch(
         )
     finally:
         _end_internal_span(span)
+        _finish_hiermoe_internal_event(
+            internal_timing_events,
+            "stage1_payload_build",
+            internal_start,
+        )
     stage1_unique_send_splits = stage1_unique_send_splits_full
     stage1_assignment_send_splits = stage1_assignment_send_splits_full
     span = _begin_internal_span("hiermoe_stage1_split_sizes_start")
@@ -1431,12 +1452,24 @@ def _hierarchical_dedup_dispatch(
         )
     finally:
         _end_internal_span(span)
+    internal_start = _hiermoe_internal_event()
     stage1_send_meta_weights = _pack_meta_weights(stage1_send_meta, stage1_send_weights)
+    _finish_hiermoe_internal_event(
+        internal_timing_events,
+        "stage1_meta_pack",
+        internal_start,
+    )
+    internal_start = _hiermoe_internal_event()
     span = _begin_internal_span("hiermoe_stage1_split_sizes")
     try:
         stage1_unique_recv_splits, stage1_assignment_recv_splits = stage1_split_exchange.wait()
     finally:
         _end_internal_span(span)
+        _finish_hiermoe_internal_event(
+            internal_timing_events,
+            "stage1_split_wait",
+            internal_start,
+        )
     stage1_send_hidden = _mark_backward_a2a_input(
         stage1_send_hidden,
         backward_internal_timing_events,
@@ -1456,6 +1489,8 @@ def _hierarchical_dedup_dispatch(
         stage1_assignment_send_splits,
     )
     stage1_a2a_end = _hiermoe_internal_event()
+    if stage1_a2a_start is not None and stage1_a2a_end is not None and internal_timing_events is not None:
+        internal_timing_events["stage1_a2a"] = (stage1_a2a_start, stage1_a2a_end)
     if pipeline_manager is not None:
         pipeline_manager.close_pipeline_planner_prepare_window(layer_key, 0)
     stage1_recv_hidden = _mark_backward_a2a_output(
@@ -1464,10 +1499,17 @@ def _hierarchical_dedup_dispatch(
         "backward_dispatch_stage1_a2a",
         layer_key,
     )
+    internal_start = _hiermoe_internal_event()
     stage1_recv_meta, stage1_recv_weights = _unpack_meta_weights(
         stage1_recv_meta_weights, meta_cols=2, weight_dtype=routing_weights.dtype
     )
+    _finish_hiermoe_internal_event(
+        internal_timing_events,
+        "stage1_meta_unpack",
+        internal_start,
+    )
 
+    internal_start = _hiermoe_internal_event()
     span = _begin_internal_span("hiermoe_stage2_payload_build")
     try:
         (
@@ -1490,6 +1532,11 @@ def _hierarchical_dedup_dispatch(
         )
     finally:
         _end_internal_span(span)
+        _finish_hiermoe_internal_event(
+            internal_timing_events,
+            "stage2_payload_build",
+            internal_start,
+        )
     span = _begin_internal_span("hiermoe_stage2_split_sizes_start")
     try:
         stage2_split_exchange = _start_exchange_split_sizes_many(
@@ -1499,12 +1546,24 @@ def _hierarchical_dedup_dispatch(
         )
     finally:
         _end_internal_span(span)
+    internal_start = _hiermoe_internal_event()
     stage2_send_meta_weights = _pack_meta_weights(stage2_send_meta, stage2_send_weights)
+    _finish_hiermoe_internal_event(
+        internal_timing_events,
+        "stage2_meta_pack",
+        internal_start,
+    )
+    internal_start = _hiermoe_internal_event()
     span = _begin_internal_span("hiermoe_stage2_split_sizes")
     try:
         stage2_unique_recv_splits, stage2_assignment_recv_splits = stage2_split_exchange.wait()
     finally:
         _end_internal_span(span)
+        _finish_hiermoe_internal_event(
+            internal_timing_events,
+            "stage2_split_wait",
+            internal_start,
+        )
     stage2_send_hidden = _mark_backward_a2a_input(
         stage2_send_hidden,
         backward_internal_timing_events,
@@ -1524,6 +1583,8 @@ def _hierarchical_dedup_dispatch(
         stage2_assignment_send_splits,
     )
     stage2_a2a_end = _hiermoe_internal_event()
+    if stage2_a2a_start is not None and stage2_a2a_end is not None and internal_timing_events is not None:
+        internal_timing_events["stage2_a2a"] = (stage2_a2a_start, stage2_a2a_end)
     if pipeline_manager is not None:
         pipeline_manager.close_pipeline_planner_prepare_window(layer_key, 1)
     recv_hidden = _mark_backward_a2a_output(
@@ -1532,8 +1593,15 @@ def _hierarchical_dedup_dispatch(
         "backward_dispatch_stage2_a2a",
         layer_key,
     )
+    internal_start = _hiermoe_internal_event()
     recv_meta, recv_weights = _unpack_meta_weights(recv_meta_weights, meta_cols=1, weight_dtype=routing_weights.dtype)
+    _finish_hiermoe_internal_event(
+        internal_timing_events,
+        "stage2_meta_unpack",
+        internal_start,
+    )
 
+    internal_start = _hiermoe_internal_event()
     span = _begin_internal_span("hiermoe_dispatch_finalize")
     try:
         relay_group_ranks = _repeat_ranks(stage2_assignment_recv_splits, hidden_states.device)
@@ -1569,20 +1637,14 @@ def _hierarchical_dedup_dispatch(
             permuted_tokens = recv_hidden.index_select(0, recv_unique_indices)
     finally:
         _end_internal_span(span)
+        _finish_hiermoe_internal_event(
+            internal_timing_events,
+            "dispatch_finalize",
+            internal_start,
+        )
     original_assignments = int(selected_experts.numel())
     dedup_tokens = int(sum(stage1_unique_send_splits))
     dedup_ratio = 1.0 - (dedup_tokens / max(1, original_assignments))
-    internal_timing_events = None
-    if (
-        stage1_a2a_start is not None
-        and stage1_a2a_end is not None
-        and stage2_a2a_start is not None
-        and stage2_a2a_end is not None
-    ):
-        internal_timing_events = {
-            "stage1_a2a": (stage1_a2a_start, stage1_a2a_end),
-            "stage2_a2a": (stage2_a2a_start, stage2_a2a_end),
-        }
     ctx = RankDedupDispatchContext(
         ep_group=ep_group,
         stage1_group=groups.stage1_group,
@@ -1607,8 +1669,12 @@ def _hierarchical_dedup_dispatch(
         recv_unique_indices=recv_unique_indices,
         stage1_unique_send_splits=stage1_unique_send_splits,
         stage1_unique_recv_splits=stage1_unique_recv_splits,
+        stage1_assignment_send_splits=stage1_assignment_send_splits,
+        stage1_assignment_recv_splits=stage1_assignment_recv_splits,
         stage2_unique_send_splits=stage2_unique_send_splits,
         stage2_unique_recv_splits=stage2_unique_recv_splits,
+        stage2_assignment_send_splits=stage2_assignment_send_splits,
+        stage2_assignment_recv_splits=stage2_assignment_recv_splits,
         stage2_send_stage1_unique_indices=stage2_send_stage1_unique_indices,
         internal_timing_events=internal_timing_events,
         backward_internal_timing_events=backward_internal_timing_events,
@@ -1841,8 +1907,12 @@ def _hierarchical3d_dedup_dispatch(
         recv_unique_indices=recv_unique_indices,
         stage1_unique_send_splits=stage1_unique_send_splits,
         stage1_unique_recv_splits=stage1_unique_recv_splits,
+        stage1_assignment_send_splits=stage1_assignment_send_splits,
+        stage1_assignment_recv_splits=stage1_assignment_recv_splits,
         stage2_unique_send_splits=stage2_unique_send_splits,
         stage2_unique_recv_splits=stage2_unique_recv_splits,
+        stage2_assignment_send_splits=stage2_assignment_send_splits,
+        stage2_assignment_recv_splits=stage2_assignment_recv_splits,
         stage2_send_stage1_unique_indices=stage2_send_stage1_unique_indices,
         stage3_unique_send_splits=stage3_unique_send_splits,
         stage3_unique_recv_splits=stage3_unique_recv_splits,
@@ -2117,6 +2187,7 @@ def _aggregate_weighted_outputs(
 
 def _hierarchical_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDispatchContext) -> torch.Tensor:
     pipeline_manager = _fixed_pipeline_manager(ctx.layer_key)
+    internal_start = _hiermoe_internal_event()
     span = _begin_internal_span("hiermoe_combine_stage2_accum")
     try:
         weighted_outputs = expert_outputs * ctx.recv_assignment_weights.to(expert_outputs.dtype)
@@ -2130,6 +2201,11 @@ def _hierarchical_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDisp
             stage2_accum = _index_add_dim0(stage2_accum, ctx.recv_unique_indices, weighted_outputs.float())
     finally:
         _end_internal_span(span)
+        _finish_hiermoe_internal_event(
+            ctx.internal_timing_events,
+            "combine_stage2_accum",
+            internal_start,
+        )
     stage2_send = _mark_backward_a2a_input(
         stage2_accum.to(expert_outputs.dtype),
         ctx.backward_internal_timing_events,
@@ -2164,6 +2240,7 @@ def _hierarchical_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDisp
         ctx.layer_key,
     )
 
+    internal_start = _hiermoe_internal_event()
     span = _begin_internal_span("hiermoe_combine_stage1_accum")
     try:
         stage1_recv_count = sum(ctx.stage1_unique_recv_splits or [])
@@ -2176,6 +2253,11 @@ def _hierarchical_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDisp
             stage1_accum = _index_add_dim0(stage1_accum, ctx.stage2_send_stage1_unique_indices, relay_partials.float())
     finally:
         _end_internal_span(span)
+        _finish_hiermoe_internal_event(
+            ctx.internal_timing_events,
+            "combine_stage1_accum",
+            internal_start,
+        )
 
     stage1_send = _mark_backward_a2a_input(
         stage1_accum.to(expert_outputs.dtype),
@@ -2210,6 +2292,7 @@ def _hierarchical_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDisp
         "backward_combine_stage1_a2a",
         ctx.layer_key,
     )
+    internal_start = _hiermoe_internal_event()
     span = _begin_internal_span("hiermoe_combine_final_accum")
     try:
         final_hidden_states = torch.zeros(
@@ -2223,6 +2306,11 @@ def _hierarchical_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDisp
             )
     finally:
         _end_internal_span(span)
+        _finish_hiermoe_internal_event(
+            ctx.internal_timing_events,
+            "combine_final_accum",
+            internal_start,
+        )
     return final_hidden_states.to(partial_outputs.dtype)
 
 

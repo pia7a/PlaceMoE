@@ -508,11 +508,9 @@ def test_online_freeze_calibration_uses_shared_communication_and_paired_compute_
 
     calibrations = [layer.planner_calibration for layer in layers]
     assert all(calibration is not None for calibration in calibrations)
-    assert all(calibration.communication_scale == pytest.approx(3.1 * 0.05 / 4.0) for calibration in calibrations)
-    assert all(
-        calibration.forward_compute_per_assignment == pytest.approx(4.19 * 0.05 / 3.0) for calibration in calibrations
-    )
-    assert all(calibration.forward_compute_constant == pytest.approx(4.19 * 2.0 / 3.0) for calibration in calibrations)
+    assert all(calibration.communication_scale == pytest.approx(1.0) for calibration in calibrations)
+    assert all(calibration.forward_compute_per_assignment == pytest.approx(0.05) for calibration in calibrations)
+    assert all(calibration.forward_compute_constant == pytest.approx(2.0) for calibration in calibrations)
     assert manager.placement_metrics()["hiermoe/placement_calibration_compute_samples"] == 2
 
 

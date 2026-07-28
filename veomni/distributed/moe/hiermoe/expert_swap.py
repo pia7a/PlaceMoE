@@ -45,7 +45,17 @@ from .core_planner import (
     QuotaPolicyEntry,
     assign_tokens_to_copies_with_quota,
 )
-from .forward_cover_planner import forward_cover_local_validation_stats, propose_forward_reuse_cover
+from .forward_cover_planner import (
+    ForwardCoverHeuristicStatistics,
+    forward_cover_local_heuristic_statistics,
+    forward_cover_local_heuristic_statistics_batched,
+    forward_cover_local_validation_stats,
+    forward_cover_patch_source_rank_relevant,
+    forward_cover_patch_validation_stats_batched,
+    patch_forward_cover_routes,
+    propose_forward_reuse_covers,
+    rotating_service_target_rank,
+)
 from .greedy_planner import GreedyCommunicationPlanner, assign_tokens_to_copies_greedy
 from .perf_model import HierMoEPerfModel
 from .planner import (
@@ -181,11 +191,31 @@ _ONLINE_FREEZE_COMPUTE_RATIO = _env_float(
     "VEOMNI_HIERMOE_ONLINE_FREEZE_COMPUTE_RATIO",
     4.19,
 )
+_ONLINE_FREEZE_INTER_MS_PER_BYTE = _env_float(
+    "VEOMNI_HIERMOE_ONLINE_FREEZE_INTER_MS_PER_BYTE",
+    6.765449326279194e-08,
+)
+_ONLINE_FREEZE_INTRA_MS_PER_BYTE = _env_float(
+    "VEOMNI_HIERMOE_ONLINE_FREEZE_INTRA_MS_PER_BYTE",
+    5.02482606728045e-09,
+)
+_ONLINE_FREEZE_ROUTE_MS_PER_ASSIGNMENT = _env_float(
+    "VEOMNI_HIERMOE_ONLINE_FREEZE_ROUTE_MS_PER_ASSIGNMENT",
+    8.746548178958447e-05,
+)
+_ONLINE_FREEZE_TRAFFIC_INTERCEPT_MS = _env_float(
+    "VEOMNI_HIERMOE_ONLINE_FREEZE_TRAFFIC_INTERCEPT_MS",
+    16.771503695343263,
+)
 _COST_MODEL_VERIFY = _env_flag("VEOMNI_HIERMOE_COST_MODEL_VERIFY")
 _FORWARD_REUSE_COVER = _env_flag("VEOMNI_HIERMOE_FORWARD_REUSE_COVER")
 _FORWARD_REUSE_COVER_COMPUTE_WEIGHT = _env_float(
     "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_COMPUTE_WEIGHT",
     1.0,
+)
+_FORWARD_REUSE_COVER_COMPUTE_MS_PER_ASSIGNMENT = _env_float(
+    "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_COMPUTE_MS_PER_ASSIGNMENT",
+    2.82807e-05,
 )
 _FORWARD_REUSE_COVER_MIN_GAIN = _env_float(
     "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_MIN_GAIN",
@@ -193,6 +223,38 @@ _FORWARD_REUSE_COVER_MIN_GAIN = _env_float(
 )
 _FORWARD_REUSE_COVER_PATCH_REMAP = _env_flag("VEOMNI_HIERMOE_FORWARD_REUSE_COVER_PATCH_REMAP")
 _FORWARD_REUSE_COVER_FAST = _env_flag("VEOMNI_HIERMOE_FORWARD_REUSE_COVER_FAST")
+_FORWARD_REUSE_COVER_ROUNDS = _env_int(
+    "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_ROUNDS",
+    1,
+    minimum=1,
+)
+_FORWARD_REUSE_COVER_ONLY_STEP = _env_int(
+    "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_ONLY_STEP",
+    -1,
+    minimum=-1,
+)
+_FORWARD_REUSE_COVER_VICTIM_MODE = (
+    os.environ.get("VEOMNI_HIERMOE_FORWARD_REUSE_COVER_VICTIM_MODE", "minimum").strip().lower()
+)
+_FORWARD_REUSE_COVER_SERVICE_SCOPE = (
+    os.environ.get("VEOMNI_HIERMOE_FORWARD_REUSE_COVER_SERVICE_SCOPE", "rank").strip().lower()
+)
+_FORWARD_REUSE_COVER_CONFIRM_SAMPLES = _env_int(
+    "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_CONFIRM_SAMPLES",
+    1,
+    minimum=1,
+)
+_FORWARD_REUSE_COVER_AGGREGATE_SERVICE_GROUP = _env_flag(
+    "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_AGGREGATE_SERVICE_GROUP"
+)
+_FORWARD_REUSE_COVER_PROPOSAL_TOPK = _env_int(
+    "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_PROPOSAL_TOPK",
+    1,
+    minimum=1,
+)
+_FORWARD_REUSE_COVER_EMPTY_SEEDING = _env_flag(
+    "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_EMPTY_SEEDING"
+)
 
 
 def _full_timing_range(section: str):
@@ -304,6 +366,8 @@ class ExpertLayerState:
     canonical_physical_slots: torch.Tensor | None = None
     latest_selected_experts: torch.Tensor | None = None
     latest_physical_routes: torch.Tensor | None = None
+    latest_forward_baseline_communication_counts: torch.Tensor | None = None
+    latest_forward_traffic_endpoint_statistics: torch.Tensor | None = None
     latest_route_step: int = -1
     last_planned_step: int = -1
     accumulated_tokens_per_local_expert: torch.Tensor | None = None
@@ -2794,20 +2858,32 @@ class ExpertSwapManager:
             not self.fixed_pipeline_overlap
             or self.expert_swap_mode != "step"
             or self.expert_swap_selector != "hiermoe_greedy_cover_p1"
-            or not _FIXED_R2_LAYOUT
+            or (not _FIXED_R2_LAYOUT and not _FORWARD_REUSE_COVER_EMPTY_SEEDING)
             or _CPU_PLANNER_MODE != "off"
             or _NPU_LAYER_OWNER_BLOCKING
             or _ONLINE_FREEZE_COST_MODE != "off"
-            or _ABLATION_REPLAY_MODE != "off"
+            or _ABLATION_REPLAY_MODE not in {"off", "static"}
         ):
             raise ValueError(
-                "Forward-reuse cover planning requires fixed R2, fixed-pipeline step mode, "
-                "the hiermoe_greedy_cover_p1 selector, and all other experimental planners disabled."
+                "Forward-reuse cover planning requires fixed R2 or explicit empty seeding, "
+                "fixed-pipeline step mode, the hiermoe_greedy_cover_p1 selector, and all "
+                "other online planners disabled."
             )
+        if _FORWARD_REUSE_COVER_EMPTY_SEEDING and _FIXED_R2_LAYOUT:
+            raise ValueError("Empty-seeding Forward Cover requires VEOMNI_HIERMOE_FIXED_R2_LAYOUT=0.")
         if _FORWARD_REUSE_COVER_PATCH_REMAP and not _FORWARD_REUSE_COVER:
             raise ValueError("Forward-reuse patch remapping requires VEOMNI_HIERMOE_FORWARD_REUSE_COVER=1.")
         if _FORWARD_REUSE_COVER_FAST and not _FORWARD_REUSE_COVER_PATCH_REMAP:
             raise ValueError("Fast Forward-reuse Cover requires VEOMNI_HIERMOE_FORWARD_REUSE_COVER_PATCH_REMAP=1.")
+        if _FORWARD_REUSE_COVER_FAST and _FORWARD_REUSE_COVER_CONFIRM_SAMPLES > 1:
+            raise ValueError("Multi-sample Cover confirmation requires exact global validation.")
+        if _FORWARD_REUSE_COVER_FAST and _FORWARD_REUSE_COVER_PROPOSAL_TOPK > 1:
+            raise ValueError("Top-K Cover proposals require exact global validation.")
+        if _FORWARD_REUSE_COVER_SERVICE_SCOPE not in {"rank", "node"}:
+            raise ValueError(
+                "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_SERVICE_SCOPE must be rank or node, "
+                f"got {_FORWARD_REUSE_COVER_SERVICE_SCOPE!r}."
+            )
         if _ABLATION_REPLAY_MODE != "off" and not self.fixed_pipeline_overlap:
             raise ValueError("HierMoE ablation replay requires fixed_pipeline_overlap=true.")
         if _ABLATION_REPLAY_MODE != "off" and not _ABLATION_REPLAY_PATH:
@@ -2822,21 +2898,52 @@ class ExpertSwapManager:
         self._online_freeze_calibration_step = _ONLINE_FREEZE_CALIBRATION_STEP
         self._online_freeze_communication_ratio = _ONLINE_FREEZE_COMMUNICATION_RATIO
         self._online_freeze_compute_ratio = _ONLINE_FREEZE_COMPUTE_RATIO
+        self._online_freeze_inter_ms_per_byte = _ONLINE_FREEZE_INTER_MS_PER_BYTE
+        self._online_freeze_intra_ms_per_byte = _ONLINE_FREEZE_INTRA_MS_PER_BYTE
+        self._online_freeze_route_ms_per_assignment = _ONLINE_FREEZE_ROUTE_MS_PER_ASSIGNMENT
+        self._online_freeze_traffic_intercept_ms = _ONLINE_FREEZE_TRAFFIC_INTERCEPT_MS
         self._cost_model_verify = _COST_MODEL_VERIFY
         self._cost_model_verify_coefficients: tuple[float, float, float, float] | None = None
         self._cost_model_verify_receive_only_coefficients: tuple[float, float] | None = None
-        self._cost_model_verify_feature_coefficients: dict[
-            str,
-            dict[str, tuple[tuple[float, ...], float]],
-        ] | None = None
+        self._cost_model_verify_feature_coefficients: (
+            dict[
+                str,
+                dict[str, tuple[tuple[float, ...], float]],
+            ]
+            | None
+        ) = None
         self._cost_model_verify_complete = False
         self._forward_reuse_cover = _FORWARD_REUSE_COVER
         self._forward_reuse_cover_patch_remap = _FORWARD_REUSE_COVER_PATCH_REMAP
         self._forward_reuse_cover_fast = _FORWARD_REUSE_COVER_FAST
         self._forward_reuse_cover_compute_weight = _FORWARD_REUSE_COVER_COMPUTE_WEIGHT
+        self._forward_reuse_cover_compute_ms_per_assignment = _FORWARD_REUSE_COVER_COMPUTE_MS_PER_ASSIGNMENT
         self._forward_reuse_cover_min_gain = _FORWARD_REUSE_COVER_MIN_GAIN
+        self._forward_reuse_cover_rounds = _FORWARD_REUSE_COVER_ROUNDS
+        self._forward_reuse_cover_only_step = _FORWARD_REUSE_COVER_ONLY_STEP
+        self._forward_reuse_cover_victim_mode = _FORWARD_REUSE_COVER_VICTIM_MODE
+        self._forward_reuse_cover_service_scope = _FORWARD_REUSE_COVER_SERVICE_SCOPE
+        self._forward_reuse_cover_confirm_samples = _FORWARD_REUSE_COVER_CONFIRM_SAMPLES
+        self._forward_reuse_cover_aggregate_service_group = _FORWARD_REUSE_COVER_AGGREGATE_SERVICE_GROUP
+        self._forward_reuse_cover_proposal_topk = _FORWARD_REUSE_COVER_PROPOSAL_TOPK
+        self._forward_reuse_cover_empty_seeding = _FORWARD_REUSE_COVER_EMPTY_SEEDING
+        self._forward_reuse_cover_pending: dict[str, tuple[PlacementAction, int]] = {}
+        if self._forward_reuse_cover_service_scope == "rank":
+            self._forward_reuse_cover_service_group_size = 1
+        else:
+            proper_group_sizes = [
+                int(group_size)
+                for group_size in self.hierarchy.group_sizes
+                if 1 < int(group_size) < self.ep_size and self.ep_size % int(group_size) == 0
+            ]
+            if not proper_group_sizes:
+                raise ValueError("Node-scoped Forward-reuse Cover requires a proper hierarchy group size.")
+            self._forward_reuse_cover_service_group_size = min(proper_group_sizes)
         self._ablation_actions_by_step: dict[int, dict[str, tuple[tuple[str, str], ...]]] = {}
         self._ablation_expected_layouts: dict[str, tuple[int, ...]] = {}
+        self._ablation_expected_owner_slots: dict[str, tuple[int, ...]] = {}
+        self._ablation_expected_source_luts: dict[str, tuple[tuple[int, ...], ...]] = {}
+        self._ablation_initial_layout = ""
         if self._ablation_replay_mode != "off":
             self._load_ablation_replay(_ABLATION_REPLAY_PATH)
 
@@ -2970,10 +3077,29 @@ class ExpertSwapManager:
         raw_layers = payload.get("layers", {})
         if not isinstance(raw_layers, dict) or not raw_layers:
             raise ValueError("HierMoE ablation replay contains no final layer layouts.")
-        self._ablation_expected_layouts = {
-            str(layer): tuple(int(value) for value in layer_payload["slot_to_logical"])
-            for layer, layer_payload in raw_layers.items()
-        }
+        expected_layouts: dict[str, tuple[int, ...]] = {}
+        expected_owner_slots: dict[str, tuple[int, ...]] = {}
+        expected_source_luts: dict[str, tuple[tuple[int, ...], ...]] = {}
+        for raw_layer, raw_layer_payload in raw_layers.items():
+            layer = str(raw_layer)
+            if not isinstance(raw_layer_payload, dict):
+                raise ValueError(f"HierMoE ablation layer {layer!r} is not a mapping.")
+            expected_layouts[layer] = tuple(
+                int(value) for value in raw_layer_payload["slot_to_logical"]
+            )
+            raw_owners = raw_layer_payload.get("owner_slots")
+            if raw_owners is not None:
+                expected_owner_slots[layer] = tuple(int(value) for value in raw_owners)
+            raw_source_lut = raw_layer_payload.get("source_logical_to_physical")
+            if raw_source_lut is not None:
+                expected_source_luts[layer] = tuple(
+                    tuple(int(value) for value in row)
+                    for row in raw_source_lut
+                )
+        self._ablation_expected_layouts = expected_layouts
+        self._ablation_expected_owner_slots = expected_owner_slots
+        self._ablation_expected_source_luts = expected_source_luts
+        self._ablation_initial_layout = str(payload.get("source", {}).get("initial_layout", "fixed_r2"))
 
     @staticmethod
     def _zero_placement_cost() -> PlacementCost:
@@ -3013,13 +3139,16 @@ class ExpertSwapManager:
                 previous = int(working[dst_slot].item())
                 if src_slot == dst_slot or int(working[src_slot].item()) != logical:
                     raise RuntimeError(f"HierMoE ablation replica {body} has no valid owner source in {layer.key}.")
-                if dst_slot in {int(value) for value in owners.tolist()}:
-                    raise RuntimeError(
-                        f"HierMoE ablation replica {body} overwrites an owner slot; "
-                        "the compact action log cannot reconstruct the replacement owner."
-                    )
                 actions.append(PlacementAction("replica", src_slot, dst_slot, logical, previous))
                 working[dst_slot] = logical
+                if previous >= 0 and int(owners[previous].item()) == dst_slot:
+                    remaining = torch.nonzero(working == previous, as_tuple=False).flatten()
+                    if remaining.numel() == 0:
+                        raise RuntimeError(
+                            f"HierMoE ablation replica {body} removes the final copy of victim "
+                            f"expert {previous} in {layer.key}."
+                        )
+                    owners[previous] = int(remaining.min().item())
                 continue
             logical_text, slot_text = body.split("@", maxsplit=1)
             logical, slot = int(logical_text), int(slot_text)
@@ -3065,28 +3194,110 @@ class ExpertSwapManager:
             expected = self._ablation_expected_layouts[layer_key]
             if actual != expected:
                 raise RuntimeError(f"HierMoE ablation final layout does not match replay output for {layer_key}.")
+            expected_owners = self._ablation_expected_owner_slots.get(layer_key)
+            if expected_owners is not None:
+                actual_owners = tuple(int(value) for value in layer.logical_to_physical.tolist())
+                if actual_owners != expected_owners:
+                    raise RuntimeError(
+                        f"HierMoE ablation owner mapping does not match replay output for {layer_key}."
+                    )
+            expected_source_lut = self._ablation_expected_source_luts.get(layer_key)
+            if expected_source_lut is not None:
+                if layer.source_logical_to_physical is None:
+                    raise RuntimeError(f"HierMoE ablation source route LUT is missing for {layer_key}.")
+                actual_source_lut = tuple(
+                    tuple(int(value) for value in row)
+                    for row in layer.source_logical_to_physical.tolist()
+                )
+                if actual_source_lut != expected_source_lut:
+                    raise RuntimeError(
+                        f"HierMoE ablation source route LUT does not match replay output for {layer_key}."
+                    )
+
+    def _install_static_ablation_route_metadata(self) -> None:
+        for layer_key, layer in self.layers.items():
+            expected_owners = self._ablation_expected_owner_slots.get(layer_key)
+            if expected_owners is not None:
+                self._refresh_layer_mapping_from_slots(layer, expected_owners)
+            expected_source_lut = self._ablation_expected_source_luts.get(layer_key)
+            if expected_source_lut is None:
+                continue
+            source_lut = torch.tensor(expected_source_lut, dtype=torch.long)
+            expected_shape = (self.ep_size, layer.num_experts)
+            if tuple(source_lut.shape) != expected_shape:
+                raise RuntimeError(
+                    f"HierMoE ablation source route LUT for {layer_key} has shape "
+                    f"{tuple(source_lut.shape)}, expected {expected_shape}."
+                )
+            if bool(((source_lut < 0) | (source_lut >= layer.num_physical_slots)).any().item()):
+                raise RuntimeError(
+                    f"HierMoE ablation source route LUT references an invalid slot for {layer_key}."
+                )
+            layout = self._layer_layout(layer)
+            logical = torch.arange(layer.num_experts, dtype=torch.long).view(1, -1)
+            routed_logical = layout.index_select(0, source_lut.reshape(-1)).view_as(source_lut)
+            if not torch.equal(routed_logical, logical.expand_as(routed_logical)):
+                raise RuntimeError(
+                    f"HierMoE ablation source route LUT references the wrong expert for {layer_key}."
+                )
+            layer.source_logical_to_physical = source_lut
+            layer._device_source_mapping_cache.clear()
 
     @torch.no_grad()
     def _install_static_ablation_layout(self) -> None:
-        if not _FIXED_R2_LAYOUT:
+        canonical_empty = self._ablation_initial_layout == "canonical_empty"
+        if canonical_empty:
+            if _FIXED_R2_LAYOUT:
+                raise RuntimeError("Canonical-empty static replay must not install the fixed R2 layout.")
+            for layer in self.layers.values():
+                expected = _initial_slot_to_logical(
+                    layer.num_experts,
+                    layer.base_num_local_experts,
+                    layer.num_local_experts,
+                    self.ep_size,
+                )
+                if not torch.equal(self._layer_layout(layer), expected):
+                    raise RuntimeError(f"Canonical-empty static replay has a non-canonical initial {layer.key} layout.")
+        elif not _FIXED_R2_LAYOUT:
             raise RuntimeError("Static HierMoE ablation replay requires VEOMNI_HIERMOE_FIXED_R2_LAYOUT=1.")
         action_count = 0
         for step in sorted(self._ablation_actions_by_step):
             by_layer = self._ablation_actions_by_step[step]
-            if set(by_layer) != set(self.layers):
-                raise RuntimeError(f"HierMoE ablation replay step {step} does not contain every registered layer.")
+            unexpected = set(by_layer) - set(self.layers)
+            if unexpected:
+                raise RuntimeError(
+                    f"HierMoE ablation replay step {step} contains unknown layers: {sorted(unexpected)}."
+                )
+            patch_plans: dict[str, PlacementPlan] = {}
             for layer_key in self.layers:
+                if layer_key not in by_layer:
+                    continue
                 layer = self.layers[layer_key]
                 plan = self._build_ablation_replay_plan(layer, by_layer[layer_key])
-                self._execute_placement_plan(
-                    layer,
-                    plan,
-                    timing_prefix=None,
-                    transfer_group=self.ep_group,
-                    force_staged_transfer=False,
-                    fast_sparse_transfer=True,
-                )
-                action_count += len(plan.actions)
+                if self._forward_reuse_cover_patch_remap and all(
+                    action.kind == "replica" for action in plan.actions
+                ):
+                    patch_plans[layer_key] = plan
+                else:
+                    self._execute_placement_plan(
+                        layer,
+                        plan,
+                        timing_prefix=None,
+                        transfer_group=self.ep_group,
+                        force_staged_transfer=False,
+                        fast_sparse_transfer=True,
+                    )
+                    action_count += len(plan.actions)
+            if patch_plans:
+                max_actions = max(len(plan.actions) for plan in patch_plans.values())
+                for action_index in range(max_actions):
+                    selections = [
+                        (self.layers[layer_key], plan.actions[action_index])
+                        for layer_key, plan in patch_plans.items()
+                        if action_index < len(plan.actions)
+                    ]
+                    action_count += len(self._execute_forward_cover_actions(selections))
+        self._install_static_ablation_route_metadata()
         self._validate_ablation_final_layout()
         logger.info_rank0(
             "HierMoE installed static ablation layout from %s using %s replayed actions.",
@@ -3192,12 +3403,31 @@ class ExpertSwapManager:
             "hiermoe/ablation_migration_mode": self._ablation_migration_mode,
             "hiermoe/ablation_grad_mode": self._ablation_grad_mode,
             "hiermoe/online_freeze_cost_mode": self._online_freeze_cost_mode,
+            "hiermoe/online_freeze_inter_ms_per_byte": self._online_freeze_inter_ms_per_byte,
+            "hiermoe/online_freeze_intra_ms_per_byte": self._online_freeze_intra_ms_per_byte,
+            "hiermoe/online_freeze_route_ms_per_assignment": self._online_freeze_route_ms_per_assignment,
+            "hiermoe/online_freeze_traffic_intercept_ms": self._online_freeze_traffic_intercept_ms,
             "hiermoe/fixed_r2_mirrored_remap": int(_FORCE_FIXED_R2_MIRRORED_REMAP),
             "hiermoe/forward_reuse_cover": int(self._forward_reuse_cover),
             "hiermoe/forward_reuse_cover_patch_remap": int(self._forward_reuse_cover_patch_remap),
             "hiermoe/forward_reuse_cover_fast": int(self._forward_reuse_cover_fast),
             "hiermoe/forward_reuse_cover_compute_weight": self._forward_reuse_cover_compute_weight,
+            "hiermoe/forward_reuse_cover_compute_ms_per_assignment": (
+                self._forward_reuse_cover_compute_ms_per_assignment
+            ),
             "hiermoe/forward_reuse_cover_min_gain": self._forward_reuse_cover_min_gain,
+            "hiermoe/forward_reuse_cover_rounds": self._forward_reuse_cover_rounds,
+            "hiermoe/forward_reuse_cover_only_step": self._forward_reuse_cover_only_step,
+            "hiermoe/forward_reuse_cover_victim_mode": self._forward_reuse_cover_victim_mode,
+            "hiermoe/forward_reuse_cover_service_scope": self._forward_reuse_cover_service_scope,
+            "hiermoe/forward_reuse_cover_service_group_size": self._forward_reuse_cover_service_group_size,
+            "hiermoe/forward_reuse_cover_aggregate_service_group": int(
+                self._forward_reuse_cover_aggregate_service_group
+            ),
+            "hiermoe/forward_reuse_cover_proposal_topk": self._forward_reuse_cover_proposal_topk,
+            "hiermoe/forward_reuse_cover_empty_seeding": int(self._forward_reuse_cover_empty_seeding),
+            "hiermoe/forward_reuse_cover_confirm_samples": self._forward_reuse_cover_confirm_samples,
+            "hiermoe/forward_reuse_cover_pending": len(self._forward_reuse_cover_pending),
             "hiermoe/pipeline_planner_backend": (
                 self._planner_collective_backend(self._pipeline_planner_group)
                 if self._pipeline_planner_group is not None
@@ -5199,7 +5429,8 @@ class ExpertSwapManager:
             )
             slot_to_logical = None
             is_identity = torch.equal(mapping, torch.arange(num_experts, dtype=torch.long))
-        self.layers[key] = ExpertLayerState(
+        previous_source_lut = None if layer is None else layer.source_logical_to_physical
+        registered_layer = ExpertLayerState(
             key=key,
             module_id=id(module),
             num_experts=num_experts,
@@ -5212,6 +5443,21 @@ class ExpertSwapManager:
             canonical_physical_slots=canonical_slots,
             is_identity=bool(is_identity),
         )
+        if self._forward_reuse_cover_patch_remap and slot_layout_enabled:
+            if (
+                previous_source_lut is not None
+                and tuple(previous_source_lut.shape) == (self.ep_size, num_experts)
+            ):
+                registered_layer.source_logical_to_physical = previous_source_lut.detach().cpu().clone()
+            else:
+                # The initial no-replica layout routes every source rank to
+                # the canonical owner.  Seed the LUT before the first empty
+                # Cover so its winner can be patched without rebuilding any
+                # token routes or requiring a preinstalled R2 layout.
+                registered_layer.source_logical_to_physical = (
+                    mapping.view(1, -1).expand(self.ep_size, -1).clone()
+                )
+        self.layers[key] = registered_layer
         self.module_id_to_key[id(module)] = key
         self.param_id_to_key[id(gate_up_proj)] = key
         self.param_id_to_key[id(down_proj)] = key
@@ -5429,7 +5675,7 @@ class ExpertSwapManager:
     def record_forward_physical_routes(self, layer_key: str, physical_routes: torch.Tensor) -> None:
         """Keep the physical routes already consumed by the trainable Forward."""
 
-        if not self._forward_reuse_cover and not self._cost_model_verify:
+        if not self._forward_reuse_cover and not self._cost_model_verify and self._online_freeze_cost_mode == "off":
             return
         layer = self.layers.get(layer_key)
         if layer is not None:
@@ -5450,10 +5696,101 @@ class ExpertSwapManager:
     def placement_timing_event(self) -> AcceleratorEvent:
         return self._timing_event()
 
-    def record_dispatch_statistics(self, **_kwargs: Any) -> None:
-        # The planner derives exact duplicate-free statistics from the raw
-        # token-top-k routes. Runtime split summaries are intentionally unused.
-        return
+    def record_dispatch_statistics(
+        self,
+        *,
+        layer_key: str,
+        step: int,
+        dispatch_context: Any,
+    ) -> None:
+        """Cache exact baseline receive counts already produced by Forward.
+
+        The winner validator previously rescanned every token row to rebuild
+        the unchanged baseline. Hierarchical dispatch already computed the
+        destination receive counts: each rank contributes its rank receive
+        total and its relay's node receive total to a sparse packed row. A
+        later SUM collective reconstructs the same global rank/node vector as
+        ``_local_packed_counts`` without another token scan.
+        """
+
+        if not self._forward_reuse_cover:
+            return
+        layer = self.layers.get(layer_key)
+        if layer is None or int(step) != int(layer.latest_route_step):
+            return
+        if getattr(dispatch_context, "mode", None) != "hierarchical":
+            layer.latest_forward_baseline_communication_counts = None
+            layer.latest_forward_traffic_endpoint_statistics = None
+            return
+        stage1_send = getattr(dispatch_context, "stage1_unique_send_splits", None)
+        stage1_recv = getattr(dispatch_context, "stage1_unique_recv_splits", None)
+        stage1_assignment_send = getattr(
+            dispatch_context,
+            "stage1_assignment_send_splits",
+            None,
+        )
+        stage2_send = getattr(dispatch_context, "stage2_unique_send_splits", None)
+        stage2_recv = getattr(dispatch_context, "stage2_unique_recv_splits", None)
+        stage2_assignment_send = getattr(
+            dispatch_context,
+            "stage2_assignment_send_splits",
+            None,
+        )
+        valid_sizes = [
+            int(size)
+            for size in self.hierarchy.group_sizes[: max(0, int(self.hierarchy.selected_dim) - 1)]
+            if 1 < int(size) < self.ep_size and self.ep_size % int(size) == 0
+        ]
+        if (
+            stage1_send is None
+            or stage1_recv is None
+            or stage1_assignment_send is None
+            or stage2_send is None
+            or stage2_recv is None
+            or stage2_assignment_send is None
+            or len(valid_sizes) != 1
+        ):
+            layer.latest_forward_baseline_communication_counts = None
+            layer.latest_forward_traffic_endpoint_statistics = None
+            return
+
+        group_size = valid_sizes[0]
+        num_nodes = self.ep_size // group_size
+        if (
+            len(stage1_send) != num_nodes
+            or len(stage1_assignment_send) != num_nodes
+            or len(stage2_send) != group_size
+            or len(stage2_assignment_send) != group_size
+        ):
+            layer.latest_forward_baseline_communication_counts = None
+            layer.latest_forward_traffic_endpoint_statistics = None
+            return
+        counts = torch.zeros((self.ep_size + self.ep_size // group_size,), dtype=torch.float32)
+        counts[self.ep_rank] = float(sum(int(value) for value in stage2_recv))
+        counts[self.ep_size + self.ep_rank // group_size] = float(sum(int(value) for value in stage1_recv))
+        layer.latest_forward_baseline_communication_counts = counts
+
+        endpoint = torch.zeros((8, self.ep_size), dtype=torch.float32)
+        lane = self.ep_rank % group_size
+        node = self.ep_rank // group_size
+        stage1_destinations = lane * num_nodes + torch.arange(num_nodes)
+        stage2_destinations = node * group_size + torch.arange(group_size)
+
+        endpoint[0, self.ep_rank] = float(sum(int(value) for value in stage1_send))
+        endpoint[1, stage1_destinations] = torch.tensor(stage1_send, dtype=torch.float32)
+        endpoint[2, self.ep_rank] = float(sum(int(value) for value in stage1_assignment_send))
+        endpoint[3, stage1_destinations] = torch.tensor(
+            stage1_assignment_send,
+            dtype=torch.float32,
+        )
+        endpoint[4, self.ep_rank] = float(sum(int(value) for value in stage2_send))
+        endpoint[5, stage2_destinations] = torch.tensor(stage2_send, dtype=torch.float32)
+        endpoint[6, self.ep_rank] = float(sum(int(value) for value in stage2_assignment_send))
+        endpoint[7, stage2_destinations] = torch.tensor(
+            stage2_assignment_send,
+            dtype=torch.float32,
+        )
+        layer.latest_forward_traffic_endpoint_statistics = endpoint.reshape(-1)
 
     def record_layer_timing(
         self,
@@ -5494,10 +5831,15 @@ class ExpertSwapManager:
             combine_end=combine_end,
         )
         layer.pending_timing = timing
-        if self._cost_model_verify and int(step) in {
-            int(self._online_freeze_calibration_step),
-            int(self._online_freeze_calibration_step) + 1,
-        }:
+        capture_cost_model_sample = (
+            self._cost_model_verify
+            and int(step)
+            in {
+                int(self._online_freeze_calibration_step),
+                int(self._online_freeze_calibration_step) + 1,
+            }
+        ) or (self._online_freeze_cost_mode != "off" and int(step) == int(self._online_freeze_calibration_step))
+        if capture_cost_model_sample:
             physical_routes = layer.latest_physical_routes
             if physical_routes is None or physical_routes.shape != selected_experts.shape:
                 raise RuntimeError(
@@ -6578,6 +6920,21 @@ class ExpertSwapManager:
                 exact_primitive_topk=(0 if self.fixed_pipeline_overlap else _GREEDY_EXACT_PRIMITIVE_TOPK),
                 post_shortlist_compact_pair=(not self.fixed_pipeline_overlap and _GREEDY_POST_SHORTLIST_COMPACT_PAIR),
                 exact_primitive_max_only=(not self.fixed_pipeline_overlap and _GREEDY_EXACT_PRIMITIVE_MAX_ONLY),
+                traffic_inter_ms_per_byte=(
+                    self._online_freeze_inter_ms_per_byte if self._online_freeze_cost_mode != "off" else None
+                ),
+                traffic_intra_ms_per_byte=(
+                    self._online_freeze_intra_ms_per_byte if self._online_freeze_cost_mode != "off" else None
+                ),
+                traffic_route_ms_per_assignment=(
+                    self._online_freeze_route_ms_per_assignment if self._online_freeze_cost_mode == "joint" else 0.0
+                ),
+                traffic_communication_phase_multiplier=(
+                    self._online_freeze_communication_ratio if self._online_freeze_cost_mode != "off" else 1.0
+                ),
+                traffic_compute_phase_multiplier=(
+                    self._online_freeze_compute_ratio if self._online_freeze_cost_mode == "joint" else 1.0
+                ),
             )
         if self.expert_swap_mode != "layer":
             return CurrentRoutePlanner(
@@ -6725,10 +7082,7 @@ class ExpertSwapManager:
     ) -> list[float]:
         return [
             float(intercept)
-            + sum(
-                float(coefficient) * float(value)
-                for coefficient, value in zip(coefficients, row, strict=True)
-            )
+            + sum(float(coefficient) * float(value) for coefficient, value in zip(coefficients, row, strict=True))
             for row in feature_rows
         ]
 
@@ -6849,9 +7203,7 @@ class ExpertSwapManager:
                     name in timing.communication_events for name in communication_event_names
                 ):
                     stage_times = [
-                        timing.communication_events[name][0].elapsed_time(
-                            timing.communication_events[name][1]
-                        )
+                        timing.communication_events[name][0].elapsed_time(timing.communication_events[name][1])
                         for name in communication_event_names
                     ]
                 local_timing_rows.append(
@@ -6949,9 +7301,7 @@ class ExpertSwapManager:
         actual_stage_a2a = (
             stage_timings.max(dim=0).values if raw_a2a_available else torch.empty((0, 0), device=common_device)
         )
-        actual_raw_a2a = (
-            actual_stage_a2a.sum(dim=1) if raw_a2a_available else torch.empty((0,), device=common_device)
-        )
+        actual_raw_a2a = actual_stage_a2a.sum(dim=1) if raw_a2a_available else torch.empty((0,), device=common_device)
         return {
             "sample_count": row_start,
             "compute_fit_sample_count": int(self.ep_size * row_start),
@@ -6966,9 +7316,7 @@ class ExpertSwapManager:
             ],
             "source_send_maxima": source_send_maxima.detach().cpu().tolist(),
             "destination_receive_maxima": destination_receive_maxima.detach().cpu().tolist(),
-            "traffic_features": {
-                name: values.detach().cpu().tolist() for name, values in traffic_features.items()
-            },
+            "traffic_features": {name: values.detach().cpu().tolist() for name, values in traffic_features.items()},
             "peak_assignments": peak_assignments.detach().cpu().tolist(),
             "actual_communication_ms": actual_communication.detach().cpu().tolist(),
             "actual_compute_ms": actual_compute.detach().cpu().tolist(),
@@ -7036,8 +7384,7 @@ class ExpertSwapManager:
         actual_compute = list(observations["actual_compute_ms"])
         actual_raw_a2a = list(observations.get("actual_raw_a2a_ms", ()))
         traffic_features = {
-            str(name): list(values)
-            for name, values in dict(observations.get("traffic_features", {})).items()
+            str(name): list(values) for name, values in dict(observations.get("traffic_features", {})).items()
         }
         base_feature_models = {
             "legacy_source_aware": ("legacy_source_aware",),
@@ -7074,10 +7421,7 @@ class ExpertSwapManager:
             for name, features in base_feature_models.items()
         }
         joint_model_rows = {
-            name: [
-                [*row, float(peak_assignments[index])]
-                for index, row in enumerate(rows)
-            ]
+            name: [[*row, float(peak_assignments[index])] for index, row in enumerate(rows)]
             for name, rows in model_rows.items()
         }
 
@@ -7119,8 +7463,7 @@ class ExpertSwapManager:
             }
             if actual_raw_a2a:
                 feature_coefficients["raw_a2a"] = {
-                    name: self._fit_nonnegative_linear_model(rows, actual_raw_a2a)
-                    for name, rows in model_rows.items()
+                    name: self._fit_nonnegative_linear_model(rows, actual_raw_a2a) for name, rows in model_rows.items()
                 }
             self._cost_model_verify_feature_coefficients = feature_coefficients
             phase = "calibration"
@@ -7270,107 +7613,222 @@ class ExpertSwapManager:
         step: int,
         started: float,
     ) -> None:
-        """Fit one shared two-term cost model from the profiled fixed-R2 step."""
+        """Validate offline traffic coefficients and fit online GEMM cost."""
 
-        records: list[tuple[ExpertLayerState, _PendingLayerTiming, float, float, float]] = []
-        compute_samples: list[tuple[float, float]] = []
-        communication_samples: list[tuple[float, float]] = []
-        for layer in sorted(layers, key=lambda value: value.key):
-            timing = layer.pending_timing
-            if timing is None or timing.step != int(step) or not self._events_ready(timing):
-                continue
-            selected = timing.selected_experts
-            planner = self._planner_for_layer(
-                layer,
-                communication_scale=1.0,
-                forward_compute_per_assignment=1.0,
-                forward_compute_constant=0.0,
-            )
-            copy_slots, _copy_mask = layer.copy_slots_for_device(selected.device)
-            reference = planner.score_layout(
-                selected,
-                timing.slot_to_logical,
-                source_ranks=self.ep_rank,
-                owner_slots=layer.logical_to_physical,
-                step=timing.step,
-                layer_seed=zlib.crc32(layer.key.encode("utf-8")),
-                max_copies=int(copy_slots.shape[1]),
-            )
-            local_values = torch.tensor(
-                [
-                    timing.dispatch_start.elapsed_time(timing.dispatch_end)
-                    + timing.combine_start.elapsed_time(timing.combine_end),
-                    timing.compute_start.elapsed_time(timing.compute_end),
-                    timing.local_assignment_count,
-                ],
-                dtype=torch.float32,
-                device=selected.device,
-            )
-            if self.ep_group is not None and self.ep_size > 1:
-                gathered_flat = torch.empty(
-                    (self.ep_size * int(local_values.numel()),),
-                    dtype=local_values.dtype,
-                    device=local_values.device,
-                )
-                dist.all_gather_into_tensor(gathered_flat, local_values, group=self.ep_group)
-                gathered = gathered_flat.view(self.ep_size, int(local_values.numel()))
-            else:
-                gathered = local_values.view(1, -1)
-
-            communication_units = float(reference.communication_model_units)
-            forward_communication_ms = float(gathered[:, 0].max().item())
-            peak_assignments = float(gathered[:, 2].max().item())
-            if communication_units <= 0.0 or peak_assignments <= 0.0:
-                continue
-            communication_samples.append((communication_units, forward_communication_ms))
-            compute_samples.extend(
-                (float(row[2].item()), float(row[1].item())) for row in gathered if float(row[2].item()) > 0.0
-            )
-            records.append((layer, timing, communication_units, peak_assignments, forward_communication_ms))
-
-        if len(records) != len(layers):
+        ordered_layers = sorted(layers, key=lambda value: value.key)
+        records = [
+            (layer, layer.pending_timing)
+            for layer in ordered_layers
+            if layer.pending_timing is not None
+            and layer.pending_timing.step == int(step)
+            and self._events_ready(layer.pending_timing)
+        ]
+        if len(records) != len(ordered_layers):
             self._accumulate_metric(
                 "hiermoe/placement_calibration_ms",
                 (time.perf_counter() - started) * 1000.0,
             )
             return
 
-        forward_pair_per_unit = self._fit_positive_through_origin(communication_samples)
+        has_full_samples = all(
+            any(int(timing.step) == int(step) for timing in layer.cost_model_timings) for layer in ordered_layers
+        )
+        communication_samples = 0
+        compute_samples: list[tuple[float, float]]
+        communication_diagnostics: dict[str, float] | None = None
+        compute_diagnostics: dict[str, float] | None = None
+        joint_diagnostics: dict[str, float] | None = None
+        traffic_scale = 1.0
+        traffic_constant = self._online_freeze_traffic_intercept_ms
+        traffic_predictors: list[float] = []
+        if has_full_samples:
+            observations = self._cost_model_step_observations(ordered_layers, step=int(step))
+            traffic_features = dict(observations["traffic_features"])
+            stage1 = [float(value) for value in traffic_features["stage1_payload_endpoint_bytes"]]
+            stage2 = [float(value) for value in traffic_features["stage2_payload_endpoint_bytes"]]
+            peak_assignments = [float(value) for value in observations["peak_assignments"]]
+            actual_communication = [float(value) for value in observations["actual_communication_ms"]]
+            route_coefficient = (
+                self._online_freeze_route_ms_per_assignment if self._online_freeze_cost_mode == "joint" else 0.0
+            )
+            traffic_predictors = [
+                self._online_freeze_inter_ms_per_byte * inter_bytes
+                + self._online_freeze_intra_ms_per_byte * intra_bytes
+                + route_coefficient * assignments
+                for inter_bytes, intra_bytes, assignments in zip(
+                    stage1,
+                    stage2,
+                    peak_assignments,
+                    strict=True,
+                )
+            ]
+            traffic_scale = self._fit_positive_through_origin(
+                [
+                    (predictor, max(0.0, actual - traffic_constant))
+                    for predictor, actual in zip(
+                        traffic_predictors,
+                        actual_communication,
+                        strict=True,
+                    )
+                ]
+            )
+            if traffic_scale <= 0.0:
+                traffic_scale = self._fit_positive_through_origin(
+                    list(zip(traffic_predictors, actual_communication, strict=True))
+                )
+                traffic_constant = 0.0
+            predicted_communication = [
+                traffic_scale * predictor + traffic_constant for predictor in traffic_predictors
+            ]
+            communication_diagnostics = self._cost_model_diagnostics(
+                actual_communication,
+                predicted_communication,
+            )
+            communication_samples = len(actual_communication)
+            compute_samples = [
+                (float(assignments), float(compute_ms))
+                for assignments, compute_ms in zip(
+                    observations["paired_assignments"],
+                    observations["paired_compute_ms"],
+                    strict=True,
+                )
+                if float(assignments) > 0.0
+            ]
+        else:
+            # Unit tests and legacy callers may provide one pending sample per
+            # layer without the full microbatch route capture.
+            compute_samples = []
+            for _layer, timing in records:
+                assert timing is not None
+                local_values = torch.stack(
+                    (
+                        timing.local_assignment_count.to(dtype=torch.float32),
+                        torch.tensor(
+                            timing.compute_start.elapsed_time(timing.compute_end),
+                            dtype=torch.float32,
+                            device=timing.local_assignment_count.device,
+                        ),
+                    )
+                )
+                if self.ep_group is not None and self.ep_size > 1:
+                    gathered_flat = torch.empty(
+                        (self.ep_size * int(local_values.numel()),),
+                        dtype=local_values.dtype,
+                        device=local_values.device,
+                    )
+                    dist.all_gather_into_tensor(gathered_flat, local_values, group=self.ep_group)
+                    gathered = gathered_flat.view(self.ep_size, int(local_values.numel()))
+                else:
+                    gathered = local_values.view(1, -1)
+                compute_samples.extend(
+                    (float(row[0].item()), float(row[1].item())) for row in gathered if float(row[0].item()) > 0.0
+                )
+
         compute_slope, compute_constant = self._fit_nonnegative_compute_model(compute_samples)
         if compute_slope <= 0.0:
             compute_slope = self._fit_positive_through_origin(compute_samples)
             compute_constant = 0.0
+        compute_diagnostics = self._cost_model_diagnostics(
+            [target for _assignments, target in compute_samples],
+            [compute_slope * assignments + compute_constant for assignments, _target in compute_samples],
+        )
 
-        full_communication_per_unit = self._online_freeze_communication_ratio * forward_pair_per_unit
-        full_compute_per_assignment = self._online_freeze_compute_ratio * compute_slope
-        full_compute_constant = self._online_freeze_compute_ratio * compute_constant
-        planner_communication_scale = full_communication_per_unit / 4.0
+        if has_full_samples:
+            actual_communication = [float(value) for value in observations["actual_communication_ms"]]
+            actual_compute = [float(value) for value in observations["actual_compute_ms"]]
+            predicted_communication = [
+                traffic_scale * predictor + traffic_constant for predictor in traffic_predictors
+            ]
+            predicted_compute = [
+                compute_slope * float(assignments) + compute_constant
+                for assignments in observations["peak_assignments"]
+            ]
+            joint_diagnostics = self._cost_model_diagnostics(
+                [
+                    communication + compute
+                    for communication, compute in zip(actual_communication, actual_compute, strict=True)
+                ],
+                [
+                    communication + compute
+                    for communication, compute in zip(predicted_communication, predicted_compute, strict=True)
+                ],
+            )
+
         if self._online_freeze_cost_mode == "joint":
-            planner_compute_slope = full_compute_per_assignment / 3.0
-            planner_compute_constant = full_compute_constant / 3.0
+            planner_compute_slope = compute_slope
+            planner_compute_constant = compute_constant
         else:
             planner_compute_slope = 0.0
             planner_compute_constant = 0.0
 
-        for layer, timing, _units, _assignments, _communication_ms in records:
+        for layer, timing in records:
+            assert timing is not None
             layer.planner_calibration = _PlannerCalibration(
                 source_step=timing.step,
-                communication_scale=planner_communication_scale,
+                communication_scale=traffic_scale,
                 forward_compute_per_assignment=planner_compute_slope,
                 forward_compute_constant=planner_compute_constant,
             )
             layer.pending_timing = None
+            layer.cost_model_timings = [sample for sample in layer.cost_model_timings if int(sample.step) != int(step)]
 
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         self._accumulate_metric("hiermoe/placement_calibration_ms", elapsed_ms)
         self._accumulate_metric("hiermoe/placement_calibrated_layers", len(records))
-        self._accumulate_metric("hiermoe/placement_calibration_communication_samples", len(communication_samples))
+        self._accumulate_metric("hiermoe/placement_calibration_communication_samples", communication_samples)
         self._accumulate_metric("hiermoe/placement_calibration_compute_samples", len(compute_samples))
-        self._accumulate_metric("hiermoe/placement_forward_pair_ms_per_model_unit", forward_pair_per_unit)
+        self._accumulate_metric("hiermoe/placement_traffic_online_scale", traffic_scale)
+        self._accumulate_metric("hiermoe/placement_traffic_online_constant_ms", traffic_constant)
+        if traffic_predictors:
+            self._accumulate_metric("hiermoe/placement_traffic_predictor_min_ms", min(traffic_predictors))
+            self._accumulate_metric("hiermoe/placement_traffic_predictor_max_ms", max(traffic_predictors))
         self._accumulate_metric("hiermoe/placement_forward_compute_ms_per_assignment", compute_slope)
         self._accumulate_metric("hiermoe/placement_forward_compute_constant_ms", compute_constant)
-        self._accumulate_metric("hiermoe/placement_full_communication_ms_per_model_unit", full_communication_per_unit)
-        self._accumulate_metric("hiermoe/placement_full_compute_ms_per_assignment", full_compute_per_assignment)
+        self._accumulate_metric(
+            "hiermoe/placement_full_compute_ms_per_assignment",
+            self._online_freeze_compute_ratio * compute_slope,
+        )
+        if communication_diagnostics is not None:
+            self._accumulate_metric(
+                "hiermoe/placement_calibration_communication_r2",
+                communication_diagnostics["r_squared"],
+            )
+            self._accumulate_metric(
+                "hiermoe/placement_calibration_communication_mape_percent",
+                communication_diagnostics["mape_percent"],
+            )
+        if compute_diagnostics is not None:
+            self._accumulate_metric(
+                "hiermoe/placement_calibration_compute_r2",
+                compute_diagnostics["r_squared"],
+            )
+            self._accumulate_metric(
+                "hiermoe/placement_calibration_compute_mape_percent",
+                compute_diagnostics["mape_percent"],
+            )
+        if joint_diagnostics is not None:
+            self._accumulate_metric(
+                "hiermoe/placement_calibration_joint_r2",
+                joint_diagnostics["r_squared"],
+            )
+            self._accumulate_metric(
+                "hiermoe/placement_calibration_joint_mape_percent",
+                joint_diagnostics["mape_percent"],
+            )
+        if communication_diagnostics is not None and communication_diagnostics["mape_percent"] > 5.0:
+            logger.warning_rank0(
+                "Online-freeze per-layer E2E traffic timings are too noisy for action-level validation: "
+                "MAPE=%.3f%% exceeds 5%%; "
+                f"R2={communication_diagnostics['r_squared']:.6f}, "
+                f"RMSE={communication_diagnostics['rmse_ms']:.3f} ms, "
+                f"max_abs={communication_diagnostics['max_abs_error_ms']:.3f} ms, "
+                f"online_scale={traffic_scale:.9g}, intercept={traffic_constant:.3f} ms, "
+                f"predictor_range="
+                f"[{min(traffic_predictors, default=0.0):.3f}, "
+                f"{max(traffic_predictors, default=0.0):.3f}] ms. "
+                "Keeping the offline multi-layout feature ratios and validating the frozen winner by E2E.",
+                communication_diagnostics["mape_percent"],
+            )
 
     @torch.no_grad()
     def prepare_calibrations(self, step: int) -> None:
@@ -8339,7 +8797,7 @@ class ExpertSwapManager:
             updated[int(action.dst_slot)] = int(action.src_logical)
             updated_owners = layer.logical_to_physical.clone()
             victim = int(action.dst_logical)
-            if int(updated_owners[victim].item()) == int(action.dst_slot):
+            if victim >= 0 and int(updated_owners[victim].item()) == int(action.dst_slot):
                 remaining = torch.nonzero(updated == victim, as_tuple=False).flatten()
                 if remaining.numel() == 0:
                     raise RuntimeError(
@@ -8375,15 +8833,38 @@ class ExpertSwapManager:
                     raise RuntimeError(f"Forward-reuse cover has no source-rank route LUT for {layer.key}.")
                 source_lut = source_lut.clone()
                 victim = int(action.dst_logical)
-                victim_fallback = int(updated_owners[victim].item())
-                source_lut[:, victim] = torch.where(
-                    source_lut[:, victim] == int(action.dst_slot),
-                    torch.full_like(source_lut[:, victim], victim_fallback),
-                    source_lut[:, victim],
-                )
+                victim_fallback = int(action.dst_slot) if victim < 0 else int(updated_owners[victim].item())
+                if victim >= 0:
+                    source_lut[:, victim] = torch.where(
+                        source_lut[:, victim] == int(action.dst_slot),
+                        torch.full_like(source_lut[:, victim], victim_fallback),
+                        source_lut[:, victim],
+                    )
                 destination_rank = int(action.dst_slot) // int(layer.num_local_experts)
-                source_lut[destination_rank, int(action.src_logical)] = int(action.dst_slot)
+                service_group_size = int(self._forward_reuse_cover_service_group_size)
+                service_start = (destination_rank // service_group_size) * service_group_size
+                source_lut[
+                    service_start : service_start + service_group_size,
+                    int(action.src_logical),
+                ] = int(action.dst_slot)
                 layer.source_logical_to_physical = source_lut
+                selected = layer.latest_selected_experts
+                physical = layer.latest_physical_routes
+                if selected is not None and physical is not None and selected.shape == physical.shape:
+                    layer.latest_physical_routes = patch_forward_cover_routes(
+                        selected_experts=selected,
+                        physical_routes=physical,
+                        action=action,
+                        source_rank=self.ep_rank,
+                        slots_per_rank=layer.num_local_experts,
+                        victim_fallback_slot=victim_fallback,
+                        service_group_size=service_group_size,
+                    )
+                    # The previous endpoint cache describes the Forward route
+                    # before this cover. A later offline round must reconstruct
+                    # its baseline from the patched route instead of reusing it.
+                    layer.latest_forward_baseline_communication_counts = None
+                    layer.latest_forward_traffic_endpoint_statistics = None
             layer.slot_to_logical = updated
             layer.logical_to_physical = updated_owners
             layer.fixed_r2_layout = False
@@ -8402,8 +8883,25 @@ class ExpertSwapManager:
         common_device = _local_tensor_view(layers[0].gate_up_proj).device
         synchronize()
         planning_started = time.perf_counter()
-        decision_rows = torch.zeros((len(layers), 8), dtype=torch.float32, device=common_device)
-        owned_layers = 0
+        decision_rows = torch.zeros(
+            (len(layers), self._forward_reuse_cover_proposal_topk, 8),
+            dtype=torch.float32,
+            device=common_device,
+        )
+        target_owner_ranks = [-1] * len(layers)
+        hierarchy_sizes = self.hierarchy.group_sizes[: max(0, int(self.hierarchy.selected_dim) - 1)]
+        aggregate_rows: torch.Tensor | None = None
+        aggregate_entries: list[tuple[int, ExpertLayerState, int]] = []
+        if self._forward_reuse_cover_aggregate_service_group:
+            num_experts = int(layers[0].num_experts)
+            if any(int(layer.num_experts) != num_experts for layer in layers):
+                raise RuntimeError("Service-group Cover aggregation requires the same expert count in every layer.")
+            aggregate_rows = torch.zeros(
+                (len(layers), 2 * num_experts + 1),
+                dtype=torch.float32,
+                device=common_device,
+            )
+
         for layer_index, layer in enumerate(layers):
             layout = self._layer_layout(layer)
             active_layout = layout[layout >= 0]
@@ -8411,7 +8909,18 @@ class ExpertSwapManager:
             target_ranks = tuple(
                 rank
                 for rank in range(self.ep_size)
-                if any(
+                if (
+                    self._forward_reuse_cover_empty_seeding
+                    and bool(
+                        (
+                            layout[
+                                rank * layer.num_local_experts : (rank + 1) * layer.num_local_experts
+                            ]
+                            < 0
+                        ).any()
+                    )
+                )
+                or any(
                     int(layout[slot].item()) >= 0 and int(copy_counts[int(layout[slot].item())].item()) > 1
                     for slot in range(
                         rank * layer.num_local_experts,
@@ -8421,18 +8930,168 @@ class ExpertSwapManager:
             )
             if not target_ranks:
                 continue
-            owner_rank = target_ranks[(int(layer_index) + int(step)) % len(target_ranks)]
+            owner_rank = rotating_service_target_rank(
+                target_ranks,
+                layer_index=layer_index,
+                step=step,
+                service_group_size=self._forward_reuse_cover_service_group_size,
+            )
+            target_owner_ranks[layer_index] = owner_rank
+            if aggregate_rows is None:
+                continue
+            service_group_size = int(self._forward_reuse_cover_service_group_size)
+            service_start = (owner_rank // service_group_size) * service_group_size
+            if not service_start <= self.ep_rank < service_start + service_group_size:
+                continue
+            selected = layer.latest_selected_experts
+            physical = layer.latest_physical_routes
+            if selected is None or physical is None or selected.shape != physical.shape:
+                continue
+            aggregate_entries.append((layer_index, layer, owner_rank))
+
+        service_statistics_compute_started = time.perf_counter()
+        if aggregate_rows is not None and aggregate_entries:
+            entry_shapes = {
+                tuple(layer.latest_selected_experts.shape)
+                for _layer_index, layer, _owner_rank in aggregate_entries
+                if layer.latest_selected_experts is not None
+            }
+            entry_weights = [
+                self._forward_cover_level_weights(layer)
+                for _layer_index, layer, _owner_rank in aggregate_entries
+            ]
+            can_batch_service_statistics = (
+                len(entry_shapes) == 1
+                and all(weights == entry_weights[0] for weights in entry_weights[1:])
+            )
+            if can_batch_service_statistics:
+                selected_batch = torch.stack(
+                    [
+                        layer.latest_selected_experts
+                        for _layer_index, layer, _owner_rank in aggregate_entries
+                        if layer.latest_selected_experts is not None
+                    ],
+                    dim=0,
+                )
+                physical_batch = torch.stack(
+                    [
+                        layer.latest_physical_routes
+                        for _layer_index, layer, _owner_rank in aggregate_entries
+                        if layer.latest_physical_routes is not None
+                    ],
+                    dim=0,
+                )
+                target_rank_batch = torch.tensor(
+                    [owner_rank for _layer_index, _layer, owner_rank in aggregate_entries],
+                    dtype=torch.long,
+                    device=common_device,
+                )
+                batched_statistics = forward_cover_local_heuristic_statistics_batched(
+                    selected_experts=selected_batch,
+                    physical_routes=physical_batch,
+                    source_rank=self.ep_rank,
+                    target_ranks=target_rank_batch,
+                    slots_per_rank=aggregate_entries[0][1].num_local_experts,
+                    ep_size=self.ep_size,
+                    hierarchy_group_sizes=hierarchy_sizes,
+                    num_experts=aggregate_entries[0][1].num_experts,
+                    level_weights=entry_weights[0],
+                )
+                layer_indices = torch.tensor(
+                    [layer_index for layer_index, _layer, _owner_rank in aggregate_entries],
+                    dtype=torch.long,
+                    device=common_device,
+                )
+                aggregate_rows[:, :num_experts].index_copy_(
+                    0,
+                    layer_indices,
+                    batched_statistics.communication_benefit,
+                )
+                aggregate_rows[:, num_experts : 2 * num_experts].index_copy_(
+                    0,
+                    layer_indices,
+                    batched_statistics.expert_assignments,
+                )
+                aggregate_rows[:, -1].index_copy_(
+                    0,
+                    layer_indices,
+                    batched_statistics.baseline_communication_units,
+                )
+            else:
+                for layer_index, layer, owner_rank in aggregate_entries:
+                    assert layer.latest_selected_experts is not None
+                    assert layer.latest_physical_routes is not None
+                    local_statistics = forward_cover_local_heuristic_statistics(
+                        selected_experts=layer.latest_selected_experts,
+                        physical_routes=layer.latest_physical_routes,
+                        source_rank=self.ep_rank,
+                        target_rank=owner_rank,
+                        slots_per_rank=layer.num_local_experts,
+                        ep_size=self.ep_size,
+                        hierarchy_group_sizes=hierarchy_sizes,
+                        num_experts=layer.num_experts,
+                        level_weights=self._forward_cover_level_weights(layer),
+                    )
+                    aggregate_rows[layer_index, : layer.num_experts] = local_statistics.communication_benefit
+                    aggregate_rows[layer_index, layer.num_experts : 2 * layer.num_experts] = (
+                        local_statistics.expert_assignments
+                    )
+                    aggregate_rows[layer_index, -1] = local_statistics.baseline_communication_units
+        synchronize()
+        service_statistics_compute_ms = (time.perf_counter() - service_statistics_compute_started) * 1000.0
+
+        service_statistics_collective_ms = 0.0
+        if aggregate_rows is not None:
+            service_statistics_collective_started = time.perf_counter()
+            if self.ep_group is not None and self.ep_size > 1:
+                dist.all_reduce(aggregate_rows, op=dist.ReduceOp.SUM, group=self.ep_group)
+            synchronize()
+            service_statistics_collective_ms = (
+                time.perf_counter() - service_statistics_collective_started
+            ) * 1000.0
+
+        owned_layers = 0
+        ready_owned_layers = 0
+        empty_count_on_owned_targets = 0
+        for layer_index, layer in enumerate(layers):
+            owner_rank = target_owner_ranks[layer_index]
             if owner_rank != self.ep_rank:
                 continue
             owned_layers += 1
+            layout = self._layer_layout(layer)
             selected = layer.latest_selected_experts
             physical = layer.latest_physical_routes
             local_counts = layer.latest_tokens_per_local_expert
-            if selected is None or physical is None or local_counts is None:
+            if selected is None or physical is None:
                 continue
             if selected.shape != physical.shape:
                 continue
-            proposal = propose_forward_reuse_cover(
+            target_start = int(owner_rank) * int(layer.num_local_experts)
+            target_end = target_start + int(layer.num_local_experts)
+            target_empty_count = int((layout[target_start:target_end] < 0).sum().item())
+            empty_count_on_owned_targets += target_empty_count
+            if local_counts is None:
+                if not self._forward_reuse_cover_empty_seeding or target_empty_count <= 0:
+                    continue
+                # Before any redundant copy is active, some dispatch paths do
+                # not publish per-physical-slot counts.  Empty destinations
+                # are nevertheless exact zero-load victims, so a zero vector
+                # contains all information the empty-slot proposal needs.
+                local_counts = torch.zeros(
+                    (layer.num_local_experts,),
+                    dtype=torch.float32,
+                    device=selected.device,
+                )
+            ready_owned_layers += 1
+            aggregated_statistics = None
+            if aggregate_rows is not None:
+                row = aggregate_rows[layer_index]
+                aggregated_statistics = ForwardCoverHeuristicStatistics(
+                    communication_benefit=row[: layer.num_experts],
+                    expert_assignments=row[layer.num_experts : 2 * layer.num_experts],
+                    baseline_communication_units=row[-1],
+                )
+            local_proposals = propose_forward_reuse_covers(
                 selected_experts=selected,
                 physical_routes=physical,
                 slot_to_logical=layout,
@@ -8446,24 +9105,29 @@ class ExpertSwapManager:
                 level_weights=self._forward_cover_level_weights(layer),
                 compute_weight=self._forward_reuse_cover_compute_weight,
                 minimum_gain=self._forward_reuse_cover_min_gain,
+                victim_mode=self._forward_reuse_cover_victim_mode,
+                service_group_size=self._forward_reuse_cover_service_group_size,
+                aggregated_statistics=aggregated_statistics,
+                max_proposals=self._forward_reuse_cover_proposal_topk,
             )
-            if proposal.action is None:
-                continue
-            action = proposal.action
-            decision_rows[layer_index] = torch.tensor(
-                [
-                    1.0,
-                    float(action.src_slot + 1),
-                    float(action.dst_slot + 1),
-                    float(action.src_logical + 1),
-                    float(action.dst_logical + 1),
-                    float(proposal.estimated_gain),
-                    float(proposal.communication_gain),
-                    float(proposal.assignment_delta),
-                ],
-                dtype=torch.float32,
-                device=common_device,
-            )
+            for proposal_index, proposal in enumerate(local_proposals):
+                if proposal_index >= self._forward_reuse_cover_proposal_topk or proposal.action is None:
+                    continue
+                action = proposal.action
+                decision_rows[layer_index, proposal_index] = torch.tensor(
+                    [
+                        1.0,
+                        float(action.src_slot + 1),
+                        float(action.dst_slot + 1),
+                        float(action.src_logical + 1),
+                        float(action.dst_logical + 1),
+                        float(proposal.estimated_gain),
+                        float(proposal.communication_gain),
+                        float(proposal.assignment_delta),
+                    ],
+                    dtype=torch.float32,
+                    device=common_device,
+                )
 
         proposal_collective_started = time.perf_counter()
         if self.ep_group is not None and self.ep_size > 1:
@@ -8472,18 +9136,30 @@ class ExpertSwapManager:
         proposal_collective_ms = (time.perf_counter() - proposal_collective_started) * 1000.0
 
         rows = decision_rows.detach().to(device="cpu")
+        fresh_proposals: dict[int, list[tuple[ExpertLayerState, PlacementAction]]] = {}
+        for layer_index, (layer, layer_rows) in enumerate(zip(layers, rows, strict=True)):
+            for row in layer_rows:
+                if int(row[0].item()) <= 0:
+                    continue
+                action = PlacementAction(
+                    kind="replica",
+                    src_slot=int(row[1].item()) - 1,
+                    dst_slot=int(row[2].item()) - 1,
+                    src_logical=int(row[3].item()) - 1,
+                    dst_logical=int(row[4].item()) - 1,
+                )
+                fresh_proposals.setdefault(layer_index, []).append((layer, action))
+
+        pending_layer_indices: set[int] = set()
         proposals: list[tuple[int, ExpertLayerState, PlacementAction]] = []
-        for layer_index, (layer, row) in enumerate(zip(layers, rows, strict=True)):
-            if int(row[0].item()) <= 0:
+        for layer_index, layer in enumerate(layers):
+            pending = self._forward_reuse_cover_pending.get(layer.key)
+            if pending is not None:
+                proposals.append((layer_index, layer, pending[0]))
+                pending_layer_indices.add(layer_index)
                 continue
-            action = PlacementAction(
-                kind="replica",
-                src_slot=int(row[1].item()) - 1,
-                dst_slot=int(row[2].item()) - 1,
-                src_logical=int(row[3].item()) - 1,
-                dst_logical=int(row[4].item()) - 1,
-            )
-            proposals.append((layer_index, layer, action))
+            for fresh in fresh_proposals.get(layer_index, ()):
+                proposals.append((layer_index, fresh[0], fresh[1]))
 
         if self._forward_reuse_cover_fast:
             # The layer owner selected a positive local action directly from
@@ -8506,6 +9182,14 @@ class ExpertSwapManager:
                 "hiermoe/forward_cover_proposal_collective_ms",
                 proposal_collective_ms,
             )
+            self._accumulate_metric(
+                "hiermoe/forward_cover_service_statistics_collective_ms",
+                service_statistics_collective_ms,
+            )
+            self._accumulate_metric(
+                "hiermoe/forward_cover_service_statistics_compute_ms",
+                service_statistics_compute_ms,
+            )
             self._accumulate_metric("hiermoe/forward_cover_validation_compute_ms", 0.0)
             self._accumulate_metric("hiermoe/forward_cover_validation_collective_ms", 0.0)
             self._accumulate_metric("hiermoe/forward_cover_migration_ms", migration_ms)
@@ -8515,37 +9199,73 @@ class ExpertSwapManager:
             self._accumulate_metric("hiermoe/forward_cover_validation_affected_tokens", 0)
             self._accumulate_metric(
                 "hiermoe/forward_cover_estimated_gain",
-                float(decision_rows[:, 5].sum().item()),
+                float(decision_rows[..., 5].sum().item()),
             )
             self._accumulate_metric(
                 "hiermoe/forward_cover_communication_gain",
-                float(decision_rows[:, 6].sum().item()),
+                float(decision_rows[..., 6].sum().item()),
             )
             self._accumulate_metric(
                 "hiermoe/forward_cover_assignment_delta",
-                float(decision_rows[:, 7].sum().item()),
+                float(decision_rows[..., 7].sum().item()),
             )
             return committed
 
-        hierarchy_sizes = self.hierarchy.group_sizes[: max(0, int(self.hierarchy.selected_dim) - 1)]
-        communication_width = self.ep_size + sum(
-            self.ep_size // int(size)
-            for size in hierarchy_sizes
-            if 1 < int(size) < self.ep_size and self.ep_size % int(size) == 0
-        )
+        endpoint_width = 8 * self.ep_size
+        validation_row_count = max(1, len(proposals))
         validation_rows = torch.zeros(
-            (len(layers), 2 * communication_width + 2 * self.ep_size),
+            (validation_row_count, 2 * endpoint_width),
             dtype=torch.float32,
             device=common_device,
         )
+        debug_endpoint_deltas = (
+            torch.zeros(
+                (validation_row_count, endpoint_width),
+                dtype=torch.float32,
+                device=common_device,
+            )
+            if self.debug_validate
+            else None
+        )
+        cost_planner = GreedyCommunicationPlanner(
+            hierarchy=self.hierarchy,
+            perf_model=self.perf_model,
+            hidden_size=layers[0].latest_hidden_size,
+            bytes_per_element=layers[0].latest_bytes_per_element,
+            slots_per_rank=layers[0].num_local_experts,
+            communication_scale=1.0,
+            forward_compute_per_assignment=self._forward_reuse_cover_compute_ms_per_assignment,
+            forward_compute_constant=0.0,
+            smooth_max_gamma=self.smooth_max_gamma,
+            process_group=self.ep_group,
+            max_copies=self.greedy_max_copies_per_expert,
+            assume_unique_routes=True,
+            traffic_inter_ms_per_byte=self._online_freeze_inter_ms_per_byte,
+            traffic_intra_ms_per_byte=self._online_freeze_intra_ms_per_byte,
+            traffic_route_ms_per_assignment=self._online_freeze_route_ms_per_assignment,
+            traffic_communication_phase_multiplier=self._online_freeze_communication_ratio,
+            traffic_compute_phase_multiplier=self._online_freeze_compute_ratio,
+        )
         validation_compute_started = time.perf_counter()
         affected_token_counts = [0] * len(proposals)
+        batched_affected_tokens: torch.Tensor | None = None
+        local_validation_proposal_count = len(proposals)
 
         def validate(proposal_index: int, layer_index: int, layer: ExpertLayerState, action: PlacementAction) -> None:
             selected = layer.latest_selected_experts
             physical = layer.latest_physical_routes
             if selected is None or physical is None:
                 return
+            baseline_assignments = None
+            local_counts = layer.latest_tokens_per_local_expert
+            cached_endpoint = layer.latest_forward_traffic_endpoint_statistics
+            if cached_endpoint is not None and local_counts is not None:
+                baseline_assignments = torch.zeros(
+                    (self.ep_size,),
+                    dtype=torch.float32,
+                    device=local_counts.device,
+                )
+                baseline_assignments[self.ep_rank] = local_counts.to(torch.float32).sum()
             local_validation = forward_cover_local_validation_stats(
                 selected_experts=selected,
                 physical_routes=physical,
@@ -8559,21 +9279,188 @@ class ExpertSwapManager:
                 step=max(0, int(layer.latest_route_step)),
                 layer_seed=zlib.crc32(layer.key.encode("utf-8")),
                 patch_remap=self._forward_reuse_cover_patch_remap,
-                victim_fallback_slot=int(layer.logical_to_physical[int(action.dst_logical)].item()),
+                victim_fallback_slot=(
+                    int(action.dst_slot)
+                    if int(action.dst_logical) < 0
+                    else int(layer.logical_to_physical[int(action.dst_logical)].item())
+                ),
+                service_group_size=self._forward_reuse_cover_service_group_size,
+                baseline_communication_counts=(
+                    layer.latest_forward_baseline_communication_counts if cached_endpoint is not None else None
+                ),
+                baseline_assignment_counts=baseline_assignments,
             )
-            validation_rows[layer_index, :communication_width] = local_validation.baseline_communication_counts
-            validation_rows[layer_index, communication_width : 2 * communication_width] = (
-                local_validation.communication_count_delta
-            )
-            assignment_start = 2 * communication_width
-            validation_rows[layer_index, assignment_start : assignment_start + self.ep_size] = (
-                local_validation.baseline_assignment_counts
-            )
-            validation_rows[layer_index, assignment_start + self.ep_size :] = local_validation.assignment_count_delta
+            if cached_endpoint is None:
+                baseline_endpoint = cost_planner._local_traffic_endpoint_statistics(
+                    local_validation.baseline_communication_counts.unsqueeze(0),
+                    local_validation.baseline_assignment_counts.unsqueeze(0),
+                    source_rank=self.ep_rank,
+                ).squeeze(0)
+            else:
+                baseline_endpoint = cached_endpoint.to(
+                    device=common_device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+            endpoint_delta = cost_planner._local_traffic_endpoint_statistics(
+                local_validation.communication_count_delta.unsqueeze(0),
+                local_validation.assignment_count_delta.unsqueeze(0),
+                source_rank=self.ep_rank,
+            ).squeeze(0)
+            validation_rows[proposal_index, :endpoint_width] = baseline_endpoint
+            validation_rows[proposal_index, endpoint_width:] = endpoint_delta
+            if self.debug_validate and cached_endpoint is not None:
+                uncached_validation = forward_cover_local_validation_stats(
+                    selected_experts=selected,
+                    physical_routes=physical,
+                    slot_to_logical=self._layer_layout(layer),
+                    action=action,
+                    source_rank=self.ep_rank,
+                    slots_per_rank=layer.num_local_experts,
+                    hierarchy_group_sizes=hierarchy_sizes,
+                    num_experts=layer.num_experts,
+                    max_copies=self.greedy_max_copies_per_expert,
+                    step=max(0, int(layer.latest_route_step)),
+                    layer_seed=zlib.crc32(layer.key.encode("utf-8")),
+                    patch_remap=self._forward_reuse_cover_patch_remap,
+                    victim_fallback_slot=(
+                        int(action.dst_slot)
+                        if int(action.dst_logical) < 0
+                        else int(layer.logical_to_physical[int(action.dst_logical)].item())
+                    ),
+                    service_group_size=self._forward_reuse_cover_service_group_size,
+                )
+                rescanned_baseline = cost_planner._local_traffic_endpoint_statistics(
+                    uncached_validation.baseline_communication_counts.unsqueeze(0),
+                    uncached_validation.baseline_assignment_counts.unsqueeze(0),
+                    source_rank=self.ep_rank,
+                ).squeeze(0)
+                assert debug_endpoint_deltas is not None
+                debug_endpoint_deltas[proposal_index] = baseline_endpoint - rescanned_baseline
             affected_token_counts[proposal_index] = local_validation.affected_tokens
 
-        validation_streams = []
-        if common_device.type != "cpu" and len(proposals) > 1:
+        can_batch_patch_validation = (
+            self._forward_reuse_cover_patch_remap
+            and not self.debug_validate
+            and bool(proposals)
+            and all(
+                layer.latest_selected_experts is not None
+                and layer.latest_physical_routes is not None
+                and layer.latest_forward_traffic_endpoint_statistics is not None
+                for _layer_index, layer, _action in proposals
+            )
+        )
+        proposal_shapes = {
+            tuple(layer.latest_selected_experts.shape)
+            for _layer_index, layer, _action in proposals
+            if layer.latest_selected_experts is not None
+        }
+        can_batch_patch_validation = can_batch_patch_validation and len(proposal_shapes) == 1
+        if can_batch_patch_validation:
+            relevant_proposal_indices = [
+                proposal_index
+                for proposal_index, (_layer_index, layer, action) in enumerate(proposals)
+                if forward_cover_patch_source_rank_relevant(
+                    action=action,
+                    source_rank=self.ep_rank,
+                    slots_per_rank=layer.num_local_experts,
+                    service_group_size=self._forward_reuse_cover_service_group_size,
+                    source_logical_to_physical=(
+                        None
+                        if layer.source_logical_to_physical is None
+                        else layer.source_logical_to_physical[self.ep_rank]
+                    ),
+                )
+            ]
+            local_validation_proposal_count = len(relevant_proposal_indices)
+            relevant_proposals = [proposals[index] for index in relevant_proposal_indices]
+            baseline_endpoint_batch = torch.stack(
+                [
+                    layer.latest_forward_traffic_endpoint_statistics
+                    for _layer_index, layer, _action in proposals
+                    if layer.latest_forward_traffic_endpoint_statistics is not None
+                ],
+                dim=0,
+            ).to(
+                device=common_device,
+                dtype=torch.float32,
+                non_blocking=True,
+            )
+            validation_rows[: len(proposals), :endpoint_width].copy_(baseline_endpoint_batch)
+        if can_batch_patch_validation and relevant_proposals:
+            selected_batch = torch.stack(
+                [
+                    layer.latest_selected_experts
+                    for _layer_index, layer, _action in relevant_proposals
+                    if layer.latest_selected_experts is not None
+                ],
+                dim=0,
+            )
+            physical_batch = torch.stack(
+                [
+                    layer.latest_physical_routes
+                    for _layer_index, layer, _action in relevant_proposals
+                    if layer.latest_physical_routes is not None
+                ],
+                dim=0,
+            )
+            source_logical = torch.tensor(
+                [action.src_logical for _layer_index, _layer, action in relevant_proposals],
+                dtype=torch.long,
+                device=common_device,
+            )
+            victim_logical = torch.tensor(
+                [action.dst_logical for _layer_index, _layer, action in relevant_proposals],
+                dtype=torch.long,
+                device=common_device,
+            )
+            destination_slots = torch.tensor(
+                [action.dst_slot for _layer_index, _layer, action in relevant_proposals],
+                dtype=torch.long,
+                device=common_device,
+            )
+            victim_fallback_slots = torch.tensor(
+                [
+                    (
+                        int(action.dst_slot)
+                        if int(action.dst_logical) < 0
+                        else int(layer.logical_to_physical[int(action.dst_logical)].item())
+                    )
+                    for _layer_index, layer, action in relevant_proposals
+                ],
+                dtype=torch.long,
+                device=common_device,
+            )
+            batched_validation = forward_cover_patch_validation_stats_batched(
+                selected_experts=selected_batch,
+                physical_routes=physical_batch,
+                source_logical=source_logical,
+                victim_logical=victim_logical,
+                destination_slots=destination_slots,
+                victim_fallback_slots=victim_fallback_slots,
+                source_rank=self.ep_rank,
+                slots_per_rank=layers[0].num_local_experts,
+                ep_size=self.ep_size,
+                hierarchy_group_sizes=hierarchy_sizes,
+                service_group_size=self._forward_reuse_cover_service_group_size,
+            )
+            endpoint_delta = cost_planner._local_traffic_endpoint_statistics(
+                batched_validation.communication_count_delta,
+                batched_validation.assignment_count_delta,
+                source_rank=self.ep_rank,
+            )
+            relevant_index_tensor = torch.tensor(
+                relevant_proposal_indices,
+                dtype=torch.long,
+                device=common_device,
+            )
+            validation_rows[:, endpoint_width:].index_copy_(
+                0,
+                relevant_index_tensor,
+                endpoint_delta,
+            )
+            batched_affected_tokens = batched_validation.affected_tokens
+        elif not can_batch_patch_validation and common_device.type != "cpu" and len(proposals) > 1:
             device_api = get_torch_device()
             try:
                 caller_stream = device_api.current_stream(common_device)
@@ -8595,53 +9482,64 @@ class ExpertSwapManager:
             for stream in validation_streams:
                 assert stream is not None
                 caller_stream.wait_stream(stream)
-        else:
+        elif not can_batch_patch_validation:
             for proposal_index, (layer_index, layer, action) in enumerate(proposals):
                 validate(proposal_index, layer_index, layer, action)
         synchronize()
         validation_compute_ms = (time.perf_counter() - validation_compute_started) * 1000.0
-        local_affected_tokens = sum(affected_token_counts)
+        local_affected_tokens = (
+            int(batched_affected_tokens.sum().item())
+            if batched_affected_tokens is not None
+            else sum(affected_token_counts)
+        )
 
         validation_collective_started = time.perf_counter()
         if self.ep_group is not None and self.ep_size > 1:
             dist.all_reduce(validation_rows, op=dist.ReduceOp.SUM, group=self.ep_group)
+            if debug_endpoint_deltas is not None:
+                dist.all_reduce(
+                    debug_endpoint_deltas,
+                    op=dist.ReduceOp.SUM,
+                    group=self.ep_group,
+                )
         synchronize()
         validation_collective_ms = (time.perf_counter() - validation_collective_started) * 1000.0
 
-        baseline_communication_counts = validation_rows[:, :communication_width]
-        candidate_communication_counts = (
-            baseline_communication_counts + validation_rows[:, communication_width : 2 * communication_width]
-        )
-        assignment_start = 2 * communication_width
-        baseline_assignment_counts = validation_rows[
-            :,
-            assignment_start : assignment_start + self.ep_size,
-        ]
-        candidate_assignment_counts = (
-            baseline_assignment_counts + validation_rows[:, assignment_start + self.ep_size :]
-        )
-        cost_planner = self._planner_for_layer(
-            layers[0],
-            communication_scale=1.0,
-            forward_compute_per_assignment=0.0,
-            process_group=self.ep_group,
-        )
-        if not isinstance(cost_planner, GreedyCommunicationPlanner):
-            raise RuntimeError("Forward cover global validation requires the greedy planner cost model.")
-        baseline_communication = cost_planner._communication_cost_details(baseline_communication_counts)[0]
-        candidate_communication = cost_planner._communication_cost_details(candidate_communication_counts)[0]
-        baseline_peak_assignments = baseline_assignment_counts.max(dim=1).values
-        candidate_peak_assignments = candidate_assignment_counts.max(dim=1).values
-        communication_gain_rows = (
-            baseline_communication - candidate_communication
-        ) / baseline_communication.clamp_min(1.0e-6)
-        assignment_gain_rows = (
-            baseline_peak_assignments - candidate_peak_assignments
-        ) / baseline_peak_assignments.clamp_min(1.0)
-        global_gain_rows = communication_gain_rows + self._forward_reuse_cover_compute_weight * assignment_gain_rows
-        proposal_mask = decision_rows[:, 0] > 0
+        if debug_endpoint_deltas is not None:
+            cached_mismatch = debug_endpoint_deltas.abs().max()
+            if float(cached_mismatch.item()) != 0.0:
+                raise RuntimeError(
+                    "Forward cached endpoint statistics disagree with route reconstruction: "
+                    f"max_abs_delta={float(cached_mismatch.item())}."
+                )
+        baseline_endpoint_statistics = validation_rows[:, :endpoint_width]
+        candidate_endpoint_statistics = baseline_endpoint_statistics + validation_rows[:, endpoint_width:]
+        (
+            baseline_communication,
+            baseline_compute,
+            _baseline_units,
+            _baseline_peak_rank,
+            _baseline_peak_compute_rank,
+            _baseline_dim,
+        ) = cost_planner._traffic_endpoint_cost_details(baseline_endpoint_statistics)
+        (
+            candidate_communication,
+            candidate_compute,
+            _candidate_units,
+            _candidate_peak_rank,
+            _candidate_peak_compute_rank,
+            _candidate_dim,
+        ) = cost_planner._traffic_endpoint_cost_details(candidate_endpoint_statistics)
+        baseline_assignment_receive = baseline_endpoint_statistics[:, 7 * self.ep_size :]
+        candidate_assignment_receive = candidate_endpoint_statistics[:, 7 * self.ep_size :]
+        baseline_peak_assignments = baseline_assignment_receive.max(dim=1).values
+        candidate_peak_assignments = candidate_assignment_receive.max(dim=1).values
+        communication_gain_rows = baseline_communication - candidate_communication
+        compute_gain_rows = baseline_compute - candidate_compute
+        assignment_gain_rows = baseline_peak_assignments - candidate_peak_assignments
+        global_gain_rows = communication_gain_rows + compute_gain_rows
         accepted_mask = (
-            proposal_mask & torch.isfinite(global_gain_rows) & (global_gain_rows > self._forward_reuse_cover_min_gain)
+            torch.isfinite(global_gain_rows) & (global_gain_rows > self._forward_reuse_cover_min_gain)
         )
         validation_summary = (
             torch.stack(
@@ -8657,20 +9555,49 @@ class ExpertSwapManager:
                 ),
                 dim=1,
             )
+            [: len(proposals)]
             .detach()
             .to(device="cpu")
         )
 
-        proposal_by_layer = {layer_index: (layer, action) for layer_index, layer, action in proposals}
+        proposal_groups: dict[
+            int,
+            list[tuple[tuple[ExpertLayerState, PlacementAction], torch.Tensor]],
+        ] = {}
+        for (layer_index, layer, action), summary in zip(proposals, validation_summary, strict=True):
+            proposal_groups.setdefault(layer_index, []).append(((layer, action), summary))
         selections: list[tuple[ExpertLayerState, PlacementAction]] = []
         estimated_gain = 0.0
         communication_gain = 0.0
         assignment_delta = 0.0
-        for layer_index, summary in enumerate(validation_summary):
-            proposed = proposal_by_layer.get(layer_index)
-            if proposed is None or int(summary[0].item()) <= 0:
+        for layer_index, candidates in proposal_groups.items():
+            accepted_candidates = [
+                (proposed, summary)
+                for proposed, summary in candidates
+                if int(summary[0].item()) > 0
+            ]
+            if not accepted_candidates:
+                if layer_index in pending_layer_indices:
+                    layer = candidates[0][0][0]
+                    self._forward_reuse_cover_pending.pop(layer.key, None)
                 continue
-            selections.append(proposed)
+            proposed, summary = max(
+                accepted_candidates,
+                key=lambda item: float(item[1][1].item()),
+            )
+            layer, action = proposed
+            if self._forward_reuse_cover_confirm_samples > 1:
+                if layer_index in pending_layer_indices:
+                    _pending_action, confirmed_samples = self._forward_reuse_cover_pending.pop(layer.key)
+                    confirmed_samples += 1
+                    if confirmed_samples >= self._forward_reuse_cover_confirm_samples:
+                        selections.append(proposed)
+                    else:
+                        self._forward_reuse_cover_pending[layer.key] = (action, confirmed_samples)
+                else:
+                    self._forward_reuse_cover_pending[layer.key] = (action, 1)
+            else:
+                selections.append(proposed)
             estimated_gain += float(summary[1].item())
             communication_gain += float(summary[2].item())
             assignment_delta += float(summary[7].item() - summary[6].item())
@@ -8687,11 +9614,28 @@ class ExpertSwapManager:
         self._accumulate_metric("hiermoe/forward_cover_planning_ms", planning_ms)
         self._accumulate_metric("hiermoe/forward_cover_decision_collective_ms", collective_ms)
         self._accumulate_metric("hiermoe/forward_cover_proposal_collective_ms", proposal_collective_ms)
+        self._accumulate_metric(
+            "hiermoe/forward_cover_service_statistics_collective_ms",
+            service_statistics_collective_ms,
+        )
+        self._accumulate_metric(
+            "hiermoe/forward_cover_service_statistics_compute_ms",
+            service_statistics_compute_ms,
+        )
         self._accumulate_metric("hiermoe/forward_cover_validation_compute_ms", validation_compute_ms)
         self._accumulate_metric("hiermoe/forward_cover_validation_collective_ms", validation_collective_ms)
         self._accumulate_metric("hiermoe/forward_cover_migration_ms", migration_ms)
         self._accumulate_metric("hiermoe/forward_cover_owned_layers", owned_layers)
+        self._accumulate_metric("hiermoe/forward_cover_ready_owned_layers", ready_owned_layers)
+        self._accumulate_metric(
+            "hiermoe/forward_cover_empty_count_on_owned_targets",
+            empty_count_on_owned_targets,
+        )
         self._accumulate_metric("hiermoe/forward_cover_proposed", len(proposals))
+        self._accumulate_metric(
+            "hiermoe/forward_cover_validation_local_proposals",
+            local_validation_proposal_count,
+        )
         self._accumulate_metric("hiermoe/forward_cover_accepted", len(committed))
         self._accumulate_metric("hiermoe/forward_cover_validation_affected_tokens", local_affected_tokens)
         self._accumulate_metric("hiermoe/forward_cover_estimated_gain", estimated_gain)
@@ -8771,27 +9715,70 @@ class ExpertSwapManager:
     @torch.no_grad()
     def _run_online_freeze_step(self, step: int) -> str:
         calibration_step = self._online_freeze_calibration_step
+        planning_step = calibration_step + 1
         if int(step) < calibration_step:
             self.latest_pair = "none"
             return self.latest_pair
-        if int(step) > calibration_step:
+        if int(step) > planning_step:
             self.latest_pair = "none"
             return self.latest_pair
 
-        self.prepare_calibrations(int(step))
         layers = [self.layers[layer_key] for layer_key in sorted(self.layers)]
+        if int(step) == calibration_step:
+            self.prepare_calibrations(int(step))
+            if any(layer.planner_calibration is None for layer in layers):
+                raise RuntimeError(
+                    f"Online freeze calibration did not complete at step {step}; "
+                    "the profiled layer events were not ready on every EP rank."
+                )
+            self.latest_pair = "none"
+            return self.latest_pair
+
         if any(layer.planner_calibration is None for layer in layers):
             raise RuntimeError(
-                f"Online freeze calibration did not complete at step {step}; "
-                "the profiled layer events were not ready on every EP rank."
+                f"Online freeze planning at step {step} has no calibration from step {calibration_step}."
             )
+        r2_costs: dict[str, float] = {}
+        for layer in layers:
+            calibration = layer.planner_calibration
+            selected = layer.latest_selected_experts
+            if calibration is None or selected is None:
+                raise RuntimeError(f"Online freeze cannot score the R2 baseline for layer {layer.key}.")
+            planner = self._planner_for_layer(
+                layer,
+                communication_scale=calibration.communication_scale,
+                forward_compute_per_assignment=calibration.forward_compute_per_assignment,
+                forward_compute_constant=calibration.forward_compute_constant,
+            )
+            copy_slots, _copy_mask = layer.copy_slots_for_device(selected.device)
+            r2_costs[layer.key] = planner.score_layout(
+                selected,
+                self._layer_layout(layer),
+                source_ranks=self.ep_rank,
+                owner_slots=layer.logical_to_physical,
+                step=int(step),
+                layer_seed=zlib.crc32(layer.key.encode("utf-8")),
+                max_copies=int(copy_slots.shape[1]),
+            ).total
         self._reset_redundant_slots_for_online_freeze(layers)
         with _full_timing_range("hiermoe_online_freeze_plan"):
             committed = self._plan_historical_layers(layers, int(step))
         expected_actions = len(layers) * self.replica_slot_capacity
         if len(committed) != expected_actions:
             raise RuntimeError(f"Online freeze committed {len(committed)} cover actions, expected {expected_actions}.")
+        final_costs = {layer.key: layer.last_plan.final_cost.total for layer in layers if layer.last_plan is not None}
+        if len(final_costs) != len(layers):
+            raise RuntimeError("Online freeze did not retain a final predicted cost for every layer.")
+        r2_total = sum(r2_costs.values())
+        final_total = sum(final_costs.values())
         self._accumulate_metric("hiermoe/online_freeze_cover_count", len(committed))
+        self._accumulate_metric("hiermoe/online_freeze_r2_predicted_cost_ms", r2_total)
+        self._accumulate_metric("hiermoe/online_freeze_final_predicted_cost_ms", final_total)
+        self._accumulate_metric("hiermoe/online_freeze_predicted_gain_ms", r2_total - final_total)
+        self._accumulate_metric(
+            "hiermoe/online_freeze_predicted_speedup",
+            r2_total / final_total if final_total > 0.0 else 0.0,
+        )
         self.latest_pair = ",".join(committed)
         return self.latest_pair
 
@@ -8806,12 +9793,27 @@ class ExpertSwapManager:
         if self._online_freeze_cost_mode != "off":
             return self._run_online_freeze_step(int(step))
         if self._forward_reuse_cover:
-            if int(step) <= 0 or self.expert_swap_interval <= 0 or int(step) % self.expert_swap_interval != 0:
+            if (
+                int(step) <= 0
+                or (
+                    self._forward_reuse_cover_only_step >= 0
+                    and int(step) != self._forward_reuse_cover_only_step
+                )
+                or self.expert_swap_interval <= 0
+                or int(step) % self.expert_swap_interval != 0
+            ):
                 self.latest_pair = "none"
                 return self.latest_pair
             layers = [self.layers[layer_key] for layer_key in sorted(self.layers)]
             with _full_timing_range("hiermoe_forward_reuse_cover_plan"):
-                committed = self._plan_forward_reuse_cover_layers(layers, int(step))
+                committed: list[str] = []
+                for round_index in range(self._forward_reuse_cover_rounds):
+                    committed.extend(
+                        self._plan_forward_reuse_cover_layers(
+                            layers,
+                            int(step) + round_index,
+                        )
+                    )
             self.latest_pair = ",".join(committed) if committed else "none"
             return self.latest_pair
         if self.fixed_pipeline_overlap:

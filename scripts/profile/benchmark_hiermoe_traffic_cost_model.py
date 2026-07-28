@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import statistics
 from pathlib import Path
 
@@ -30,6 +31,18 @@ _EVENT_NAMES = (
     "stage2_a2a",
     "combine_stage2_a2a",
     "combine_stage1_a2a",
+    "stage1_payload_build",
+    "stage1_meta_pack",
+    "stage1_split_wait",
+    "stage1_meta_unpack",
+    "stage2_payload_build",
+    "stage2_meta_pack",
+    "stage2_split_wait",
+    "stage2_meta_unpack",
+    "dispatch_finalize",
+    "combine_stage2_accum",
+    "combine_stage1_accum",
+    "combine_final_accum",
 )
 _METRIC_NAMES = ("communication_region_ms", *_EVENT_NAMES)
 
@@ -45,6 +58,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-size", type=int, default=2048)
     parser.add_argument("--slot-increment", type=int, default=4)
     parser.add_argument("--max-copies", type=int, default=8)
+    parser.add_argument(
+        "--variants",
+        default="owners,mirrored_r2,node_local,quarter_cyclic,hot,random",
+        help="Comma-separated controlled layout variants; use 'external' with --layout-json.",
+    )
+    parser.add_argument(
+        "--layout-json",
+        type=Path,
+        help="Optional replay JSON whose per-layer slot_to_logical layouts are measured as 'external'.",
+    )
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -105,10 +128,7 @@ def _fill_redundant_slots(
     generator.manual_seed(20260727 + int(layer))
     random_order = torch.randperm(num_experts, generator=generator).tolist()
     for rank in range(ep_size):
-        used = {
-            int(value)
-            for value in layout[rank * slots_per_rank : rank * slots_per_rank + base].tolist()
-        }
+        used = {int(value) for value in layout[rank * slots_per_rank : rank * slots_per_rank + base].tolist()}
         for offset in range(redundant):
             if variant == "mirrored_r2":
                 candidate = ((rank + ep_size // 2) % ep_size) * base + offset % base
@@ -131,6 +151,37 @@ def _fill_redundant_slots(
     return layout
 
 
+def _load_external_layouts(
+    path: Path,
+    *,
+    layers: int,
+    num_physical_slots: int,
+    device: torch.device,
+) -> list[torch.Tensor]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    raw_layers = payload.get("layers", {})
+    if not isinstance(raw_layers, dict):
+        raise ValueError(f"External layout JSON has no layer mapping: {path}.")
+
+    indexed: dict[int, torch.Tensor] = {}
+    for layer_name, layer_payload in raw_layers.items():
+        match = re.search(r"\.layers\.(\d+)\.", str(layer_name))
+        if match is None:
+            continue
+        layer = int(match.group(1))
+        values = layer_payload.get("slot_to_logical") if isinstance(layer_payload, dict) else None
+        if not isinstance(values, list) or len(values) != num_physical_slots:
+            raise ValueError(
+                f"External layout {layer_name!r} has {0 if values is None else len(values)} slots; "
+                f"expected {num_physical_slots}."
+            )
+        indexed[layer] = torch.tensor(values, dtype=torch.long, device=device)
+    missing = sorted(set(range(layers)) - set(indexed))
+    if missing:
+        raise ValueError(f"External layout JSON is missing layers {missing}: {path}.")
+    return [indexed[layer] for layer in range(layers)]
+
+
 def _physical_routes_by_variant(
     logical_routes: list[torch.Tensor],
     *,
@@ -141,22 +192,43 @@ def _physical_routes_by_variant(
     source_rank: int,
     num_experts: int,
     max_copies: int,
+    variants: tuple[str, ...],
+    external_layouts: list[torch.Tensor] | None = None,
 ) -> tuple[dict[str, list[torch.Tensor]], dict[str, list[torch.Tensor]]]:
-    variants = ("owners", "mirrored_r2", "node_local", "quarter_cyclic", "hot", "random")
+    supported = {
+        "owners",
+        "mirrored_r2",
+        "node_local",
+        "quarter_cyclic",
+        "hot",
+        "random",
+        "external",
+    }
+    unknown = sorted(set(variants) - supported)
+    if unknown:
+        raise ValueError(f"Unknown traffic benchmark variants: {unknown}.")
+    if "external" in variants and external_layouts is None:
+        raise ValueError("The external benchmark variant requires --layout-json.")
+    if external_layouts is not None and len(external_layouts) != len(logical_routes):
+        raise ValueError("External layout count must match the logical route layer count.")
     layouts = {name: [] for name in variants}
     routes_by_variant = {name: [] for name in variants}
     for layer, logical in enumerate(logical_routes):
         local_counts = torch.bincount(logical.reshape(-1), minlength=num_experts).to(torch.float32)
         dist.all_reduce(local_counts, op=dist.ReduceOp.SUM)
         for name in variants:
-            layout = _fill_redundant_slots(
-                owner_layout,
-                variant=name,
-                layer=layer,
-                global_expert_counts=local_counts,
-                ep_size=hierarchy.ep_size,
-                num_experts=num_experts,
-                slots_per_rank=slots_per_rank,
+            layout = (
+                external_layouts[layer]
+                if name == "external" and external_layouts is not None
+                else _fill_redundant_slots(
+                    owner_layout,
+                    variant=name,
+                    layer=layer,
+                    global_expert_counts=local_counts,
+                    ep_size=hierarchy.ep_size,
+                    num_experts=num_experts,
+                    slots_per_rank=slots_per_rank,
+                )
             )
             physical = assign_tokens_to_copies_greedy(
                 logical,
@@ -186,11 +258,7 @@ def _traffic_feature_rows(
         dim=0,
     )
     local_assignments = torch.cat(
-        [
-            planner._local_packed_assignment_counts(route)
-            for name in names
-            for route in routes_by_variant[name]
-        ],
+        [planner._local_packed_assignment_counts(route) for name in names for route in routes_by_variant[name]],
         dim=0,
     )
     source_unique = torch.empty(
@@ -262,11 +330,10 @@ def _measure(
     num_physical_experts: int,
     warmup: int,
     iterations: int,
-) -> dict[str, list[dict[str, float]]]:
+) -> tuple[dict[str, list[dict[str, float]]], dict[str, dict[str, object]]]:
     names = list(routes_by_variant)
     samples = {
-        name: [[[] for _metric in _METRIC_NAMES] for _layer in routes]
-        for name, routes in routes_by_variant.items()
+        name: [[[] for _metric in _METRIC_NAMES] for _layer in routes] for name, routes in routes_by_variant.items()
     }
     for iteration in range(warmup + iterations):
         rotated = names[iteration % len(names) :] + names[: iteration % len(names)]
@@ -283,14 +350,10 @@ def _measure(
             torch.npu.synchronize()
             values = []
             for dispatch, combine, internal in events:
-                stage_values = [
-                    float(internal[event][0].elapsed_time(internal[event][1]))
-                    for event in _EVENT_NAMES
-                ]
+                stage_values = [float(internal[event][0].elapsed_time(internal[event][1])) for event in _EVENT_NAMES]
                 values.append(
                     [
-                        float(dispatch[0].elapsed_time(dispatch[1]))
-                        + float(combine[0].elapsed_time(combine[1])),
+                        float(dispatch[0].elapsed_time(dispatch[1])) + float(combine[0].elapsed_time(combine[1])),
                         *stage_values,
                     ]
                 )
@@ -302,7 +365,7 @@ def _measure(
                         samples[name][layer][metric].append(float(value))
         dist.barrier()
 
-    return {
+    layer_medians = {
         name: [
             {
                 metric: statistics.median(layer_samples[metric_index])
@@ -312,6 +375,25 @@ def _measure(
         ]
         for name, variant_samples in samples.items()
     }
+    aggregate_timings: dict[str, dict[str, object]] = {}
+    for name, variant_samples in samples.items():
+        variant_summary: dict[str, object] = {}
+        for metric_index, metric in enumerate(_METRIC_NAMES):
+            iteration_totals = [
+                sum(layer_samples[metric_index][iteration] for layer_samples in variant_samples)
+                for iteration in range(iterations)
+            ]
+            median = statistics.median(iteration_totals)
+            absolute_deviations = [abs(value - median) for value in iteration_totals]
+            variant_summary[metric] = {
+                "iteration_totals_ms": iteration_totals,
+                "median_ms": median,
+                "mad_ms": statistics.median(absolute_deviations),
+                "min_ms": min(iteration_totals),
+                "max_ms": max(iteration_totals),
+            }
+        aggregate_timings[name] = variant_summary
+    return layer_medians, aggregate_timings
 
 
 def main() -> None:
@@ -349,6 +431,16 @@ def main() -> None:
             slot_increment=args.slot_increment,
             device=device,
         )
+        external_layouts = (
+            None
+            if args.layout_json is None
+            else _load_external_layouts(
+                args.layout_json,
+                layers=args.layers,
+                num_physical_slots=int(owner_layout.numel()),
+                device=device,
+            )
+        )
         _layouts, routes_by_variant = _physical_routes_by_variant(
             logical_routes,
             owner_layout=owner_layout,
@@ -358,6 +450,8 @@ def main() -> None:
             source_rank=rank,
             num_experts=args.num_experts,
             max_copies=args.max_copies,
+            variants=tuple(name.strip() for name in args.variants.split(",") if name.strip()),
+            external_layouts=external_layouts,
         )
         planner = GreedyCommunicationPlanner(
             hierarchy=hierarchy,
@@ -371,7 +465,7 @@ def main() -> None:
         top_k = int(logical_routes[0].shape[1])
         hidden = torch.zeros((max_tokens, args.hidden_size), dtype=torch.bfloat16, device=device)
         weights = torch.full((max_tokens, top_k), 1.0 / top_k, dtype=torch.float32, device=device)
-        timings = _measure(
+        timings, aggregate_timings = _measure(
             routes_by_variant,
             hidden=hidden,
             weights=weights,
@@ -390,6 +484,7 @@ def main() -> None:
                     "warmup": args.warmup,
                     "iterations": args.iterations,
                     "variants": list(routes_by_variant),
+                    "layout_json": None if args.layout_json is None else str(args.layout_json),
                 },
                 "samples": {
                     name: [
@@ -398,6 +493,7 @@ def main() -> None:
                     ]
                     for name in routes_by_variant
                 },
+                "aggregate_timings": aggregate_timings,
             }
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
