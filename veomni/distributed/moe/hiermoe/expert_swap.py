@@ -166,6 +166,7 @@ _ABLATION_REPLAY_PATH = os.environ.get("VEOMNI_HIERMOE_ABLATION_REPLAY_PATH", ""
 _ABLATION_REPLAY_MODE = os.environ.get("VEOMNI_HIERMOE_ABLATION_REPLAY_MODE", "off").strip().lower()
 _ABLATION_MIGRATION_MODE = os.environ.get("VEOMNI_HIERMOE_ABLATION_MIGRATION_MODE", "hidden").strip().lower()
 _ABLATION_GRAD_MODE = os.environ.get("VEOMNI_HIERMOE_ABLATION_GRAD_MODE", "hidden").strip().lower()
+_STATIC_PRELOAD_LAYOUT_PATH = os.environ.get("VEOMNI_HIERMOE_STATIC_PRELOAD_LAYOUT_PATH", "").strip()
 _CPU_PLANNER_MODE = os.environ.get("VEOMNI_HIERMOE_CPU_PLANNER_MODE", "off").strip().lower()
 _CPU_TRAIN_CORES_PER_RANK = _env_int("VEOMNI_HIERMOE_CPU_TRAIN_CORES_PER_RANK", 8)
 _NPU_LAYER_OWNER_BLOCKING = _env_flag("VEOMNI_HIERMOE_NPU_LAYER_OWNER_BLOCKING")
@@ -3245,6 +3246,33 @@ class ExpertSwapManager:
 
     @torch.no_grad()
     def _install_static_ablation_layout(self) -> None:
+        if _STATIC_PRELOAD_LAYOUT_PATH:
+            if _STATIC_PRELOAD_LAYOUT_PATH != _ABLATION_REPLAY_PATH:
+                raise RuntimeError(
+                    "HierMoE static preload and ablation replay must use the same layout file: "
+                    f"preload={_STATIC_PRELOAD_LAYOUT_PATH!r}, replay={_ABLATION_REPLAY_PATH!r}."
+                )
+            for layer_key, layer in self.layers.items():
+                expected_layout = self._ablation_expected_layouts[layer_key]
+                validated_layout, _owners = self._validate_placement_layout(
+                    layer,
+                    expected_layout,
+                    self._ablation_expected_owner_slots.get(layer_key),
+                )
+                layer.slot_to_logical = validated_layout
+                layer.fixed_r2_layout = False
+                layer.active_quota_policy = ()
+                layer.pending_physical_routes = None
+                layer.pending_route_data_ptr = 0
+                layer.placement_version += 1
+            self._install_static_ablation_route_metadata()
+            self._validate_ablation_final_layout()
+            logger.info_rank0(
+                "HierMoE installed preloaded static ablation metadata from %s without expert P2P.",
+                _STATIC_PRELOAD_LAYOUT_PATH,
+            )
+            return
+
         canonical_empty = self._ablation_initial_layout == "canonical_empty"
         if canonical_empty:
             if _FIXED_R2_LAYOUT:
@@ -3260,7 +3288,18 @@ class ExpertSwapManager:
                     raise RuntimeError(f"Canonical-empty static replay has a non-canonical initial {layer.key} layout.")
         elif not _FIXED_R2_LAYOUT:
             raise RuntimeError("Static HierMoE ablation replay requires VEOMNI_HIERMOE_FIXED_R2_LAYOUT=1.")
-        action_count = 0
+        # A static replay already knows the final layout before training
+        # starts.  Replaying one action wave at a time needlessly serializes
+        # hundreds of expert transfers and can leave the first FSDP
+        # collective queued behind minutes of device copies.  Concatenate all
+        # recorded actions per layer, let ``_build_ablation_replay_plan``
+        # resolve every final slot back to an original state source, and
+        # materialize that layer with one sparse transfer plan.  The final
+        # owner/source-LUT metadata is installed below, so static replay does
+        # not need the online Cover path's incremental LUT patches.
+        specs_by_layer: dict[str, list[tuple[str, str]]] = {
+            layer_key: [] for layer_key in self.layers
+        }
         for step in sorted(self._ablation_actions_by_step):
             by_layer = self._ablation_actions_by_step[step]
             unexpected = set(by_layer) - set(self.layers)
@@ -3268,35 +3307,31 @@ class ExpertSwapManager:
                 raise RuntimeError(
                     f"HierMoE ablation replay step {step} contains unknown layers: {sorted(unexpected)}."
                 )
-            patch_plans: dict[str, PlacementPlan] = {}
             for layer_key in self.layers:
-                if layer_key not in by_layer:
-                    continue
-                layer = self.layers[layer_key]
-                plan = self._build_ablation_replay_plan(layer, by_layer[layer_key])
-                if self._forward_reuse_cover_patch_remap and all(
-                    action.kind == "replica" for action in plan.actions
-                ):
-                    patch_plans[layer_key] = plan
-                else:
-                    self._execute_placement_plan(
-                        layer,
-                        plan,
-                        timing_prefix=None,
-                        transfer_group=self.ep_group,
-                        force_staged_transfer=False,
-                        fast_sparse_transfer=True,
-                    )
-                    action_count += len(plan.actions)
-            if patch_plans:
-                max_actions = max(len(plan.actions) for plan in patch_plans.values())
-                for action_index in range(max_actions):
-                    selections = [
-                        (self.layers[layer_key], plan.actions[action_index])
-                        for layer_key, plan in patch_plans.items()
-                        if action_index < len(plan.actions)
-                    ]
-                    action_count += len(self._execute_forward_cover_actions(selections))
+                specs_by_layer[layer_key].extend(by_layer.get(layer_key, ()))
+
+        action_count = 0
+        for layer_key, layer in self.layers.items():
+            plan = self._build_ablation_replay_plan(layer, specs_by_layer[layer_key])
+            self._execute_placement_plan(
+                layer,
+                plan,
+                timing_prefix=None,
+                transfer_group=self.ep_group,
+                force_staged_transfer=False,
+                fast_sparse_transfer=True,
+            )
+            # ``ProcessGroupHCCL::Work.wait`` guarantees that the P2P work was
+            # submitted, but the destination-slot copies consuming the shared
+            # receive staging buffer may still be queued on the default
+            # stream.  Static installation immediately reuses that staging
+            # buffer for the next layer; without a device fence dozens of
+            # recv/copy waves can accumulate ahead of the first FSDP
+            # collective and eventually hit HCCL's dispatch timeout.  This is
+            # startup-only work, so finish each layer before reusing the
+            # manager-wide staging pool.
+            synchronize()
+            action_count += len(plan.actions)
         self._install_static_ablation_route_metadata()
         self._validate_ablation_final_layout()
         logger.info_rank0(
@@ -6581,6 +6616,7 @@ class ExpertSwapManager:
         send_buffers: dict[int, torch.Tensor],
         recv_specs: dict[int, tuple[int, torch.dtype, torch.device]],
         process_group: dist.ProcessGroup | None = None,
+        globally_ordered_pairs: bool = False,
     ) -> dict[int, torch.Tensor]:
         process_group = self.ep_group if process_group is None else process_group
         if process_group is None or self.ep_size <= 1:
@@ -6598,19 +6634,47 @@ class ExpertSwapManager:
             )
             for peer_rank, (numel, dtype, device) in recv_specs.items()
         }
-        ops: list[dist.P2POp] = []
-        for peer_rank in sorted(set(send_buffers) | set(recv_buffers)):
+        def _run_peer(peer_rank: int) -> None:
             peer_global_rank = _ep_global_rank(process_group, peer_rank)
+            ops: list[dist.P2POp] = []
             send_buffer = send_buffers.get(peer_rank)
             if send_buffer is not None:
                 ops.append(dist.P2POp(dist.isend, send_buffer, peer_global_rank, process_group))
             recv_buffer = recv_buffers.get(peer_rank)
             if recv_buffer is not None:
                 ops.append(dist.P2POp(dist.irecv, recv_buffer, peer_global_rank, process_group))
-        if ops:
+            if not ops:
+                return
             works = dist.batch_isend_irecv(ops)
             for work in works:
                 work.wait()
+
+        if globally_ordered_pairs:
+            # An arbitrary EPLB layout can give one expert copies on many
+            # ranks.  Issuing every rank's owner-star peer list in its local
+            # order can create a different HCCL P2P order on each rank and
+            # deadlock.  Traverse the same undirected rank-pair schedule
+            # everywhere; only the two participating ranks issue work.
+            for left_rank in range(int(self.ep_size)):
+                for right_rank in range(left_rank + 1, int(self.ep_size)):
+                    if self.ep_rank == left_rank:
+                        _run_peer(right_rank)
+                    elif self.ep_rank == right_rank:
+                        _run_peer(left_rank)
+        else:
+            ops: list[dist.P2POp] = []
+            for peer_rank in sorted(set(send_buffers) | set(recv_buffers)):
+                peer_global_rank = _ep_global_rank(process_group, peer_rank)
+                send_buffer = send_buffers.get(peer_rank)
+                if send_buffer is not None:
+                    ops.append(dist.P2POp(dist.isend, send_buffer, peer_global_rank, process_group))
+                recv_buffer = recv_buffers.get(peer_rank)
+                if recv_buffer is not None:
+                    ops.append(dist.P2POp(dist.irecv, recv_buffer, peer_global_rank, process_group))
+            if ops:
+                works = dist.batch_isend_irecv(ops)
+                for work in works:
+                    work.wait()
         return recv_buffers
 
     def _sync_pairwise_replica_gradients(
@@ -6720,6 +6784,7 @@ class ExpertSwapManager:
                 send_buffers=reduce_send_buffers,
                 process_group=process_group,
                 recv_specs=reduce_recv_specs,
+                globally_ordered_pairs=True,
             )
             for peer_rank, items in reduce_recv_items.items():
                 recv_buffer = reduce_recv_buffers[peer_rank]
@@ -6765,6 +6830,7 @@ class ExpertSwapManager:
                 send_buffers=broadcast_send_buffers,
                 process_group=process_group,
                 recv_specs=broadcast_recv_specs,
+                globally_ordered_pairs=True,
             )
 
             for item_key, total in owner_totals.items():
@@ -10064,6 +10130,15 @@ class ExpertSwapManager:
                 works = dist.batch_isend_irecv(ops) if ops else ()
                 for work in works:
                     work.wait()
+                if works:
+                    # HCCL ``Work.wait`` only guarantees host-side
+                    # submission on Ascend.  The receive buffers are consumed
+                    # below on the default stream, so establish the missing
+                    # communication-stream -> default-stream dependency before
+                    # reading them.  Without this fence a following slot copy
+                    # can be queued against an in-flight recv and the first
+                    # later collective stalls behind ``aclnnInplaceCopy``.
+                    synchronize()
             elif send_numel:
                 recv_buffer.copy_(send_buffer)
             pending_remote.append((recv_buffer, peer_recvs, output_splits))

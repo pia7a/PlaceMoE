@@ -2429,10 +2429,7 @@ def statistical_forward_lut_cover_local_deltas(
         rounding_mode="floor",
     )
     source_service_group = int(uniform_source_rank) // int(service_group_size)
-    lhs_relevant = (
-        torch.div(destination_ranks, int(service_group_size), rounding_mode="floor")
-        == source_service_group
-    )
+    lhs_relevant = torch.div(destination_ranks, int(service_group_size), rounding_mode="floor") == source_service_group
     lhs_old_ranks = baseline_ranks.index_select(0, lhs).reshape(-1)
     rhs_old_ranks = baseline_ranks.index_select(0, rhs).reshape(-1)
     lhs_new_ranks = torch.where(lhs_relevant, destination_ranks, lhs_old_ranks)
@@ -2445,8 +2442,7 @@ def statistical_forward_lut_cover_local_deltas(
         rounding_mode="floor",
     )
     level_sizes = (1,) + tuple(
-        int(size)
-        for size in planner.hierarchy.group_sizes[: max(0, int(planner.hierarchy.selected_dim) - 1)]
+        int(size) for size in planner.hierarchy.group_sizes[: max(0, int(planner.hierarchy.selected_dim) - 1)]
     )
     widths = tuple(planner.ep_size // size for size in level_sizes)
     offsets: list[int] = []
@@ -2617,8 +2613,7 @@ def prepare_forward_lut_cover_compact_statistics(
         rounding_mode="floor",
     )
     level_sizes = (1,) + tuple(
-        int(size)
-        for size in planner.hierarchy.group_sizes[: max(0, int(planner.hierarchy.selected_dim) - 1)]
+        int(size) for size in planner.hierarchy.group_sizes[: max(0, int(planner.hierarchy.selected_dim) - 1)]
     )
     baseline_counts: list[torch.Tensor] = []
     zero_hits: list[torch.Tensor] = []
@@ -2636,9 +2631,7 @@ def prepare_forward_lut_cover_compact_statistics(
         )
         token_group_counts.scatter_add_(1, group_index, hit_values)
         baseline_counts.append((token_group_counts > 0).sum(dim=0).to(torch.float32))
-        zero_hits.append(
-            (token_group_counts == 0).to(torch.float32).transpose(0, 1).matmul(hit_values)
-        )
+        zero_hits.append((token_group_counts == 0).to(torch.float32).transpose(0, 1).matmul(hit_values))
         own_group_counts = token_group_counts.index_select(1, groups)
         sole_matrix = hit_values * (own_group_counts == 1).to(torch.float32)
         sole_hits.append(sole_matrix.sum(dim=0))
@@ -2721,8 +2714,7 @@ def score_forward_lut_cover_compact_statistics(
     rhs_old_ranks = baseline_ranks.index_select(0, rhs)
     source_service_group = int(uniform_source_rank) // int(service_group_size)
     lhs_new_ranks = torch.where(
-        torch.div(destination_ranks, int(service_group_size), rounding_mode="floor")
-        == source_service_group,
+        torch.div(destination_ranks, int(service_group_size), rounding_mode="floor") == source_service_group,
         destination_ranks,
         lhs_old_ranks,
     )
@@ -2734,8 +2726,7 @@ def score_forward_lut_cover_compact_statistics(
 
     communication_deltas: list[torch.Tensor] = []
     level_sizes = (1,) + tuple(
-        int(size)
-        for size in planner.hierarchy.group_sizes[: max(0, int(planner.hierarchy.selected_dim) - 1)]
+        int(size) for size in planner.hierarchy.group_sizes[: max(0, int(planner.hierarchy.selected_dim) - 1)]
     )
     for level, size in enumerate(level_sizes):
         group_by_logical = statistics.group_by_logical[level]
@@ -2823,6 +2814,115 @@ def score_forward_lut_cover_compact_statistics(
     return torch.cat(communication_deltas, dim=1), assignment_delta
 
 
+@torch.no_grad()
+def score_forward_lut_move_compact_statistics(
+    planner: GreedyCommunicationPlanner,
+    statistics: ForwardLUTCoverCompactStatistics,
+    experts: torch.Tensor,
+    destination_slots: torch.Tensor,
+    *,
+    source_logical_to_physical: torch.Tensor,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score independent one-expert LUT moves from cached Forward statistics.
+
+    A move changes one source-rank LUT entry from its current physical copy to
+    another existing copy of the same logical expert.  Since no second expert
+    changes, the exact communication delta needs only the old-group ``sole``
+    loss and new-group ``zero`` gain.  The assignment delta moves the full
+    non-deduplicated multiplicity of that expert between the two physical
+    ranks.
+    """
+
+    device = statistics.assignment_multiplicity.device
+    experts = experts.to(device=device, dtype=torch.long, non_blocking=True).reshape(-1)
+    destination_slots = destination_slots.to(
+        device=device,
+        dtype=torch.long,
+        non_blocking=True,
+    ).reshape(-1)
+    source_lut = source_logical_to_physical.to(
+        device=device,
+        dtype=torch.long,
+        non_blocking=True,
+    ).reshape(-1)
+    if experts.numel() != destination_slots.numel():
+        raise ValueError("experts and destination_slots must have the same length.")
+    if int(source_lut.numel()) != int(num_experts):
+        raise ValueError("The source-rank LUT must contain one slot per logical expert.")
+    if bool(((experts < 0) | (experts >= int(num_experts))).any().item()):
+        raise ValueError("experts contains an out-of-range logical expert.")
+    if bool((destination_slots < 0).any().item()):
+        raise ValueError("destination_slots contains a negative physical slot.")
+    if experts.numel() == 0:
+        return (
+            statistics.assignment_multiplicity.new_empty((0, sum(planner._count_widths()))),
+            statistics.assignment_multiplicity.new_empty((0, int(planner.ep_size))),
+        )
+
+    baseline_ranks = torch.div(
+        source_lut,
+        int(planner.slots_per_rank),
+        rounding_mode="floor",
+    )
+    old_ranks = baseline_ranks.index_select(0, experts)
+    new_ranks = torch.div(
+        destination_slots,
+        int(planner.slots_per_rank),
+        rounding_mode="floor",
+    )
+    if bool((new_ranks >= int(planner.ep_size)).any().item()):
+        raise ValueError("destination_slots contains a slot outside the EP layout.")
+
+    communication_deltas: list[torch.Tensor] = []
+    level_sizes = (1,) + tuple(
+        int(size) for size in planner.hierarchy.group_sizes[: max(0, int(planner.hierarchy.selected_dim) - 1)]
+    )
+    action_indices = torch.arange(experts.numel(), dtype=torch.long, device=device)
+    for level, size in enumerate(level_sizes):
+        old_groups = statistics.group_by_logical[level].index_select(0, experts)
+        new_groups = torch.div(new_ranks, size, rounding_mode="floor")
+        moves = old_groups != new_groups
+        num_groups = int(statistics.baseline_counts[level].numel())
+        delta = torch.zeros(
+            (experts.numel(), num_groups),
+            dtype=torch.float32,
+            device=device,
+        )
+        selected_actions = action_indices[moves]
+        delta.reshape(-1).index_add_(
+            0,
+            selected_actions * num_groups + old_groups[moves],
+            -statistics.sole_expert_hits[level].index_select(0, experts[moves]),
+        )
+        delta.reshape(-1).index_add_(
+            0,
+            selected_actions * num_groups + new_groups[moves],
+            statistics.zero_group_expert_hits[level][new_groups[moves], experts[moves]],
+        )
+        communication_deltas.append(delta)
+
+    assignment_delta = torch.zeros(
+        (experts.numel(), int(planner.ep_size)),
+        dtype=torch.float32,
+        device=device,
+    )
+    moves = old_ranks != new_ranks
+    selected_actions = action_indices[moves]
+    weights = statistics.assignment_multiplicity.index_select(0, experts[moves])
+    assignment_delta.reshape(-1).index_add_(
+        0,
+        selected_actions * int(planner.ep_size) + old_ranks[moves],
+        -weights,
+    )
+    assignment_delta.reshape(-1).index_add_(
+        0,
+        selected_actions * int(planner.ep_size) + new_ranks[moves],
+        weights,
+    )
+    return torch.cat(communication_deltas, dim=1), assignment_delta
+
+
 __all__ = [
     "ForwardLUTCoverCompactStatistics",
     "StatisticalPairContext",
@@ -2837,6 +2937,7 @@ __all__ = [
     "statistical_forward_lut_cover_local_deltas",
     "prepare_forward_lut_cover_compact_statistics",
     "score_forward_lut_cover_compact_statistics",
+    "score_forward_lut_move_compact_statistics",
     "statistical_batched_selected_pair_local_deltas",
     "statistical_pair_interaction_bound_local",
     "statistical_primitive_fast_path_available",

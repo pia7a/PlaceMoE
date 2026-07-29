@@ -52,6 +52,7 @@
 
 # Additional import blocks for patches
 import copy
+import inspect
 from contextlib import nullcontext
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -558,26 +559,17 @@ def _create_causal_mask_compat(
     past_key_values,
     position_ids,
 ):
-    try:
-        return create_causal_mask(
-            config=config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-        )
-    except TypeError as exc:
-        if "inputs_embeds" not in str(exc):
-            raise
-        return create_causal_mask(
-            config=config,
-            input_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-        )
+    parameters = inspect.signature(create_causal_mask).parameters
+    kwargs = {
+        "config": config,
+        "attention_mask": attention_mask,
+        "past_key_values": past_key_values,
+        "position_ids": position_ids,
+    }
+    kwargs["inputs_embeds" if "inputs_embeds" in parameters else "input_embeds"] = inputs_embeds
+    if "cache_position" in parameters:
+        kwargs["cache_position"] = cache_position
+    return create_causal_mask(**kwargs)
 
 
 # ======================================================================

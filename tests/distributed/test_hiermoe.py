@@ -3434,7 +3434,10 @@ def _three_copy_owner_grad_sync_uses_two_waves_worker():
     finally:
         dist.batch_isend_irecv = original_batch_isend_irecv
 
-    assert len(batch_op_counts) == 2
+    # The owner traverses the two source peers separately in a globally
+    # ordered rank-pair schedule for both reduce and broadcast.  Each
+    # non-owner participates in one pair per phase.
+    assert len(batch_op_counts) == (4 if rank == 1 else 2)
     torch.testing.assert_close(module.gate_up_proj.grad[0], torch.full_like(module.gate_up_proj.grad[0], 6.0))
     torch.testing.assert_close(module.down_proj.grad[0], torch.full_like(module.down_proj.grad[0], 60.0))
 

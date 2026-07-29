@@ -5,14 +5,16 @@
 
 The offline initializer has three independent stages:
 
-1. classify the unique logical experts into four balanced base groups;
-2. enumerate the exact-capacity redundant-group choices;
+1. classify the unique logical experts into topology-derived balanced groups;
+2. allocate an exact arbitrary replica budget from affinity classes;
 3. jointly classify unique and redundant physical instances into nodes and
    ranks while alternating with the static source-rank routing LUT.
 
 Affinity and assignment load propose complete states.  The existing exact
 HierMoE hybrid evaluator selects states, so the emitted Forward LUT and the
-offline cost model always use the same physical routes.
+offline cost model always use the same physical routes. Uniformly reserved
+but inactive physical slots are represented as EMPTY and can be preloaded as
+zero-filled expert state.
 """
 
 from __future__ import annotations
@@ -20,8 +22,11 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -35,7 +40,6 @@ from scripts.profile.build_hiermoe_hierarchical_init_layout import (
     _HybridEvaluator,
     _load_routes,
     _replay_payload,
-    _route_statistics,
 )
 
 
@@ -62,6 +66,14 @@ class _PartitionRefinement:
     swaps: tuple[tuple[int, int], ...]
 
 
+@dataclass(frozen=True)
+class _CapacityPlan:
+    primary_slots_per_rank: int
+    reserved_replicas: int
+    active_replicas: int
+    empty_slots: int
+
+
 def _parse_int_list(value: str) -> tuple[int, ...]:
     values = tuple(int(item) for item in value.split(",") if item.strip())
     if not values:
@@ -76,11 +88,60 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-steps", type=_parse_int_list, default=(2,))
     parser.add_argument("--layer-start", type=int, default=0)
     parser.add_argument("--layers", type=int, default=48)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=min(48, max(1, (os.cpu_count() or 1) // 4)),
+        help="Independent layer planner processes. One preserves the legacy serial execution.",
+    )
+    parser.add_argument(
+        "--candidate-workers",
+        type=int,
+        default=4,
+        help="Concurrent exact candidate builders within each layer process.",
+    )
+    parser.add_argument(
+        "--worker-threads",
+        type=int,
+        default=1,
+        help="PyTorch CPU threads available to each layer planner process.",
+    )
     parser.add_argument("--ep-size", type=int, default=32)
     parser.add_argument("--ranks-per-node", type=int, default=8)
     parser.add_argument("--num-experts", type=int, default=128)
-    parser.add_argument("--slots-per-rank", type=int, default=8)
-    parser.add_argument("--primary-slots-per-rank", type=int, default=4)
+    parser.add_argument(
+        "--slots-per-rank",
+        type=int,
+        default=None,
+        help="Total reserved expert slots per rank. Defaults to primary capacity plus four redundant slots.",
+    )
+    parser.add_argument(
+        "--redundant-slots-per-rank",
+        type=int,
+        default=None,
+        help="Optional per-rank redundant capacity used to derive or validate slots-per-rank.",
+    )
+    parser.add_argument(
+        "--primary-slots-per-rank",
+        type=int,
+        default=None,
+        help="Canonical owner capacity per rank. Defaults to num_experts / ep_size.",
+    )
+    parser.add_argument(
+        "--active-redundant-slots",
+        type=int,
+        default=None,
+        help=(
+            "Number of redundant copies to activate globally. Defaults to all reserved slots; "
+            "unused uniformly reserved slots remain EMPTY."
+        ),
+    )
+    parser.add_argument(
+        "--replica-candidate-limit",
+        type=int,
+        default=64,
+        help="Maximum exact-budget replica allocations evaluated per logical partition.",
+    )
     parser.add_argument("--partition-restarts", type=int, default=3)
     parser.add_argument("--alternations", type=int, default=3)
     parser.add_argument("--lut-iterations", type=int, default=6)
@@ -231,13 +292,120 @@ def _replica_sets_from_partition(
     ]
 
 
-def _logical_instances(num_experts: int, replica_experts: np.ndarray) -> np.ndarray:
-    return np.concatenate(
+def _top_fixed_cardinality_combinations(
+    scores: np.ndarray,
+    *,
+    selected: int,
+    limit: int,
+) -> list[tuple[int, ...]]:
+    """Return the highest additive-score fixed-size subsets without exhaustive enumeration."""
+
+    groups = int(len(scores))
+    if not 0 <= selected <= groups:
+        raise ValueError("Selected group count is outside the available group range.")
+    states: list[list[tuple[float, tuple[int, ...]]]] = [[] for _ in range(selected + 1)]
+    states[0] = [(0.0, ())]
+    for group, score in enumerate(scores.tolist()):
+        upper = min(selected, group + 1)
+        for count in range(upper, 0, -1):
+            proposals = states[count] + [
+                (value + float(score), indices + (group,)) for value, indices in states[count - 1]
+            ]
+            proposals.sort(key=lambda row: (-row[0], row[1]))
+            states[count] = proposals[:limit]
+    return [indices for _, indices in states[selected]]
+
+
+def _replica_allocations(
+    affinity: np.ndarray,
+    demand: np.ndarray,
+    *,
+    replicas: int,
+    restarts: int,
+    iterations: int,
+    seed: int,
+    candidate_limit: int,
+) -> list[np.ndarray]:
+    """Return exact-size replica multisets for any feasible global budget.
+
+    Full expert-library copies are peeled off first. The remaining budget is
+    represented as a union of equal affinity classes whose size is
+    ``gcd(num_experts, residual)``. This is the capacity-general form of the
+    previous whole-node-class enumeration: for example, 96 replicas among 128
+    experts becomes three classes chosen from four, while 16 replicas becomes
+    one class chosen from eight.
+    """
+
+    num_experts = int(affinity.shape[0])
+    if affinity.shape != (num_experts, num_experts):
+        raise ValueError("Replica affinity must be square.")
+    if demand.shape != (num_experts,):
+        raise ValueError("Replica demand shape does not match the expert count.")
+    if replicas < 0:
+        raise ValueError("Replica capacity must be non-negative.")
+    if candidate_limit <= 0:
+        raise ValueError("Replica candidate limit must be positive.")
+
+    full_rounds, residual = divmod(int(replicas), num_experts)
+    full = np.tile(np.arange(num_experts, dtype=np.int64), full_rounds)
+    if residual == 0:
+        return [full]
+
+    group_size = int(np.gcd(num_experts, residual))
+    num_groups = num_experts // group_size
+    partitions = (
+        [np.arange(num_experts, dtype=np.int64)]
+        if group_size == 1
+        else _logical_base_partitions(
+            affinity,
+            demand,
+            num_nodes=num_groups,
+            restarts=restarts,
+            iterations=iterations,
+            seed=seed,
+        )
+    )
+    rows: list[tuple[float, bytes, np.ndarray]] = []
+    seen: set[bytes] = set()
+    for partition in partitions:
+        groups = [np.flatnonzero(partition == value) for value in range(num_groups)]
+        group_scores = np.asarray([demand[group].sum() for group in groups], dtype=np.float64)
+        for combination in _top_fixed_cardinality_combinations(
+            group_scores,
+            selected=residual // group_size,
+            limit=candidate_limit,
+        ):
+            residual_experts = np.sort(np.concatenate([groups[index] for index in combination]))
+            allocation = np.concatenate([full, residual_experts]).astype(np.int64, copy=False)
+            key = allocation.tobytes()
+            if key in seen:
+                continue
+            seen.add(key)
+            # Demand is only a shortlist proxy. Every retained allocation is
+            # still placed, routed, and selected by the exact hybrid evaluator.
+            proxy = float(demand[residual_experts].sum())
+            rows.append((-proxy, key, allocation))
+    rows.sort(key=lambda row: (row[0], row[1]))
+    return [row[2] for row in rows[:candidate_limit]]
+
+
+def _logical_instances(
+    num_experts: int,
+    replica_experts: np.ndarray,
+    *,
+    total_slots: int | None = None,
+) -> np.ndarray:
+    active = np.concatenate(
         [
             np.arange(num_experts, dtype=np.int64),
             replica_experts.astype(np.int64, copy=False),
         ]
     )
+    if total_slots is None:
+        return active
+    if total_slots < len(active):
+        raise ValueError("Physical slot capacity is smaller than the active expert instance count.")
+    return np.pad(active, (0, total_slots - len(active)), constant_values=-1)
 
 
 def _structured_instance_node_candidates(
@@ -249,7 +417,12 @@ def _structured_instance_node_candidates(
 ) -> list[tuple[str, np.ndarray]]:
     """Enumerate every degree-two base-class overlap for four full node libraries."""
 
-    num_nodes = 4
+    ep_size = int(demand_by_source.shape[0])
+    if ep_size % ranks_per_node:
+        raise ValueError("Source ranks must divide evenly into nodes.")
+    num_nodes = ep_size // ranks_per_node
+    if num_nodes != 4 or bool((logical_instances < 0).any()):
+        return []
     if len(logical_instances) != 2 * len(labels):
         return []
     if not bool((np.bincount(logical_instances, minlength=len(labels)) == 2).all()):
@@ -310,6 +483,7 @@ def _group_coherent_node_lut(
     ranks_per_node: int,
     communication_ms_per_token: float,
     assignment_ms_per_assignment: float,
+    route_statistics: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, float]:
     """Choose one shared destination node per source-node and logical class."""
 
@@ -335,31 +509,36 @@ def _group_coherent_node_lut(
             raise RuntimeError("A structured logical class has no common serving node.")
         nodes_by_group.append(tuple(sorted(common)))
 
+    if route_statistics is None:
+        route_statistics = _group_route_statistics(
+            samples,
+            logical_groups,
+            ranks_per_node=ranks_per_node,
+        )
+    assignments_by_group, group_mask_histogram = route_statistics
+    if assignments_by_group.shape != (num_nodes, num_groups):
+        raise ValueError("Group assignment statistics do not match the topology.")
+    if group_mask_histogram.shape != (num_nodes, 1 << num_groups):
+        raise ValueError("Group-mask statistics do not match the logical partition.")
+
     source_candidates: list[list[tuple[tuple[int, ...], float, np.ndarray]]] = []
-    group_tensor = torch.from_numpy(logical_groups).to(torch.long)
     for source_node in range(num_nodes):
-        source_start = source_node * ranks_per_node
-        source_routes = [
-            sample[source_rank]
-            for sample in samples
-            for source_rank in range(source_start, source_start + ranks_per_node)
-        ]
-        mapped_groups = [group_tensor.index_select(0, route.reshape(-1)).view_as(route) for route in source_routes]
         candidates: list[tuple[tuple[int, ...], float, np.ndarray]] = []
         for destination_nodes in itertools.product(*nodes_by_group):
             node_by_group = torch.tensor(destination_nodes, dtype=torch.long)
             remote_hits = 0.0
             node_assignments = np.zeros((num_nodes,), dtype=np.float64)
-            for route, groups in zip(source_routes, mapped_groups, strict=True):
-                nodes = node_by_group.index_select(0, groups.reshape(-1)).view_as(groups)
-                hits = torch.zeros((route.shape[0], num_nodes), dtype=torch.bool)
-                hits.scatter_(1, nodes, True)
-                hits[:, source_node] = False
-                remote_hits += float(hits.sum().item())
-                node_assignments += torch.bincount(
-                    nodes.reshape(-1),
-                    minlength=num_nodes,
-                ).numpy()
+            for group, destination_node in enumerate(destination_nodes):
+                node_assignments[destination_node] += assignments_by_group[source_node, group]
+            for mask, count in enumerate(group_mask_histogram[source_node].tolist()):
+                if count == 0:
+                    continue
+                remote_nodes = {
+                    int(node_by_group[group])
+                    for group in range(num_groups)
+                    if mask & (1 << group) and int(node_by_group[group]) != source_node
+                }
+                remote_hits += float(count * len(remote_nodes))
             candidates.append(
                 (
                     tuple(int(value) for value in destination_nodes),
@@ -410,6 +589,47 @@ def _group_coherent_node_lut(
                 raise RuntimeError("Group-coherent LUT references an absent expert copy.")
             lut[source_start : source_start + ranks_per_node, expert] = instance
     return lut, float(total_ms[best_index])
+
+
+def _group_route_statistics(
+    samples: list[list[torch.Tensor]],
+    logical_groups: np.ndarray,
+    *,
+    ranks_per_node: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Summarize exact token-group incidence once for all structured seeds."""
+
+    ep_size = len(samples[0])
+    if ep_size % ranks_per_node:
+        raise ValueError("Source ranks must divide evenly into nodes.")
+    num_nodes = ep_size // ranks_per_node
+    num_groups = int(logical_groups.max()) + 1
+    if num_groups >= 63:
+        raise ValueError("Group-mask statistics require fewer than 63 logical groups.")
+    assignments_by_group = np.zeros((num_nodes, num_groups), dtype=np.float64)
+    group_mask_histogram = np.zeros((num_nodes, 1 << num_groups), dtype=np.int64)
+    group_lut = torch.from_numpy(logical_groups).to(torch.long)
+    for sample in samples:
+        for source_rank, route in enumerate(sample):
+            source_node = source_rank // ranks_per_node
+            groups = group_lut.index_select(0, route.reshape(-1)).view_as(route)
+            assignments_by_group[source_node] += torch.bincount(
+                groups.reshape(-1),
+                minlength=num_groups,
+            ).numpy()
+            masks = torch.zeros((route.shape[0],), dtype=torch.long)
+            for position in range(route.shape[1]):
+                masks.bitwise_or_(
+                    torch.bitwise_left_shift(
+                        torch.ones_like(groups[:, position]),
+                        groups[:, position],
+                    )
+                )
+            group_mask_histogram[source_node] += torch.bincount(
+                masks,
+                minlength=1 << num_groups,
+            ).numpy()
+    return assignments_by_group, group_mask_histogram
 
 
 def _node_proxy_lut(
@@ -472,17 +692,25 @@ def _uniform_instance_statistics(
     affinity_by_source: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     instances = len(logical_instances)
-    copies = np.bincount(logical_instances, minlength=demand_by_source.shape[1]).astype(np.float64)
-    instance_demand = demand_by_source[:, logical_instances] / copies[logical_instances][None, :]
+    num_experts = int(demand_by_source.shape[1])
+    active = logical_instances >= 0
+    copies = np.bincount(logical_instances[active], minlength=num_experts).astype(np.float64)
+    if bool((copies <= 0).any()):
+        raise ValueError("Every logical expert must retain at least one physical instance.")
+    instance_demand = np.zeros((demand_by_source.shape[0], instances), dtype=np.float64)
+    active_experts = logical_instances[active]
+    instance_demand[:, active] = demand_by_source[:, active_experts] / copies[active_experts][None, :]
     instance_affinity = np.zeros(
         (demand_by_source.shape[0], instances, instances),
         dtype=np.float64,
     )
     for lhs in range(instances):
         logical_lhs = int(logical_instances[lhs])
+        if logical_lhs < 0:
+            continue
         for rhs in range(lhs + 1, instances):
             logical_rhs = int(logical_instances[rhs])
-            if logical_lhs == logical_rhs:
+            if logical_rhs < 0 or logical_lhs == logical_rhs:
                 continue
             values = affinity_by_source[:, logical_lhs, logical_rhs] / (copies[logical_lhs] * copies[logical_rhs])
             instance_affinity[:, lhs, rhs] = values
@@ -545,9 +773,8 @@ def _partition_proxy_cost(
         within += float(np.triu(affinity[np.ix_(members, members)], k=1).sum())
     loads = np.bincount(labels, weights=demand, minlength=parts)
     peak = max(float(loads.max(initial=0.0)), float(peak_floor))
-    cost = (
-        -float(affinity_ms_per_hit) * within
-        + float(assignment_ms_per_assignment) * peak / max(float(assignment_divisor), 1.0)
+    cost = -float(affinity_ms_per_hit) * within + float(assignment_ms_per_assignment) * peak / max(
+        float(assignment_divisor), 1.0
     )
     return cost, within, peak
 
@@ -599,7 +826,8 @@ def _refine_balanced_partition(
         if item_kinds is None:
             raise ValueError("Duplicate-kind filtering requires item kinds.")
         kind_counts = np.zeros((parts, int(item_kinds.max(initial=-1)) + 1), dtype=np.int64)
-        np.add.at(kind_counts, (labels, item_kinds), 1)
+        active_kinds = item_kinds >= 0
+        np.add.at(kind_counts, (labels[active_kinds], item_kinds[active_kinds]), 1)
         if bool((kind_counts > 1).any()):
             raise ValueError("Initial partition already contains duplicate item kinds.")
 
@@ -618,10 +846,9 @@ def _refine_balanced_partition(
         if kind_counts is not None and item_kinds is not None:
             lhs_kinds = item_kinds[lhs]
             rhs_kinds = item_kinds[rhs]
-            legal &= (lhs_kinds == rhs_kinds) | (
-                (kind_counts[rhs_parts, lhs_kinds] == 0)
-                & (kind_counts[lhs_parts, rhs_kinds] == 0)
-            )
+            lhs_available = (lhs_kinds < 0) | (kind_counts[rhs_parts, np.maximum(lhs_kinds, 0)] == 0)
+            rhs_available = (rhs_kinds < 0) | (kind_counts[lhs_parts, np.maximum(rhs_kinds, 0)] == 0)
+            legal &= (lhs_kinds == rhs_kinds) | (lhs_available & rhs_available)
         if not bool(legal.any()):
             break
 
@@ -638,12 +865,9 @@ def _refine_balanced_partition(
         candidate_loads[row_ids, lhs_parts] += demand[rhs] - demand[lhs]
         candidate_loads[row_ids, rhs_parts] += demand[lhs] - demand[rhs]
         candidate_peaks = np.maximum(candidate_loads.max(axis=1), float(peak_floor))
-        deltas = (
-            -float(affinity_ms_per_hit) * affinity_gain
-            + float(assignment_ms_per_assignment)
-            * (candidate_peaks - current_peak)
-            / max(float(assignment_divisor), 1.0)
-        )
+        deltas = -float(affinity_ms_per_hit) * affinity_gain + float(assignment_ms_per_assignment) * (
+            candidate_peaks - current_peak
+        ) / max(float(assignment_divisor), 1.0)
         deltas[~legal] = np.inf
         best_index = int(np.argmin(deltas))
         if not np.isfinite(deltas[best_index]) or deltas[best_index] >= -float(improvement_epsilon):
@@ -661,10 +885,12 @@ def _refine_balanced_partition(
         loads[right_part] += demand[left] - demand[right]
         labels[left], labels[right] = labels[right], labels[left]
         if kind_counts is not None and left_kind is not None and right_kind is not None:
-            kind_counts[left_part, left_kind] -= 1
-            kind_counts[right_part, right_kind] -= 1
-            kind_counts[left_part, right_kind] += 1
-            kind_counts[right_part, left_kind] += 1
+            if left_kind >= 0:
+                kind_counts[left_part, left_kind] -= 1
+                kind_counts[right_part, left_kind] += 1
+            if right_kind >= 0:
+                kind_counts[right_part, right_kind] -= 1
+                kind_counts[left_part, right_kind] += 1
         swaps.append((left, right))
 
     proxy_cost, within, peak = _partition_proxy_cost(
@@ -755,7 +981,9 @@ def _hyperedge_instance_nodes(
             )
 
     node_columns = np.repeat(np.arange(num_nodes, dtype=np.int64), capacity)
-    benefit = counts[node_columns[:, None], logical_instances[None, :]].T
+    benefit = np.zeros((len(logical_instances), len(node_columns)), dtype=np.float64)
+    active = logical_instances >= 0
+    benefit[active] = counts[node_columns[:, None], logical_instances[active][None, :]].T
     instances, columns = linear_sum_assignment(-benefit)
     instance_nodes = np.full((len(logical_instances),), -1, dtype=np.int64)
     instance_nodes[instances] = node_columns[columns]
@@ -813,26 +1041,55 @@ def _greedy_ranks_with_fixed_nodes(
     *,
     ranks_per_node: int,
     slots_per_rank: int,
+    logical_instances: np.ndarray | None = None,
 ) -> np.ndarray:
     """Balance exact instance assignments before using affinity as a tie-break."""
 
     demand = instance_demand.sum(axis=0)
     affinity = instance_affinity.sum(axis=0)
+    if logical_instances is None:
+        logical_instances = np.arange(len(instance_nodes), dtype=np.int64)
+    else:
+        logical_instances = np.asarray(logical_instances, dtype=np.int64)
+        if logical_instances.shape != instance_nodes.shape:
+            raise ValueError("Logical instance shape does not match node assignment.")
     num_nodes = int(instance_nodes.max()) + 1
+    ep_size = num_nodes * ranks_per_node
+    num_experts = int(logical_instances.max(initial=-1)) + 1
+    if num_experts % ep_size:
+        raise ValueError("Logical experts must divide evenly across EP ranks.")
+    primary_slots_per_rank = num_experts // ep_size
+    max_empty_per_rank = slots_per_rank - primary_slots_per_rank
     instance_ranks = np.full_like(instance_nodes, -1)
     for node in range(num_nodes):
         members = np.flatnonzero(instance_nodes == node)
         capacities = np.full((ranks_per_node,), slots_per_rank, dtype=np.int64)
         loads = np.zeros((ranks_per_node,), dtype=np.float64)
         lane_members: list[list[int]] = [[] for _ in range(ranks_per_node)]
+        active_members = logical_instances[members]
+        multiplicity = np.bincount(
+            active_members[active_members >= 0],
+            minlength=int(active_members.max(initial=-1)) + 1,
+        )
         for instance in sorted(
             members.tolist(),
-            key=lambda value: (-float(demand[value]), value),
+            key=lambda value: (
+                -int(multiplicity[int(logical_instances[value])]) if int(logical_instances[value]) >= 0 else 0,
+                -float(demand[value]),
+                value,
+            ),
         ):
             best: tuple[float, float, int] | None = None
             amount = float(demand[instance])
+            logical = int(logical_instances[instance])
             for lane in range(ranks_per_node):
                 if capacities[lane] <= 0:
+                    continue
+                if logical < 0:
+                    empty_count = sum(int(logical_instances[other]) < 0 for other in lane_members[lane])
+                    if empty_count >= max_empty_per_rank:
+                        continue
+                if logical >= 0 and any(int(logical_instances[other]) == logical for other in lane_members[lane]):
                     continue
                 projected_peak = max(loads[lane] + amount, float(loads.max()))
                 affinity_gain = sum(float(affinity[instance, other]) for other in lane_members[lane])
@@ -851,9 +1108,105 @@ def _greedy_ranks_with_fixed_nodes(
     return instance_ranks
 
 
+def _rank_assignment_is_device_unique(
+    instance_ranks: np.ndarray,
+    logical_instances: np.ndarray,
+    *,
+    ep_size: int,
+) -> bool:
+    for rank in range(ep_size):
+        active = logical_instances[(instance_ranks == rank) & (logical_instances >= 0)]
+        if len(active) != len(np.unique(active)):
+            return False
+    return True
+
+
+def _rank_assignment_supports_balanced_owners(
+    instance_ranks: np.ndarray,
+    logical_instances: np.ndarray,
+    *,
+    ep_size: int,
+) -> bool:
+    num_experts = int(logical_instances.max(initial=-1)) + 1
+    if num_experts % ep_size:
+        return False
+    minimum_active = num_experts // ep_size
+    for rank in range(ep_size):
+        active = (instance_ranks == rank) & (logical_instances >= 0)
+        if int(active.sum()) < minimum_active:
+            return False
+    return True
+
+
+def _greedy_instance_nodes(
+    instance_demand: np.ndarray,
+    instance_affinity: np.ndarray,
+    logical_instances: np.ndarray,
+    *,
+    num_nodes: int,
+    ranks_per_node: int,
+    slots_per_rank: int,
+) -> np.ndarray:
+    """Build a capacity-feasible node seed when spectral labels overpack a copy kind."""
+
+    demand = instance_demand.sum(axis=0)
+    affinity = instance_affinity.sum(axis=0)
+    capacity = ranks_per_node * slots_per_rank
+    ep_size = num_nodes * ranks_per_node
+    num_experts = int(logical_instances.max(initial=-1)) + 1
+    if num_experts % ep_size:
+        raise ValueError("Logical experts must divide evenly across EP ranks.")
+    primary_slots_per_node = (num_experts // ep_size) * ranks_per_node
+    max_empty_per_node = capacity - primary_slots_per_node
+    capacities = np.full((num_nodes,), capacity, dtype=np.int64)
+    loads = np.zeros((num_nodes,), dtype=np.float64)
+    node_members: list[list[int]] = [[] for _ in range(num_nodes)]
+    active = logical_instances[logical_instances >= 0]
+    multiplicity = np.bincount(active, minlength=int(active.max(initial=-1)) + 1)
+    result = np.full((len(logical_instances),), -1, dtype=np.int64)
+    for instance in sorted(
+        range(len(logical_instances)),
+        key=lambda value: (
+            -int(multiplicity[int(logical_instances[value])]) if int(logical_instances[value]) >= 0 else 0,
+            -float(demand[value]),
+            value,
+        ),
+    ):
+        logical = int(logical_instances[instance])
+        amount = float(demand[instance])
+        best: tuple[tuple[float, float, float, int], int] | None = None
+        for node in range(num_nodes):
+            if capacities[node] <= 0:
+                continue
+            if logical < 0:
+                empty_count = sum(int(logical_instances[other]) < 0 for other in node_members[node])
+                if empty_count >= max_empty_per_node:
+                    continue
+            if logical >= 0:
+                same_kind = sum(int(logical_instances[other]) == logical for other in node_members[node])
+                if same_kind >= ranks_per_node:
+                    continue
+            projected_peak = max(loads[node] + amount, float(loads.max(initial=0.0)))
+            affinity_gain = sum(float(affinity[instance, other]) for other in node_members[node])
+            sources = slice(node * ranks_per_node, (node + 1) * ranks_per_node)
+            locality = float(instance_demand[sources, instance].sum())
+            key = (projected_peak, -affinity_gain, -locality, node)
+            if best is None or key < best[0]:
+                best = (key, node)
+        if best is None:
+            raise RuntimeError("Could not construct a capacity-feasible node assignment.")
+        node = best[1]
+        result[instance] = node
+        capacities[node] -= 1
+        loads[node] += amount
+        node_members[node].append(instance)
+    return result
+
+
 def _classify_instances(
     instance_demand: np.ndarray,
     instance_affinity: np.ndarray,
+    logical_instances: np.ndarray,
     *,
     ep_size: int,
     ranks_per_node: int,
@@ -910,6 +1263,66 @@ def _classify_instances(
     counts = np.bincount(instance_ranks, minlength=ep_size)
     if not bool((counts == slots_per_rank).all()):
         raise RuntimeError("Hierarchical instance classification violates rank capacity.")
+    valid = _rank_assignment_is_device_unique(
+        instance_ranks,
+        logical_instances,
+        ep_size=ep_size,
+    ) and _rank_assignment_supports_balanced_owners(
+        instance_ranks,
+        logical_instances,
+        ep_size=ep_size,
+    )
+    if not valid:
+        try:
+            instance_ranks = _greedy_ranks_with_fixed_nodes(
+                instance_nodes,
+                instance_demand,
+                instance_affinity,
+                ranks_per_node=ranks_per_node,
+                slots_per_rank=slots_per_rank,
+                logical_instances=logical_instances,
+            )
+        except RuntimeError:
+            pass
+        valid = _rank_assignment_is_device_unique(
+            instance_ranks,
+            logical_instances,
+            ep_size=ep_size,
+        ) and _rank_assignment_supports_balanced_owners(
+            instance_ranks,
+            logical_instances,
+            ep_size=ep_size,
+        )
+        if not valid:
+            instance_nodes = _greedy_instance_nodes(
+                instance_demand,
+                instance_affinity,
+                logical_instances,
+                num_nodes=num_nodes,
+                ranks_per_node=ranks_per_node,
+                slots_per_rank=slots_per_rank,
+            )
+            instance_ranks = _greedy_ranks_with_fixed_nodes(
+                instance_nodes,
+                instance_demand,
+                instance_affinity,
+                ranks_per_node=ranks_per_node,
+                slots_per_rank=slots_per_rank,
+                logical_instances=logical_instances,
+            )
+    if not (
+        _rank_assignment_is_device_unique(
+            instance_ranks,
+            logical_instances,
+            ep_size=ep_size,
+        )
+        and _rank_assignment_supports_balanced_owners(
+            instance_ranks,
+            logical_instances,
+            ep_size=ep_size,
+        )
+    ):
+        raise RuntimeError("Hierarchical instance classification violates rank ownership or duplicate constraints.")
     return instance_ranks
 
 
@@ -1051,19 +1464,25 @@ def _materialize_layout(
             if len(eligible):
                 owner_cost[expert, column] = -float(served[eligible].max())
     experts, columns = linear_sum_assignment(owner_cost)
-    if len(experts) != num_experts or bool((owner_cost[experts, columns] >= 1e29).any()):
-        raise RuntimeError("The classified instances have no balanced owner assignment.")
-    owner_rank = np.full((num_experts,), -1, dtype=np.int64)
-    owner_rank[experts] = owner_columns[columns]
-
     owner_instance = np.full((num_experts,), -1, dtype=np.int64)
-    for expert in range(num_experts):
-        instances = np.flatnonzero((logical_instances == expert) & (instance_ranks == owner_rank[expert]))
-        owner_instance[expert] = int(instances[np.argmax(served[instances])])
+    if len(experts) == num_experts and not bool((owner_cost[experts, columns] >= 1e29).any()):
+        owner_rank = np.full((num_experts,), -1, dtype=np.int64)
+        owner_rank[experts] = owner_columns[columns]
+        for expert in range(num_experts):
+            instances = np.flatnonzero((logical_instances == expert) & (instance_ranks == owner_rank[expert]))
+            owner_instance[expert] = int(instances[np.argmax(served[instances])])
+    else:
+        # Canonical ownership is a gradient/checkpoint identity, not a
+        # placement capacity. Fall back to the most-served copy when an
+        # arbitrary active/empty budget makes balanced owners infeasible.
+        for expert in range(num_experts):
+            instances = np.flatnonzero(logical_instances == expert)
+            owner_instance[expert] = int(instances[np.argmax(served[instances])])
 
     layout = np.full((ep_size * slots_per_rank,), -1, dtype=np.int64)
     owners = np.full((num_experts,), -1, dtype=np.int64)
     instance_to_slot = np.full((len(logical_instances),), -1, dtype=np.int64)
+    owner_set = {int(instance) for instance in owner_instance.tolist()}
     for rank in range(ep_size):
         owner_instances = sorted(
             np.flatnonzero(
@@ -1071,14 +1490,8 @@ def _materialize_layout(
             ).tolist(),
             key=lambda instance: int(logical_instances[instance]),
         )
-        if len(owner_instances) != primary_slots_per_rank:
-            raise RuntimeError(f"Rank {rank} received {len(owner_instances)} owner instances.")
         remaining = sorted(
-            [
-                int(instance)
-                for instance in np.flatnonzero(instance_ranks == rank)
-                if int(instance) not in owner_instances
-            ],
+            [int(instance) for instance in np.flatnonzero(instance_ranks == rank) if int(instance) not in owner_set],
             key=lambda instance: (int(logical_instances[instance]), instance),
         )
         ordered = owner_instances + remaining
@@ -1087,9 +1500,11 @@ def _materialize_layout(
         for local_slot, instance in enumerate(ordered):
             slot = rank * slots_per_rank + local_slot
             expert = int(logical_instances[instance])
-            layout[slot] = expert
             instance_to_slot[instance] = slot
-            if local_slot < primary_slots_per_rank:
+            if expert < 0:
+                continue
+            layout[slot] = expert
+            if instance in owner_set:
                 owners[expert] = slot
     if bool((owners < 0).any()) or bool((instance_to_slot < 0).any()):
         raise RuntimeError("Layout materialization lost an owner or physical instance.")
@@ -1111,14 +1526,20 @@ def _build_candidate(
     strategy: str,
     fixed_instance_nodes: np.ndarray | None = None,
     fixed_initial_lut: np.ndarray | None = None,
+    initial_instance_statistics: tuple[np.ndarray, np.ndarray] | None = None,
+    cost_cache: dict[bytes, HybridCost] | None = None,
 ) -> _Candidate | None:
     started = time.perf_counter()
-    instance_demand, instance_affinity = _uniform_instance_statistics(
-        logical_instances,
-        demand_by_source,
-        affinity_by_source,
-    )
-    if fixed_instance_nodes is not None:
+    if fixed_instance_nodes is None:
+        if initial_instance_statistics is None:
+            instance_demand, instance_affinity = _uniform_instance_statistics(
+                logical_instances,
+                demand_by_source,
+                affinity_by_source,
+            )
+        else:
+            instance_demand, instance_affinity = initial_instance_statistics
+    else:
         if fixed_initial_lut is None:
             node_lut, _ = _node_proxy_lut(
                 samples,
@@ -1142,6 +1563,7 @@ def _build_candidate(
             instance_ranks = _classify_instances(
                 instance_demand,
                 instance_affinity,
+                logical_instances,
                 ep_size=args.ep_size,
                 ranks_per_node=args.ranks_per_node,
                 slots_per_rank=args.slots_per_rank,
@@ -1156,6 +1578,7 @@ def _build_candidate(
                 instance_affinity,
                 ranks_per_node=args.ranks_per_node,
                 slots_per_rank=args.slots_per_rank,
+                logical_instances=logical_instances,
             )
         if fixed_initial_lut is None:
             initial_lut = _initial_lut_instances(
@@ -1197,7 +1620,12 @@ def _build_candidate(
                 )
             except RuntimeError:
                 continue
-            cost = evaluator.evaluate(samples, lut)
+            cache_key = lut.tobytes()
+            cost = None if cost_cache is None else cost_cache.get(cache_key)
+            if cost is None:
+                cost = evaluator.evaluate(samples, lut)
+                if cost_cache is not None:
+                    cost_cache[cache_key] = cost
             candidate = _Candidate(
                 strategy=strategy,
                 layout=layout,
@@ -1229,201 +1657,337 @@ def _build_candidate(
     )
 
 
-def _validate_configuration(args: argparse.Namespace) -> int:
+def _validate_configuration(args: argparse.Namespace) -> _CapacityPlan:
     if args.ep_size % args.ranks_per_node:
         raise ValueError("EP size must be divisible by ranks per node.")
-    if args.num_experts != args.ep_size * args.primary_slots_per_rank:
-        raise ValueError("Primary capacity must equal the logical expert count.")
-    replicas = args.ep_size * (args.slots_per_rank - args.primary_slots_per_rank)
-    if replicas < 0 or replicas > args.num_experts:
-        raise ValueError("This initializer supports zero to one redundant copy per expert.")
-    num_nodes = args.ep_size // args.ranks_per_node
-    base_group = args.num_experts // num_nodes
-    if replicas % base_group:
-        raise ValueError("Replica capacity must be a multiple of the node base-group size.")
-    return replicas
+    if args.num_experts <= 0 or args.ep_size <= 0:
+        raise ValueError("Expert and EP sizes must be positive.")
+    if args.num_experts % args.ep_size:
+        raise ValueError("This initializer requires logical experts to divide evenly across EP ranks.")
+
+    primary_slots = args.num_experts // args.ep_size
+    if args.primary_slots_per_rank is None:
+        args.primary_slots_per_rank = primary_slots
+    elif int(args.primary_slots_per_rank) != primary_slots:
+        raise ValueError(
+            "Primary slots per rank must equal num_experts / ep_size; "
+            f"expected {primary_slots}, got {args.primary_slots_per_rank}."
+        )
+    configured_redundant = getattr(args, "redundant_slots_per_rank", None)
+    if args.slots_per_rank is None:
+        redundant_per_rank = 4 if configured_redundant is None else int(configured_redundant)
+        if redundant_per_rank < 0:
+            raise ValueError("Redundant slots per rank must be non-negative.")
+        args.slots_per_rank = primary_slots + redundant_per_rank
+    elif configured_redundant is not None and int(args.slots_per_rank) != primary_slots + int(configured_redundant):
+        raise ValueError("slots-per-rank does not match primary plus redundant slots per rank.")
+    if args.slots_per_rank < primary_slots:
+        raise ValueError("Physical slots per rank cannot be smaller than the canonical owner capacity.")
+
+    reserved = args.ep_size * (args.slots_per_rank - primary_slots)
+    active = reserved if args.active_redundant_slots is None else int(args.active_redundant_slots)
+    if active < 0 or active > reserved:
+        raise ValueError(f"Active redundant slots must be between zero and reserved capacity {reserved}.")
+    # A rank cannot hold the same logical expert twice. Consequently an
+    # expert has at most one copy on every EP rank.
+    if active > args.num_experts * (args.ep_size - 1):
+        raise ValueError("Active replica budget exceeds the duplicate-free EP placement capacity.")
+    return _CapacityPlan(
+        primary_slots_per_rank=primary_slots,
+        reserved_replicas=reserved,
+        active_replicas=active,
+        empty_slots=reserved - active,
+    )
+
+
+def _preloaded_replay_payload(
+    *,
+    layouts: list[np.ndarray],
+    owners: list[np.ndarray],
+    luts: list[np.ndarray],
+    args: argparse.Namespace,
+    algorithm: str,
+) -> dict[str, object]:
+    """Serialize layouts with inactive slots for direct startup preload.
+
+    The legacy replay action language normalizes a full layout through owner
+    swaps and replica fills. It cannot represent an arbitrary inactive-slot
+    distribution without temporary actions, while the runtime's static
+    preload path already validates and installs the exact layout atomically.
+    """
+
+    layers: dict[str, object] = {}
+    for offset, (layout, owner, lut) in enumerate(zip(layouts, owners, luts, strict=True)):
+        layer = args.layer_start + offset
+        name = f"model.language_model.layers.{layer}.mlp.experts"
+        layers[name] = {
+            "slot_to_logical": [int(value) for value in layout.tolist()],
+            "owner_slots": [int(value) for value in owner.tolist()],
+            "source_logical_to_physical": [[int(value) for value in row] for row in lut.tolist()],
+        }
+    return {
+        "schema_version": 2,
+        "source": {
+            "initial_layout": "preloaded",
+            "algorithm": algorithm,
+            "route_root": str(args.route_root.resolve()),
+            "optimize_steps": list(args.optimize_steps),
+            "validation_steps": list(args.validation_steps),
+            "requires_static_preload": True,
+        },
+        "topology": {
+            "ep_size": args.ep_size,
+            "num_experts": args.num_experts,
+            "num_physical_slots": args.ep_size * args.slots_per_rank,
+            "slots_per_rank": args.slots_per_rank,
+        },
+        "replay": {"actions_by_step": {"1": []}},
+        "layers": layers,
+    }
+
+
+def _plan_layer(
+    layer: int,
+    *,
+    args: argparse.Namespace,
+    capacity: _CapacityPlan,
+) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
+    torch.set_num_threads(int(args.worker_threads))
+    evaluator = _HybridEvaluator(args)
+    layer_started = time.perf_counter()
+    optimize_samples = _load_routes(
+        args.route_root,
+        steps=args.optimize_steps,
+        layer=layer,
+        ep_size=args.ep_size,
+    )
+    validation_samples = _load_routes(
+        args.route_root,
+        steps=args.validation_steps,
+        layer=layer,
+        ep_size=args.ep_size,
+    )
+    source_demand, source_affinity = _source_statistics(
+        optimize_samples,
+        num_experts=args.num_experts,
+    )
+    # These are exact identities, not approximations: source statistics retain
+    # one row per EP rank, and their affinity sum is the same global pair
+    # count previously rebuilt by a second complete route scan.
+    demand_by_rank = source_demand
+    affinity = source_affinity.sum(axis=0)
+    partitions = _logical_base_partitions(
+        affinity,
+        demand_by_rank.sum(axis=0),
+        num_nodes=args.ep_size // args.ranks_per_node,
+        restarts=args.partition_restarts,
+        iterations=args.partition_iterations,
+        seed=args.seed + 100_003 * layer,
+    )
+    replica_allocations = _replica_allocations(
+        affinity,
+        demand_by_rank.sum(axis=0),
+        replicas=capacity.active_replicas,
+        restarts=args.partition_restarts,
+        iterations=args.partition_iterations,
+        seed=args.seed + 100_003 * layer + 53_123,
+        candidate_limit=args.replica_candidate_limit,
+    )
+    candidates: list[_Candidate] = []
+    candidate_jobs: list[dict[str, object]] = []
+    seen_replica_sets: set[tuple[bytes, bytes]] = set()
+    uniform_statistics: dict[bytes, tuple[np.ndarray, np.ndarray]] = {}
+    cost_cache: dict[bytes, HybridCost] = {}
+    for partition_index, partition in enumerate(partitions):
+        for combination_index, replica_experts in enumerate(replica_allocations):
+            key = (partition.tobytes(), replica_experts.tobytes())
+            if key in seen_replica_sets:
+                continue
+            seen_replica_sets.add(key)
+            logical_instances = _logical_instances(
+                args.num_experts,
+                replica_experts,
+                total_slots=args.ep_size * args.slots_per_rank,
+            )
+            logical_key = logical_instances.tobytes()
+            structured = _structured_instance_node_candidates(
+                partition,
+                logical_instances,
+                source_demand,
+                ranks_per_node=args.ranks_per_node,
+            )
+            structured_route_statistics = (
+                _group_route_statistics(
+                    optimize_samples,
+                    partition,
+                    ranks_per_node=args.ranks_per_node,
+                )
+                if structured
+                else None
+            )
+            if args.generic_instance_seed or not structured:
+                statistics = uniform_statistics.get(logical_key)
+                if statistics is None:
+                    statistics = _uniform_instance_statistics(
+                        logical_instances,
+                        source_demand,
+                        source_affinity,
+                    )
+                    uniform_statistics[logical_key] = statistics
+                candidate_jobs.append(
+                    {
+                        "logical_instances": logical_instances,
+                        "demand_by_source": source_demand,
+                        "affinity_by_source": source_affinity,
+                        "seed": args.seed + 100_003 * layer + 997 * partition_index + 31 * combination_index,
+                        "strategy": f"recursive_classifier_p{partition_index}_c{combination_index}",
+                        "initial_instance_statistics": statistics,
+                    }
+                )
+            proxy_rows: list[tuple[float, str, np.ndarray, np.ndarray]] = []
+            for structured_strategy, structured_nodes in structured:
+                coherent_lut, proxy_score = _group_coherent_node_lut(
+                    optimize_samples,
+                    logical_instances,
+                    structured_nodes,
+                    partition,
+                    ranks_per_node=args.ranks_per_node,
+                    communication_ms_per_token=(
+                        args.communication_phase_multiplier
+                        * args.hidden_size
+                        * args.bytes_per_element
+                        * args.inter_ms_per_byte
+                    ),
+                    assignment_ms_per_assignment=(
+                        args.compute_phase_multiplier * args.compute_ms_per_assignment
+                        + args.communication_phase_multiplier * args.route_ms_per_assignment
+                    ),
+                    route_statistics=structured_route_statistics,
+                )
+                proxy_rows.append(
+                    (
+                        proxy_score,
+                        structured_strategy,
+                        structured_nodes,
+                        coherent_lut,
+                    )
+                )
+            for _, structured_strategy, structured_nodes, coherent_lut in sorted(
+                proxy_rows,
+                key=lambda row: row[0],
+            )[: args.structured_shortlist]:
+                candidate_jobs.append(
+                    {
+                        "logical_instances": logical_instances,
+                        "demand_by_source": source_demand,
+                        "affinity_by_source": source_affinity,
+                        "seed": args.seed + 100_003 * layer + 997 * partition_index + 31 * combination_index,
+                        "strategy": (f"structured_{structured_strategy}_p{partition_index}_c{combination_index}"),
+                        "fixed_instance_nodes": structured_nodes,
+                        "fixed_initial_lut": coherent_lut,
+                    }
+                )
+            if args.hyperedge_seed:
+                hyperedge_nodes = _hyperedge_instance_nodes(
+                    optimize_samples,
+                    logical_instances,
+                    num_nodes=args.ep_size // args.ranks_per_node,
+                    capacity=args.ranks_per_node * args.slots_per_rank,
+                    num_experts=args.num_experts,
+                    seed=args.seed + 100_003 * layer + 997 * partition_index + 31 * combination_index,
+                    sample_limit=args.hyperedge_token_sample,
+                )
+                candidate_jobs.append(
+                    {
+                        "logical_instances": logical_instances,
+                        "demand_by_source": source_demand,
+                        "affinity_by_source": source_affinity,
+                        "seed": args.seed + 100_003 * layer + 997 * partition_index + 31 * combination_index,
+                        "strategy": f"hyperedge_recursive_p{partition_index}_c{combination_index}",
+                        "fixed_instance_nodes": hyperedge_nodes,
+                    }
+                )
+    build_candidate = partial(
+        _build_candidate,
+        optimize_samples,
+        evaluator=evaluator,
+        args=args,
+        cost_cache=cost_cache,
+    )
+    if args.candidate_workers == 1:
+        built_candidates = [build_candidate(**job) for job in candidate_jobs]
+    else:
+        with ThreadPoolExecutor(
+            max_workers=min(args.candidate_workers, len(candidate_jobs)),
+        ) as executor:
+            built_candidates = list(executor.map(lambda job: build_candidate(**job), candidate_jobs))
+    candidates.extend(candidate for candidate in built_candidates if candidate is not None)
+    if not candidates:
+        raise RuntimeError(f"No feasible recursive classifier candidate for layer {layer}.")
+    best = min(candidates, key=lambda item: item.optimize_cost.total_ms)
+    validation_cost = evaluator.evaluate(validation_samples, best.lut)
+    active_layout = best.layout[best.layout >= 0]
+    copy_counts = np.bincount(active_layout, minlength=args.num_experts)
+    layer_ms = (time.perf_counter() - layer_started) * 1000.0
+    row: dict[str, object] = {
+        "layer": layer,
+        "strategy": best.strategy,
+        "candidate_count": len(candidates),
+        "candidates": [
+            {
+                "strategy": candidate.strategy,
+                "planner_ms": candidate.planner_ms,
+                "optimize": asdict(candidate.optimize_cost),
+            }
+            for candidate in sorted(
+                candidates,
+                key=lambda item: item.optimize_cost.total_ms,
+            )
+        ],
+        "planner_ms": layer_ms,
+        "winner_planner_ms": best.planner_ms,
+        "exact_route_evaluations": len(cost_cache),
+        "uniform_statistics_builds": len(uniform_statistics),
+        "alternations": best.alternations,
+        "copy_counts": [int(value) for value in copy_counts.tolist()],
+        "optimize": asdict(best.optimize_cost),
+        "validation": asdict(validation_cost),
+    }
+    print(
+        f"layer={layer:02d} strategy={best.strategy} candidates={len(candidates)} "
+        f"optimize_ms={best.optimize_cost.total_ms:.3f} "
+        f"validation_ms={validation_cost.total_ms:.3f} "
+        f"planner_ms={layer_ms:.1f}",
+        flush=True,
+    )
+    return layer, best.layout, best.owners, best.lut, row
 
 
 def main() -> None:
     args = _parse_args()
-    replicas = _validate_configuration(args)
-    evaluator = _HybridEvaluator(args)
-    layouts: list[np.ndarray] = []
-    owners: list[np.ndarray] = []
-    luts: list[np.ndarray] = []
-    rows: list[dict[str, object]] = []
-
-    for layer in range(args.layer_start, args.layer_start + args.layers):
-        optimize_samples = _load_routes(
-            args.route_root,
-            steps=args.optimize_steps,
-            layer=layer,
-            ep_size=args.ep_size,
-        )
-        validation_samples = _load_routes(
-            args.route_root,
-            steps=args.validation_steps,
-            layer=layer,
-            ep_size=args.ep_size,
-        )
-        demand_by_rank, _, affinity, _ = _route_statistics(
-            optimize_samples,
-            num_experts=args.num_experts,
-            ranks_per_node=args.ranks_per_node,
-        )
-        source_demand, source_affinity = _source_statistics(
-            optimize_samples,
-            num_experts=args.num_experts,
-        )
-        partitions = _logical_base_partitions(
-            affinity,
-            demand_by_rank.sum(axis=0),
-            num_nodes=args.ep_size // args.ranks_per_node,
-            restarts=args.partition_restarts,
-            iterations=args.partition_iterations,
-            seed=args.seed + 100_003 * layer,
-        )
-        candidates: list[_Candidate] = []
-        seen_replica_sets: set[tuple[bytes, bytes]] = set()
-        for partition_index, partition in enumerate(partitions):
-            for combination_index, replica_experts in enumerate(
-                _replica_sets_from_partition(partition, replicas=replicas)
-            ):
-                key = (partition.tobytes(), replica_experts.tobytes())
-                if key in seen_replica_sets:
-                    continue
-                seen_replica_sets.add(key)
-                logical_instances = _logical_instances(args.num_experts, replica_experts)
-                structured = _structured_instance_node_candidates(
-                    partition,
-                    logical_instances,
-                    source_demand,
-                    ranks_per_node=args.ranks_per_node,
-                )
-                if args.generic_instance_seed or not structured:
-                    candidate = _build_candidate(
-                        optimize_samples,
-                        logical_instances=logical_instances,
-                        demand_by_source=source_demand,
-                        affinity_by_source=source_affinity,
-                        evaluator=evaluator,
-                        args=args,
-                        seed=args.seed + 100_003 * layer + 997 * partition_index + 31 * combination_index,
-                        strategy=f"recursive_classifier_p{partition_index}_c{combination_index}",
-                    )
-                    if candidate is not None:
-                        candidates.append(candidate)
-                proxy_rows: list[tuple[float, str, np.ndarray, np.ndarray]] = []
-                for structured_strategy, structured_nodes in structured:
-                    coherent_lut, proxy_score = _group_coherent_node_lut(
-                        optimize_samples,
-                        logical_instances,
-                        structured_nodes,
-                        partition,
-                        ranks_per_node=args.ranks_per_node,
-                        communication_ms_per_token=(
-                            args.communication_phase_multiplier
-                            * args.hidden_size
-                            * args.bytes_per_element
-                            * args.inter_ms_per_byte
-                        ),
-                        assignment_ms_per_assignment=(
-                            args.compute_phase_multiplier * args.compute_ms_per_assignment
-                            + args.communication_phase_multiplier * args.route_ms_per_assignment
-                        ),
-                    )
-                    proxy_rows.append(
-                        (
-                            proxy_score,
-                            structured_strategy,
-                            structured_nodes,
-                            coherent_lut,
-                        )
-                    )
-                for _, structured_strategy, structured_nodes, coherent_lut in sorted(
-                    proxy_rows,
-                    key=lambda row: row[0],
-                )[: args.structured_shortlist]:
-                    structured_candidate = _build_candidate(
-                        optimize_samples,
-                        logical_instances=logical_instances,
-                        demand_by_source=source_demand,
-                        affinity_by_source=source_affinity,
-                        evaluator=evaluator,
-                        args=args,
-                        seed=args.seed + 100_003 * layer + 997 * partition_index + 31 * combination_index,
-                        strategy=(f"structured_{structured_strategy}_p{partition_index}_c{combination_index}"),
-                        fixed_instance_nodes=structured_nodes,
-                        fixed_initial_lut=coherent_lut,
-                    )
-                    if structured_candidate is not None:
-                        candidates.append(structured_candidate)
-                if args.hyperedge_seed:
-                    hyperedge_nodes = _hyperedge_instance_nodes(
-                        optimize_samples,
-                        logical_instances,
-                        num_nodes=args.ep_size // args.ranks_per_node,
-                        capacity=args.ranks_per_node * args.slots_per_rank,
-                        num_experts=args.num_experts,
-                        seed=args.seed + 100_003 * layer + 997 * partition_index + 31 * combination_index,
-                        sample_limit=args.hyperedge_token_sample,
-                    )
-                    hyperedge_candidate = _build_candidate(
-                        optimize_samples,
-                        logical_instances=logical_instances,
-                        demand_by_source=source_demand,
-                        affinity_by_source=source_affinity,
-                        evaluator=evaluator,
-                        args=args,
-                        seed=args.seed + 100_003 * layer + 997 * partition_index + 31 * combination_index,
-                        strategy=f"hyperedge_recursive_p{partition_index}_c{combination_index}",
-                        fixed_instance_nodes=hyperedge_nodes,
-                    )
-                    if hyperedge_candidate is not None:
-                        candidates.append(hyperedge_candidate)
-        if not candidates:
-            raise RuntimeError(f"No feasible recursive classifier candidate for layer {layer}.")
-        best = min(candidates, key=lambda item: item.optimize_cost.total_ms)
-        validation_cost = evaluator.evaluate(validation_samples, best.lut)
-        layouts.append(best.layout)
-        owners.append(best.owners)
-        luts.append(best.lut)
-        copy_counts = np.bincount(best.layout, minlength=args.num_experts)
-        row = {
-            "layer": layer,
-            "strategy": best.strategy,
-            "candidate_count": len(candidates),
-            "candidates": [
-                {
-                    "strategy": candidate.strategy,
-                    "planner_ms": candidate.planner_ms,
-                    "optimize": asdict(candidate.optimize_cost),
-                }
-                for candidate in sorted(
-                    candidates,
-                    key=lambda item: item.optimize_cost.total_ms,
-                )
-            ],
-            "planner_ms": best.planner_ms,
-            "alternations": best.alternations,
-            "copy_counts": [int(value) for value in copy_counts.tolist()],
-            "optimize": asdict(best.optimize_cost),
-            "validation": asdict(validation_cost),
-        }
-        rows.append(row)
-        print(
-            f"layer={layer:02d} strategy={best.strategy} candidates={len(candidates)} "
-            f"optimize_ms={best.optimize_cost.total_ms:.3f} "
-            f"validation_ms={validation_cost.total_ms:.3f} "
-            f"planner_ms={best.planner_ms:.1f}",
-            flush=True,
-        )
+    capacity = _validate_configuration(args)
+    if args.workers <= 0 or args.candidate_workers <= 0 or args.worker_threads <= 0:
+        raise ValueError("workers, candidate-workers, and worker-threads must be positive.")
+    layer_ids = tuple(range(args.layer_start, args.layer_start + args.layers))
+    worker = partial(_plan_layer, args=args, capacity=capacity)
+    wall_started = time.perf_counter()
+    if args.workers == 1:
+        results = [worker(layer) for layer in layer_ids]
+    else:
+        with ProcessPoolExecutor(max_workers=min(args.workers, len(layer_ids))) as executor:
+            results = list(executor.map(worker, layer_ids))
+    wall_ms = (time.perf_counter() - wall_started) * 1000.0
+    results.sort(key=lambda item: item[0])
+    layouts = [item[1] for item in results]
+    owners = [item[2] for item in results]
+    luts = [item[3] for item in results]
+    rows = [item[4] for item in results]
 
     validation_total = sum(float(row["validation"]["total_ms"]) for row in rows)
     comparison_ms = float(args.comparison_validation_ms)
     report = {
         "schema_version": 1,
-        "algorithm": "capacity-general-recursive-classifier-v1",
+        "algorithm": "capacity-general-recursive-classifier-v2",
         "configuration": {
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items()
@@ -1431,24 +1995,57 @@ def main() -> None:
         },
         "layers": rows,
         "aggregate": {
-            "replica_slots": replicas,
+            "replica_slots": capacity.active_replicas,
+            "reserved_replica_slots": capacity.reserved_replicas,
+            "active_replica_slots": capacity.active_replicas,
+            "empty_slots": capacity.empty_slots,
             "optimize_total_ms": sum(float(row["optimize"]["total_ms"]) for row in rows),
             "validation_total_ms": validation_total,
             "planner_total_ms": sum(float(row["planner_ms"]) for row in rows),
             "planner_mean_ms_per_layer": sum(float(row["planner_ms"]) for row in rows) / len(rows),
+            "planner_wall_ms": wall_ms,
+            "workers": min(args.workers, len(layer_ids)),
+            "candidate_workers": args.candidate_workers,
+            "exact_route_evaluations": sum(int(row["exact_route_evaluations"]) for row in rows),
+            "uniform_statistics_builds": sum(int(row["uniform_statistics_builds"]) for row in rows),
             "comparison_validation_ms": comparison_ms,
             "validation_gain_ms": comparison_ms - validation_total,
             "validation_speedup": comparison_ms / validation_total,
             "e2e_eligible": bool(args.layer_start == 0 and args.layers == 48 and validation_total <= comparison_ms),
         },
     }
-    payload = _replay_payload(
-        layouts=layouts,
-        owners=owners,
-        luts=luts,
-        args=args,
-        algorithm="capacity-general-recursive-classifier-v1",
-    )
+    serialization_mode = "preloaded"
+    serialization_reason = "inactive physical slots require exact static preload"
+    if not capacity.empty_slots:
+        try:
+            payload = _replay_payload(
+                layouts=layouts,
+                owners=owners,
+                luts=luts,
+                args=args,
+                algorithm="capacity-general-recursive-classifier-v2",
+            )
+            serialization_mode = "actions"
+            serialization_reason = ""
+        except RuntimeError as error:
+            serialization_reason = f"legacy action normalization is not feasible: {error}"
+            payload = _preloaded_replay_payload(
+                layouts=layouts,
+                owners=owners,
+                luts=luts,
+                args=args,
+                algorithm="capacity-general-recursive-classifier-v2",
+            )
+    else:
+        payload = _preloaded_replay_payload(
+            layouts=layouts,
+            owners=owners,
+            luts=luts,
+            args=args,
+            algorithm="capacity-general-recursive-classifier-v2",
+        )
+    report["aggregate"]["serialization_mode"] = serialization_mode
+    report["aggregate"]["serialization_reason"] = serialization_reason
     for path, value in ((args.output_layout, payload), (args.output_report, report)):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")

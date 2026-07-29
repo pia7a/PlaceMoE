@@ -328,6 +328,12 @@ class EnvironMeterCallback(Callback):
         super().__init__(trainer)
 
         args: "VeOmniArguments" = self.trainer.args
+        profile_dir = os.environ.get("VERL_MOE_PROFILE_DIR")
+        self.env_metrics_jsonl_path = (
+            Path(profile_dir) / "env_metrics" / "env_metrics_rank0.jsonl"
+            if profile_dir and args.train.global_rank == 0
+            else None
+        )
         self.trainer.environ_meter = helper.EnvironMeter(
             config=trainer.model_config,
             global_batch_size=args.train.global_batch_size,
@@ -382,6 +388,23 @@ class EnvironMeterCallback(Callback):
 
         self.trainer.step_train_metrics = step_train_metrics
         self.trainer.step_env_metrics = step_env_metrics
+        self._write_env_metrics(state, step_env_metrics)
+
+    def _write_env_metrics(self, state: TrainerState, metrics: Dict[str, Any]) -> None:
+        if self.env_metrics_jsonl_path is None:
+            return
+
+        payload = {"step": int(state.global_step), **metrics}
+        self.env_metrics_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.env_metrics_jsonl_path.open("a", encoding="utf-8") as writer:
+            writer.write(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    default=lambda value: value.item() if hasattr(value, "item") else str(value),
+                )
+                + "\n"
+            )
 
 
 class TqdmCallback(Callback):

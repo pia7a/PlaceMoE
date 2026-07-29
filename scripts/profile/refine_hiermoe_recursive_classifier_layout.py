@@ -41,6 +41,7 @@ from scripts.profile.build_hiermoe_recursive_classifier_layout import (
     _materialize_layout,
     _optimize_lut_instances,
     _parse_int_list,
+    _preloaded_replay_payload,
     _refine_balanced_partition,
     _source_statistics,
 )
@@ -81,11 +82,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--node-max-swaps", type=int, default=32)
     parser.add_argument("--rank-max-swaps", type=int, default=16)
     parser.add_argument("--lut-iterations", type=int, default=6)
-    parser.add_argument("--ep-size", type=int, default=32)
+    parser.add_argument("--ep-size", type=int, default=None)
     parser.add_argument("--ranks-per-node", type=int, default=8)
-    parser.add_argument("--num-experts", type=int, default=128)
-    parser.add_argument("--slots-per-rank", type=int, default=8)
-    parser.add_argument("--primary-slots-per-rank", type=int, default=4)
+    parser.add_argument("--num-experts", type=int, default=None)
+    parser.add_argument("--slots-per-rank", type=int, default=None)
+    parser.add_argument("--primary-slots-per-rank", type=int, default=None)
     parser.add_argument("--hidden-size", type=int, default=2048)
     parser.add_argument("--bytes-per-element", type=int, default=2)
     parser.add_argument("--inter-ms-per-byte", type=float, default=6.765449326279194e-08)
@@ -143,20 +144,11 @@ def _load_incumbent(
 
 def _cost_coefficients(args: argparse.Namespace) -> tuple[float, float, float]:
     payload_bytes = float(args.hidden_size * args.bytes_per_element)
-    node_affinity = (
-        float(args.communication_phase_multiplier)
-        * payload_bytes
-        * float(args.inter_ms_per_byte)
-    )
-    rank_affinity = (
-        float(args.communication_phase_multiplier)
-        * payload_bytes
-        * float(args.intra_ms_per_byte)
-    )
-    assignment = (
-        float(args.compute_phase_multiplier) * float(args.compute_ms_per_assignment)
-        + float(args.communication_phase_multiplier) * float(args.route_ms_per_assignment)
-    )
+    node_affinity = float(args.communication_phase_multiplier) * payload_bytes * float(args.inter_ms_per_byte)
+    rank_affinity = float(args.communication_phase_multiplier) * payload_bytes * float(args.intra_ms_per_byte)
+    assignment = float(args.compute_phase_multiplier) * float(args.compute_ms_per_assignment) + float(
+        args.communication_phase_multiplier
+    ) * float(args.route_ms_per_assignment)
     return node_affinity, rank_affinity, assignment
 
 
@@ -234,14 +226,16 @@ def _feasible_rank_seed(
         capacities = np.full((args.ranks_per_node,), args.slots_per_rank, dtype=np.int64)
         loads = np.zeros((args.ranks_per_node,), dtype=np.float64)
         lane_members: list[list[int]] = [[] for _ in range(args.ranks_per_node)]
+        active_logical = logical_instances[members]
+        active_logical = active_logical[active_logical >= 0]
         multiplicity = np.bincount(
-            logical_instances[members],
+            active_logical,
             minlength=args.num_experts,
         )
         order = sorted(
             members.tolist(),
             key=lambda item: (
-                -int(multiplicity[int(logical_instances[item])]),
+                -int(multiplicity[int(logical_instances[item])]) if int(logical_instances[item]) >= 0 else 0,
                 -float(demand[item]),
                 item,
             ),
@@ -253,16 +247,13 @@ def _feasible_rank_seed(
             for lane in range(args.ranks_per_node):
                 if capacities[lane] <= 0:
                     continue
-                if any(int(logical_instances[other]) == logical for other in lane_members[lane]):
+                if logical >= 0 and any(int(logical_instances[other]) == logical for other in lane_members[lane]):
                     continue
                 projected_peak = max(
                     float(loads.max(initial=0.0)),
                     loads[lane] + float(demand[instance]),
                 )
-                affinity_gain = sum(
-                    float(affinity[instance, other])
-                    for other in lane_members[lane]
-                )
+                affinity_gain = sum(float(affinity[instance, other]) for other in lane_members[lane])
                 key = (
                     projected_peak,
                     int(lane != preferred_lane),
@@ -524,18 +515,14 @@ def _refine_layer(
                             "rank_proxy_cost": geometry.rank_proxy_cost,
                             "optimize": asdict(optimize_cost),
                             "validation": (
-                                None
-                                if not np.isfinite(validation_cost.total_ms)
-                                else asdict(validation_cost)
+                                None if not np.isfinite(validation_cost.total_ms) else asdict(validation_cost)
                             ),
                         },
                     )
                 )
         exact_ms = (time.perf_counter() - exact_started) * 1000.0
         feasible = [
-            row
-            for row in candidates
-            if row[0].optimize_cost.total_ms < incumbent.optimize_cost.total_ms - 1e-9
+            row for row in candidates if row[0].optimize_cost.total_ms < incumbent.optimize_cost.total_ms - 1e-9
         ]
         accepted = min(feasible, key=lambda row: row[0].optimize_cost.total_ms) if feasible else None
         if accepted is not None:
@@ -592,12 +579,26 @@ def _refine_layer(
 
 def main() -> None:
     args = _parse_args()
-    if args.ep_size % args.ranks_per_node:
-        raise ValueError("EP size must be divisible by ranks per node.")
     payload = json.loads(args.input_layout.read_text(encoding="utf-8"))
     topology = payload.get("topology")
     if not isinstance(topology, dict):
         raise ValueError("Input layout has no topology metadata.")
+    for argument, topology_key in (
+        ("ep_size", "ep_size"),
+        ("num_experts", "num_experts"),
+        ("slots_per_rank", "slots_per_rank"),
+    ):
+        if getattr(args, argument) is None:
+            setattr(args, argument, int(topology[topology_key]))
+    if args.ep_size % args.ranks_per_node:
+        raise ValueError("EP size must be divisible by ranks per node.")
+    if args.num_experts % args.ep_size:
+        raise ValueError("Logical experts must divide evenly across EP ranks.")
+    expected_primary = args.num_experts // args.ep_size
+    if args.primary_slots_per_rank is None:
+        args.primary_slots_per_rank = expected_primary
+    elif args.primary_slots_per_rank != expected_primary:
+        raise ValueError("Primary slots per rank must equal num_experts / ep_size.")
     expected = {
         "ep_size": args.ep_size,
         "num_experts": args.num_experts,
@@ -655,18 +656,16 @@ def main() -> None:
             "planner_mean_ms_per_layer": sum(float(row["planner_ms"]) for row in rows) / len(rows),
             "mapped_statistics_builds": sum(int(row["mapped_statistics_builds"]) for row in rows),
             "exact_route_evaluations": sum(int(row["exact_route_evaluations"]) for row in rows),
-            "validation_route_evaluations": sum(
-                int(row["validation_route_evaluations"])
-                for row in rows
-            ),
+            "validation_route_evaluations": sum(int(row["validation_route_evaluations"]) for row in rows),
             "e2e_eligible": bool(
-                args.layer_start == 0
-                and args.layers == 48
-                and final_validation <= initial_validation
+                args.layer_start == 0 and args.layers == 48 and final_validation <= initial_validation
             ),
         },
     }
-    replay = _replay_payload(
+    replay_builder = (
+        _preloaded_replay_payload if any(bool((layout < 0).any()) for layout in layouts) else _replay_payload
+    )
+    replay = replay_builder(
         layouts=layouts,
         owners=owners,
         luts=luts,

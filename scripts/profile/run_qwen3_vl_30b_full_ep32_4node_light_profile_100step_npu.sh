@@ -22,7 +22,9 @@ fi
 RUN_NAME=${RUN_NAME:-qwen3vl_full48_sharegpt4v_ep32_lightprof_100step_$(date +%Y%m%d_%H%M%S)}
 RUN_ROOT=${RUN_ROOT:-"${REPO_ROOT}/pretrain_runs/${RUN_NAME}"}
 MODEL_PATH=${MODEL_PATH:-/workspace/model/Qwen3-VL-30B-A3B-Instruct}
+MODEL_CONFIG_PATH=${MODEL_CONFIG_PATH:-${MODEL_PATH}}
 DATA_PATH=${DATA_PATH:-/workspace/dataset/ShareGPT4V/sharegpt4v_instruct_gpt4-vision_cap100k_coco_abs_share_full_shards}
+DATA_SOURCE_NAME=${DATA_SOURCE_NAME:-sharegpt4v_sft}
 
 NNODES=${NNODES:-4}
 NODE_RANK=${NODE_RANK:?NODE_RANK must be set to 0, 1, 2, or 3}
@@ -37,12 +39,16 @@ GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-32}
 MAX_SEQ_LEN=${MAX_SEQ_LEN:-4096}
 DATA_NUM_WORKERS=${DATA_NUM_WORKERS:-4}
 DATA_PREFETCH_FACTOR=${DATA_PREFETCH_FACTOR:-2}
+TRAIN_FREEZE_VIT=${TRAIN_FREEZE_VIT:-false}
 DP_REPLICATE_SIZE=${DP_REPLICATE_SIZE:-1}
 DP_SHARD_SIZE=${DP_SHARD_SIZE:-${TOTAL_PROCS}}
 EP_SIZE=${EP_SIZE:-32}
 NUM_MOE_LAYERS=${NUM_MOE_LAYERS:-48}
 MOE_IMPL=${MOE_IMPL:-fused_npu}
 ATTN_IMPL=${ATTN_IMPL:-flash_attention_2}
+RMS_NORM_GATED_IMPL=${RMS_NORM_GATED_IMPL:-npu}
+CAUSAL_CONV1D_IMPL=${CAUSAL_CONV1D_IMPL:-eager}
+CHUNK_GATED_DELTA_RULE_IMPL=${CHUNK_GATED_DELTA_RULE_IMPL:-eager}
 MOE_MONITOR_INTERVAL=${MOE_MONITOR_INTERVAL:-1}
 
 PROFILE_KIND=${PROFILE_KIND:-pretrain}
@@ -166,6 +172,7 @@ RUN_NAME=${RUN_NAME}
 RUN_ROOT=${RUN_ROOT}
 MODEL_PATH=${MODEL_PATH}
 DATA_PATH=${DATA_PATH}
+DATA_SOURCE_NAME=${DATA_SOURCE_NAME}
 NNODES=${NNODES}
 NODE_RANK=${NODE_RANK}
 NPROC_PER_NODE=${NPROC_PER_NODE}
@@ -177,6 +184,7 @@ GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}
 MAX_SEQ_LEN=${MAX_SEQ_LEN}
 DATA_NUM_WORKERS=${DATA_NUM_WORKERS}
 DATA_PREFETCH_FACTOR=${DATA_PREFETCH_FACTOR}
+TRAIN_FREEZE_VIT=${TRAIN_FREEZE_VIT}
 DP_REPLICATE_SIZE=${DP_REPLICATE_SIZE}
 DP_SHARD_SIZE=${DP_SHARD_SIZE}
 EP_SIZE=${EP_SIZE}
@@ -184,6 +192,9 @@ NUM_MOE_LAYERS=${NUM_MOE_LAYERS}
 MOE_IMPL=${MOE_IMPL}
 ATTN_IMPL=${ATTN_IMPL}
 MOE_MONITOR_INTERVAL=${MOE_MONITOR_INTERVAL}
+RMS_NORM_GATED_IMPL=${RMS_NORM_GATED_IMPL}
+CAUSAL_CONV1D_IMPL=${CAUSAL_CONV1D_IMPL}
+CHUNK_GATED_DELTA_RULE_IMPL=${CHUNK_GATED_DELTA_RULE_IMPL}
 VERL_MOE_PROFILE_DIR=${VERL_MOE_PROFILE_DIR}
 VEOMNI_FULL_PROFILE_ENABLE=${VEOMNI_FULL_PROFILE_ENABLE}
 VEOMNI_FULL_PROFILE_START_STEP=${VEOMNI_FULL_PROFILE_START_STEP}
@@ -290,19 +301,24 @@ torchrun \
     --master-addr="${MASTER_ADDR}" \
     --master-port="${MASTER_PORT}" \
     tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml \
+    --model.config_path "${MODEL_CONFIG_PATH}" \
     --model.model_path "${MODEL_PATH}" \
+    --model.tokenizer_path "${MODEL_PATH}" \
     --model.ops_implementation.moe_implementation "${MOE_IMPL}" \
     --model.ops_implementation.attn_implementation "${ATTN_IMPL}" \
     --model.ops_implementation.cross_entropy_loss_implementation npu \
     --model.ops_implementation.rms_norm_implementation npu \
     --model.ops_implementation.rotary_pos_emb_implementation npu \
     --model.ops_implementation.rotary_pos_emb_vision_implementation npu \
+    --model.ops_implementation.rms_norm_gated_implementation "${RMS_NORM_GATED_IMPL}" \
+    --model.ops_implementation.causal_conv1d_implementation "${CAUSAL_CONV1D_IMPL}" \
+    --model.ops_implementation.chunk_gated_delta_rule_implementation "${CHUNK_GATED_DELTA_RULE_IMPL}" \
     --model.ops_implementation.swiglu_mlp_implementation eager \
     --model.ops_implementation.load_balancing_loss_implementation eager \
     --data.train_path "${DATA_PATH}" \
     --data.dataloader.type native \
     --data.datasets_type iterable \
-    --data.source_name sharegpt4v_sft \
+    --data.source_name "${DATA_SOURCE_NAME}" \
     --data.dataloader.num_workers "${DATA_NUM_WORKERS}" \
     --data.dataloader.prefetch_factor "${DATA_PREFETCH_FACTOR}" \
     --data.max_seq_len "${MAX_SEQ_LEN}" \
@@ -310,6 +326,7 @@ torchrun \
     --train.global_batch_size "${GLOBAL_BATCH_SIZE}" \
     --train.max_steps "${MAX_STEPS}" \
     --train.num_train_epochs 1 \
+    --train.freeze_vit "${TRAIN_FREEZE_VIT}" \
     --train.accelerator.dp_replicate_size "${DP_REPLICATE_SIZE}" \
     --train.accelerator.dp_shard_size "${DP_SHARD_SIZE}" \
     --train.accelerator.ep_size "${EP_SIZE}" \

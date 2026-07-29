@@ -1,14 +1,98 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 
-import numpy as np
+from argparse import Namespace
 
+import numpy as np
+import pytest
+import torch
+
+from scripts.profile.build_hiermoe_hierarchical_init_layout import _route_statistics
 from scripts.profile.build_hiermoe_recursive_classifier_layout import (
+    _classify_instances,
+    _group_route_statistics,
     _logical_instances,
     _materialize_layout,
     _partition_proxy_cost,
+    _rank_assignment_is_device_unique,
     _refine_balanced_partition,
+    _replica_allocations,
     _replica_sets_from_partition,
+    _source_statistics,
+    _structured_instance_node_candidates,
+    _uniform_instance_statistics,
+    _validate_configuration,
 )
+
+
+def test_group_route_statistics_match_direct_token_incidence() -> None:
+    logical_groups = np.asarray([0, 0, 1, 1], dtype=np.int64)
+    samples = [
+        [
+            torch.tensor([[0, 1, 2], [0, 2, 3]], dtype=torch.long),
+            torch.tensor([[0, 1, 3], [2, 3, 2]], dtype=torch.long),
+            torch.tensor([[0, 1, 0], [0, 2, 3]], dtype=torch.long),
+            torch.tensor([[2, 3, 2], [1, 2, 3]], dtype=torch.long),
+        ]
+    ]
+
+    assignments, masks = _group_route_statistics(
+        samples,
+        logical_groups,
+        ranks_per_node=2,
+    )
+    expected_assignments = np.zeros_like(assignments)
+    expected_masks = np.zeros_like(masks)
+    for source_rank, route in enumerate(samples[0]):
+        source_node = source_rank // 2
+        for row in route.tolist():
+            groups = [int(logical_groups[expert]) for expert in row]
+            for group in groups:
+                expected_assignments[source_node, group] += 1
+            mask = 0
+            for group in groups:
+                mask |= 1 << group
+            expected_masks[source_node, mask] += 1
+
+    assert np.array_equal(assignments, expected_assignments)
+    assert np.array_equal(masks, expected_masks)
+
+
+def test_source_statistics_reconstruct_legacy_global_statistics() -> None:
+    samples = [
+        [
+            torch.tensor(
+                [
+                    [source_rank, (source_rank + 1) % 8, (source_rank + 3) % 8],
+                    [(source_rank + 2) % 8, source_rank, (source_rank + 5) % 8],
+                ],
+                dtype=torch.long,
+            )
+            for source_rank in range(4)
+        ],
+        [
+            torch.tensor(
+                [
+                    [(source_rank + 4) % 8, source_rank, (source_rank + 1) % 8],
+                    [(source_rank + 6) % 8, (source_rank + 3) % 8, source_rank],
+                ],
+                dtype=torch.long,
+            )
+            for source_rank in range(4)
+        ],
+    ]
+
+    legacy_demand, _, legacy_affinity, _ = _route_statistics(
+        samples,
+        num_experts=8,
+        ranks_per_node=2,
+    )
+    source_demand, source_affinity = _source_statistics(
+        samples,
+        num_experts=8,
+    )
+
+    assert np.array_equal(source_demand, legacy_demand)
+    assert np.array_equal(source_affinity.sum(axis=0), legacy_affinity)
 
 
 def test_replica_group_enumeration_supports_all_ep32_capacities() -> None:
@@ -113,3 +197,151 @@ def test_unified_rank_refinement_rejects_duplicate_expert_copies() -> None:
     for part in range(2):
         members = logical[result.labels == part]
         assert len(np.unique(members)) == len(members)
+
+
+@pytest.mark.parametrize(
+    ("num_experts", "ep_size"),
+    (
+        (128, 16),
+        (128, 32),
+        (128, 64),
+        (256, 16),
+        (256, 32),
+        (256, 64),
+    ),
+)
+def test_capacity_validation_supports_model_and_ep_matrix(num_experts: int, ep_size: int) -> None:
+    primary = num_experts // ep_size
+    args = Namespace(
+        num_experts=num_experts,
+        ep_size=ep_size,
+        ranks_per_node=8,
+        slots_per_rank=None,
+        redundant_slots_per_rank=2,
+        primary_slots_per_rank=None,
+        active_redundant_slots=ep_size + 1,
+    )
+
+    capacity = _validate_configuration(args)
+
+    assert capacity.primary_slots_per_rank == primary
+    assert capacity.reserved_replicas == 2 * ep_size
+    assert capacity.active_replicas == ep_size + 1
+    assert capacity.empty_slots == ep_size - 1
+    assert args.primary_slots_per_rank == primary
+    assert args.slots_per_rank == primary + 2
+
+
+@pytest.mark.parametrize("replicas", (1, 6, 16, 22))
+def test_replica_allocation_supports_exact_arbitrary_budgets(replicas: int) -> None:
+    num_experts = 16
+    affinity = np.ones((num_experts, num_experts), dtype=np.float64)
+    np.fill_diagonal(affinity, 0.0)
+    demand = np.arange(1, num_experts + 1, dtype=np.float64)
+
+    allocations = _replica_allocations(
+        affinity,
+        demand,
+        replicas=replicas,
+        restarts=1,
+        iterations=2,
+        seed=17,
+        candidate_limit=8,
+    )
+
+    assert allocations
+    for allocation in allocations:
+        assert allocation.shape == (replicas,)
+        assert bool(((allocation >= 0) & (allocation < num_experts)).all())
+
+
+def test_empty_slots_keep_instance_statistics_and_materialization_valid() -> None:
+    num_experts = 8
+    ep_size = 4
+    slots_per_rank = 3
+    logical_instances = _logical_instances(
+        num_experts,
+        np.asarray([0], dtype=np.int64),
+        total_slots=ep_size * slots_per_rank,
+    )
+    instance_ranks = np.asarray([0, 0, 1, 1, 2, 2, 3, 3, 3, 0, 1, 2], dtype=np.int64)
+    lut_instances = np.tile(np.arange(num_experts, dtype=np.int64), (ep_size, 1))
+    lut_instances[2:, 0] = num_experts
+    demand = np.ones((ep_size, num_experts), dtype=np.float64)
+    affinity = np.zeros((ep_size, num_experts, num_experts), dtype=np.float64)
+
+    instance_demand, instance_affinity = _uniform_instance_statistics(
+        logical_instances,
+        demand,
+        affinity,
+    )
+    layout, owners, lut = _materialize_layout(
+        logical_instances,
+        instance_ranks,
+        lut_instances,
+        demand,
+        ep_size=ep_size,
+        slots_per_rank=slots_per_rank,
+        primary_slots_per_rank=2,
+        num_experts=num_experts,
+    )
+
+    assert instance_demand.shape == (ep_size, ep_size * slots_per_rank)
+    assert instance_affinity.shape == (ep_size, ep_size * slots_per_rank, ep_size * slots_per_rank)
+    assert bool((instance_demand[:, logical_instances < 0] == 0).all())
+    assert int((layout < 0).sum()) == 3
+    assert len(np.unique(owners)) == num_experts
+    assert np.all(layout[lut] == np.arange(num_experts, dtype=np.int64)[None, :])
+
+
+@pytest.mark.parametrize("ep_size", (16, 64))
+def test_four_node_structured_seed_is_not_used_for_other_topologies(ep_size: int) -> None:
+    num_experts = 16
+    labels = np.arange(num_experts, dtype=np.int64) % (ep_size // 8)
+    logical_instances = np.tile(np.arange(num_experts, dtype=np.int64), 2)
+    demand = np.ones((ep_size, num_experts), dtype=np.float64)
+
+    assert (
+        _structured_instance_node_candidates(
+            labels,
+            logical_instances,
+            demand,
+            ranks_per_node=8,
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize("ep_size", (16, 64))
+def test_generic_classifier_places_full_r2_on_two_and_eight_nodes(ep_size: int) -> None:
+    num_experts = 128
+    logical_instances = _logical_instances(
+        num_experts,
+        np.arange(num_experts, dtype=np.int64),
+    )
+    demand = np.ones((ep_size, num_experts), dtype=np.float64)
+    affinity = np.zeros((ep_size, num_experts, num_experts), dtype=np.float64)
+    instance_demand, instance_affinity = _uniform_instance_statistics(
+        logical_instances,
+        demand,
+        affinity,
+    )
+
+    instance_ranks = _classify_instances(
+        instance_demand,
+        instance_affinity,
+        logical_instances,
+        ep_size=ep_size,
+        ranks_per_node=8,
+        slots_per_rank=2 * num_experts // ep_size,
+        seed=3,
+        iterations=2,
+        load_weight=8.0,
+    )
+
+    assert bool((np.bincount(instance_ranks, minlength=ep_size) == 2 * num_experts // ep_size).all())
+    assert _rank_assignment_is_device_unique(
+        instance_ranks,
+        logical_instances,
+        ep_size=ep_size,
+    )

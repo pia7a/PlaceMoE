@@ -621,10 +621,10 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         # `.bound_kernel()`; storing the OpSlot itself would couple the instance to
         # the module-global slot, and a second model rebinding the slot with a
         # different impl would silently switch this instance's kernel too.
-        # `eager` leaves causal_conv1d_fn = None (the varlen path then raises) and
-        # falls back to the torch chunk_gated_delta_rule, which `forward` rejects
-        # for varlen training; the decode-only `*_update` aliases are kept None
-        # because the precomputed-state path raises NotImplementedError anyway.
+        # `eager` leaves causal_conv1d_fn = None and falls back to the torch
+        # chunk_gated_delta_rule.  The training forward below preserves packed
+        # sequence boundaries by applying both eager operations independently to
+        # every interval in cu_seq_lens_q.
         self.causal_conv1d_fn = veomni_causal_conv1d.bound_kernel()
         self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
         self.chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel() or torch_chunk_gated_delta_rule
@@ -748,7 +748,48 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                     cu_seqlens=cu_seq_lens_q.npu(),
                 )[0]
             else:
-                raise NotImplementedError("This path is not supported yet because it can't process varlen now.")
+                # The upstream eager depthwise convolution assumes a dense
+                # [batch, sequence] tensor. VeOmni packs multiple examples into
+                # batch dimension 1, so convolving the full tensor would leak
+                # state across example boundaries. Apply the same causal
+                # convolution to each packed interval instead.
+                if cu_seq_lens_q is None:
+                    sequence_boundaries = (0, int(mixed_qkv.shape[1]))
+                else:
+                    sequence_boundaries = tuple(
+                        int(value)
+                        for value in cu_seq_lens_q.detach().to(device="cpu", dtype=torch.long).tolist()
+                    )
+                    if (
+                        len(sequence_boundaries) < 2
+                        or sequence_boundaries[0] != 0
+                        or sequence_boundaries[-1] != int(mixed_qkv.shape[1])
+                    ):
+                        raise ValueError(
+                            "cu_seq_lens_q must start at zero and end at the packed sequence length."
+                        )
+                if ulysses_enabled:
+                    conv_weight = self._get_local_conv1d_weight(
+                        ulysses_rank=ulysses_rank,
+                        local_key_dim=local_key_dim,
+                        local_value_dim=local_value_dim,
+                    ).unsqueeze(1)
+                    conv_bias = None
+                else:
+                    conv_weight = self.conv1d.weight
+                    conv_bias = self.conv1d.bias
+                convolved_sequences = []
+                for start, end in zip(sequence_boundaries[:-1], sequence_boundaries[1:], strict=True):
+                    sequence = mixed_qkv[:, start:end, :].transpose(1, 2)
+                    convolved = F.conv1d(
+                        sequence,
+                        conv_weight,
+                        conv_bias,
+                        padding=self.conv_kernel_size - 1,
+                        groups=int(sequence.shape[1]),
+                    )
+                    convolved_sequences.append(self.act(convolved[:, :, : end - start]).transpose(1, 2))
+                mixed_qkv = torch.cat(convolved_sequences, dim=1)
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -779,14 +820,37 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         if not use_precomputed_states:
-            # Modification: instance-local guard (see GPU patch comment).
             if self.chunk_gated_delta_rule is torch_chunk_gated_delta_rule:
-                raise RuntimeError(
-                    "Varlen Qwen3.5 GatedDeltaNet training is GPU-only — NPU has no fla/flash_qla "
-                    "backend registered today. On GPU, set chunk_gated_delta_rule_implementation='fla' "
-                    "(and install flash-linear-attention) or 'flash_qla' (with the optional flash-qla "
-                    "extra) in OpsImplementationConfig."
-                )
+                # Preserve the same packed sequence boundaries used by the
+                # eager convolution.  Each interval receives an independent
+                # recurrent state, exactly matching an unpadded per-example
+                # forward while retaining the packed training representation.
+                if cu_seq_lens_q is None:
+                    sequence_boundaries = (0, int(query.shape[1]))
+                else:
+                    sequence_boundaries = tuple(
+                        int(value)
+                        for value in cu_seq_lens_q.detach().to(device="cpu", dtype=torch.long).tolist()
+                    )
+                if cache_params is not None and len(sequence_boundaries) != 2:
+                    raise NotImplementedError(
+                        "Caching multiple packed sequences with the eager gated-delta rule is not supported."
+                    )
+                core_outputs = []
+                last_recurrent_state = None
+                for start, end in zip(sequence_boundaries[:-1], sequence_boundaries[1:], strict=True):
+                    core_output, last_recurrent_state = self.chunk_gated_delta_rule(
+                        query[:, start:end],
+                        key[:, start:end],
+                        value[:, start:end],
+                        g=g[:, start:end],
+                        beta=beta[:, start:end],
+                        initial_state=None,
+                        output_final_state=cache_params is not None,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                    core_outputs.append(core_output)
+                core_attn_out = torch.cat(core_outputs, dim=1)
             else:
                 # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
                 core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
@@ -1981,7 +2045,6 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=text_position_ids,
         )

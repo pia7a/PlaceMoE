@@ -10,9 +10,19 @@ master_port=${MASTER_PORT:-29950}
 run_suffix=${RUN_SUFFIX:-20260722}
 swap_interval=${HIERMOE_SWAP_INTERVAL_OVERRIDE:-1}
 max_steps=${MAX_STEPS_OVERRIDE:-6}
+model_path=${MODEL_PATH_OVERRIDE:-/workspace/model/Qwen3-VL-30B-A3B-Instruct}
+model_config_path=${MODEL_CONFIG_PATH_OVERRIDE:-${model_path}}
 data_path=${DATA_PATH_OVERRIDE:-/workspace/dataset/ShareGPT4V/sharegpt4v_instruct_gpt4-vision_cap100k_coco_abs_share_full_shards}
+data_source_name=${DATA_SOURCE_NAME_OVERRIDE:-sharegpt4v_sft}
+micro_batch_size=${MICRO_BATCH_SIZE_OVERRIDE:-4}
+global_batch_size=${GLOBAL_BATCH_SIZE_OVERRIDE:-128}
+max_seq_len=${MAX_SEQ_LEN_OVERRIDE:-4096}
 data_num_workers=${DATA_NUM_WORKERS_OVERRIDE:-4}
 data_prefetch_factor=${DATA_PREFETCH_FACTOR_OVERRIDE:-2}
+freeze_vit=${TRAIN_FREEZE_VIT_OVERRIDE:-false}
+rms_norm_gated_impl=${RMS_NORM_GATED_IMPLEMENTATION_OVERRIDE:-npu}
+causal_conv1d_impl=${CAUSAL_CONV1D_IMPLEMENTATION_OVERRIDE:-eager}
+chunk_gated_delta_rule_impl=${CHUNK_GATED_DELTA_RULE_IMPLEMENTATION_OVERRIDE:-eager}
 perf_model_path=${HIERMOE_PERF_MODEL_PATH_OVERRIDE:-/workspace/output/hiermoe_perf_model_c009_ep32_20260720/v2/hiermoe_perf_model.json}
 greedy_copy_cap=${HIERMOE_GREEDY_MAX_COPIES_OVERRIDE:-4}
 greedy_adaptive_topk=${HIERMOE_GREEDY_ADAPTIVE_TOPK_OVERRIDE:-0}
@@ -28,6 +38,7 @@ debug_copy_layers=${HIERMOE_DEBUG_COPY_LAYERS_OVERRIDE:-1}
 debug_copy_groups=${HIERMOE_DEBUG_COPY_GROUPS_OVERRIDE:-2}
 hccl_if_base_port=${HCCL_IF_BASE_PORT:-55000}
 ablation_replay_path=${HIERMOE_ABLATION_REPLAY_PATH_OVERRIDE:-${source_root}/results/qwen3vl_greedy_ep32_mb4_gbs128_r2_pipeline_6step_hccl_serial_nonblocking_score_20260726_r3_committed_layout.json}
+static_preload_layout_path=${HIERMOE_STATIC_PRELOAD_LAYOUT_PATH_OVERRIDE:-}
 key=/home/tzq/KeyPair-3bce.pem
 
 hiermoe_enable=false
@@ -73,7 +84,11 @@ forward_reuse_cover_proposal_topk=${HIERMOE_FORWARD_REUSE_COVER_PROPOSAL_TOPK_OV
 forward_reuse_cover_empty_seeding=0
 hiermoe_internal_timing=${VEOMNI_HIERMOE_INTERNAL_TIMING_OVERRIDE:-0}
 force_fixed_r2_mirrored_remap=0
-full_profile_start_step=3
+full_profile_start_step=${FULL_PROFILE_START_STEP_OVERRIDE:-3}
+full_profile_every_n=${FULL_PROFILE_EVERY_N_OVERRIDE:-1}
+full_profile_ranks=${FULL_PROFILE_RANKS_OVERRIDE:-0}
+num_moe_layers=${NUM_MOE_LAYERS_OVERRIDE:-48}
+redundant_slots_override=${HIERMOE_REDUNDANT_SLOTS_OVERRIDE:-}
 
 case "${variant}" in
   baseline)
@@ -345,6 +360,9 @@ case "${variant}" in
     forward_reuse_cover=1
     forward_reuse_cover_patch_remap=1
     forward_reuse_cover_empty_seeding=1
+    if [[ "${variant}" == "hierarchical_full_static" && -z "${static_preload_layout_path}" ]]; then
+      static_preload_layout_path=${ablation_replay_path}
+    fi
     ;;
   forward_reuse_cover_patch_multiround)
     hiermoe_enable=true
@@ -419,26 +437,38 @@ case "${variant}" in
     ;;
 esac
 
-run_name=qwen3vl_greedy_ep32_mb4_gbs128_${variant}_${max_steps}step_${run_suffix}
+if [[ -n "${redundant_slots_override}" ]]; then
+  redundant_slots=${redundant_slots_override}
+fi
+ablation_grad_mode=${HIERMOE_ABLATION_GRAD_MODE_OVERRIDE:-${ablation_grad_mode}}
+
+run_name=${RUN_NAME_OVERRIDE:-qwen3vl_greedy_ep32_mb${micro_batch_size}_gbs${global_batch_size}_${variant}_${max_steps}step_${run_suffix}}
 common_env=(
   -e "PYTHONPATH=${source_root}"
   -e "RUN_NAME=${run_name}"
   -e "RUN_ROOT=${source_root}/pretrain_runs/${run_name}"
-  -e "MODEL_PATH=/workspace/model/Qwen3-VL-30B-A3B-Instruct"
+  -e "MODEL_PATH=${model_path}"
+  -e "MODEL_CONFIG_PATH=${model_config_path}"
   -e "DATA_PATH=${data_path}"
+  -e "DATA_SOURCE_NAME=${data_source_name}"
   -e "DATA_NUM_WORKERS=${data_num_workers}"
   -e "DATA_PREFETCH_FACTOR=${data_prefetch_factor}"
+  -e "TRAIN_FREEZE_VIT=${freeze_vit}"
+  -e "RMS_NORM_GATED_IMPL=${rms_norm_gated_impl}"
+  -e "CAUSAL_CONV1D_IMPL=${causal_conv1d_impl}"
+  -e "CHUNK_GATED_DELTA_RULE_IMPL=${chunk_gated_delta_rule_impl}"
   -e "NNODES=4"
   -e "NPROC_PER_NODE=8"
   -e "MASTER_ADDR=192.168.0.55"
   -e "MASTER_PORT=${master_port}"
   -e "MAX_STEPS=${max_steps}"
-  -e "MICRO_BATCH_SIZE=4"
-  -e "GLOBAL_BATCH_SIZE=128"
-  -e "MAX_SEQ_LEN=4096"
+  -e "MICRO_BATCH_SIZE=${micro_batch_size}"
+  -e "GLOBAL_BATCH_SIZE=${global_batch_size}"
+  -e "MAX_SEQ_LEN=${max_seq_len}"
   -e "DP_REPLICATE_SIZE=1"
   -e "DP_SHARD_SIZE=32"
   -e "EP_SIZE=32"
+  -e "NUM_MOE_LAYERS=${num_moe_layers}"
   -e "HIERMOE_ENABLE=${hiermoe_enable}"
   -e "HIERMOE_DEDUP_ONLY=${dedup_only}"
   -e "HIERMOE_TOKEN_DEDUP=${token_dedup}"
@@ -459,6 +489,7 @@ common_env=(
   -e "VEOMNI_HIERMOE_ABLATION_REPLAY_MODE=${ablation_replay_mode}"
   -e "VEOMNI_HIERMOE_ABLATION_MIGRATION_MODE=${ablation_migration_mode}"
   -e "VEOMNI_HIERMOE_ABLATION_GRAD_MODE=${ablation_grad_mode}"
+  -e "VEOMNI_HIERMOE_STATIC_PRELOAD_LAYOUT_PATH=${static_preload_layout_path}"
   -e "VEOMNI_HIERMOE_CPU_PLANNER_MODE=${cpu_planner_mode}"
   -e "VEOMNI_HIERMOE_CPU_TRAIN_CORES_PER_RANK=${cpu_train_cores_per_rank}"
   -e "VEOMNI_HIERMOE_NPU_LAYER_OWNER_BLOCKING=${npu_layer_owner_blocking}"
@@ -496,8 +527,8 @@ common_env=(
   -e "VEOMNI_HIERMOE_FULL_ROUTE_GATHER_MAX_TOKENS=16384"
   -e "VEOMNI_FULL_PROFILE_ENABLE=1"
   -e "VEOMNI_FULL_PROFILE_START_STEP=${full_profile_start_step}"
-  -e "VEOMNI_FULL_PROFILE_EVERY_N=1"
-  -e "VEOMNI_FULL_PROFILE_RANKS=0"
+  -e "VEOMNI_FULL_PROFILE_EVERY_N=${full_profile_every_n}"
+  -e "VEOMNI_FULL_PROFILE_RANKS=${full_profile_ranks}"
   -e "VEOMNI_HIERMOE_INTERNAL_TIMING=${hiermoe_internal_timing}"
   -e "VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STATS=${debug_copy_stats}"
   -e "VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STATS_MAX_LAYERS=${debug_copy_layers}"
@@ -532,18 +563,23 @@ launch_remote() {
     >"${host_root}/${run_name}_rank${node_rank}.host.log" 2>&1
 }
 
-launch_remote 192.168.0.190 1 tzq_npu_static_r2_rank1_20260720 &
+rank0_container=${RANK0_CONTAINER_OVERRIDE:-tzq_npu_coremoe_verify_20260717}
+rank1_container=${RANK1_CONTAINER_OVERRIDE:-tzq_npu_static_r2_rank1_20260720}
+rank2_container=${RANK2_CONTAINER_OVERRIDE:-tzq_npu_static_r2_rank2_20260719}
+rank3_container=${RANK3_CONTAINER_OVERRIDE:-tzq_npu_static_r2_rank3_20260719}
+
+launch_remote 192.168.0.190 1 "${rank1_container}" &
 rank1_pid=$!
-launch_remote 192.168.0.109 2 tzq_npu_static_r2_rank2_20260719 &
+launch_remote 192.168.0.109 2 "${rank2_container}" &
 rank2_pid=$!
-launch_remote 192.168.0.9 3 tzq_npu_static_r2_rank3_20260719 &
+launch_remote 192.168.0.9 3 "${rank3_container}" &
 rank3_pid=$!
 
 docker exec \
   "${common_env[@]}" \
   -e NODE_RANK=0 \
   -w "${source_root}" \
-  tzq_npu_coremoe_verify_20260717 \
+  "${rank0_container}" \
   bash "${launcher}" \
   >"${host_root}/${run_name}_rank0.host.log" 2>&1
 rank0_rc=$?

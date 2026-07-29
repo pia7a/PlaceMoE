@@ -8,6 +8,10 @@ from tests.tools.launch_utils import torchrun
 from veomni.distributed.moe.hiermoe import expert_swap as expert_swap_module
 from veomni.distributed.moe.hiermoe.perf_model import HierMoEPerfModel
 from veomni.distributed.moe.hiermoe.topology import Hierarchy
+from veomni.distributed.parallel_plan import (
+    _hiermoe_static_preload_layouts,
+    _hiermoe_static_preload_shard,
+)
 
 
 class _FakeExperts(nn.Module):
@@ -16,6 +20,71 @@ class _FakeExperts(nn.Module):
         self.num_experts = 4
         self.gate_up_proj = nn.Parameter(torch.arange(6, dtype=torch.float32).view(3, 2, 1))
         self.down_proj = nn.Parameter(torch.arange(6, dtype=torch.float32).view(3, 1, 2))
+
+
+def test_static_preload_shards_checkpoint_by_final_slot_layout(tmp_path, monkeypatch):
+    key = "layers.0.mlp.experts"
+    replay_path = tmp_path / "layout.json"
+    replay_path.write_text(
+        json.dumps(
+            {
+                "layers": {
+                    key: {
+                        "slot_to_logical": [3, 0, 1, 3, 2, 0],
+                    }
+                }
+            }
+        )
+    )
+    _hiermoe_static_preload_layouts.cache_clear()
+    monkeypatch.setenv("VEOMNI_HIERMOE_STATIC_PRELOAD_LAYOUT_PATH", str(replay_path))
+    tensor = torch.arange(8, dtype=torch.float32).view(4, 2)
+
+    rank0 = _hiermoe_static_preload_shard(
+        tensor,
+        f"{key}.down_proj",
+        (3, 2),
+        para_rank=0,
+    )
+    rank1 = _hiermoe_static_preload_shard(
+        tensor,
+        f"{key}.down_proj",
+        (3, 2),
+        para_rank=1,
+    )
+
+    torch.testing.assert_close(rank0, tensor.index_select(0, torch.tensor([3, 0, 1])))
+    torch.testing.assert_close(rank1, tensor.index_select(0, torch.tensor([3, 2, 0])))
+
+
+def test_static_preload_zero_fills_inactive_slots(tmp_path, monkeypatch):
+    key = "layers.0.mlp.experts"
+    replay_path = tmp_path / "layout_with_empty.json"
+    replay_path.write_text(
+        json.dumps(
+            {
+                "layers": {
+                    key: {
+                        "slot_to_logical": [3, -1, 1, 2],
+                    }
+                }
+            }
+        )
+    )
+    _hiermoe_static_preload_layouts.cache_clear()
+    monkeypatch.setenv("VEOMNI_HIERMOE_STATIC_PRELOAD_LAYOUT_PATH", str(replay_path))
+    tensor = torch.arange(8, dtype=torch.float32).view(4, 2)
+
+    shard = _hiermoe_static_preload_shard(
+        tensor,
+        f"{key}.down_proj",
+        (4, 2),
+        para_rank=0,
+    )
+
+    torch.testing.assert_close(shard[0], tensor[3])
+    torch.testing.assert_close(shard[1], torch.zeros_like(shard[1]))
+    torch.testing.assert_close(shard[2:], tensor.index_select(0, torch.tensor([1, 2])))
 
 
 def _manager(monkeypatch, replay_path, *, migration_mode="blocking", grad_mode="blocking"):
@@ -196,6 +265,99 @@ def test_ablation_replay_installs_owner_and_source_route_metadata(tmp_path, monk
     assert layer.source_logical_to_physical.tolist() == [
         [1, 0, 3, 4],
         [1, 0, 5, 4],
+    ]
+    manager.shutdown_pipeline()
+
+
+def test_static_ablation_collapses_all_steps_into_one_plan_per_layer(tmp_path, monkeypatch):
+    key = "layers.0.mlp.experts"
+    replay_path = tmp_path / "replay.json"
+    replay_path.write_text(
+        json.dumps(
+            {
+                "topology": {"ep_size": 2},
+                "replay": {
+                    "actions_by_step": {
+                        "1": [{"layer": key, "kind": "replica", "body": "0->5"}],
+                        "2": [{"layer": key, "kind": "replica", "body": "3->2"}],
+                    }
+                },
+                "layers": {
+                    key: {
+                        "slot_to_logical": [0, 1, 3, 2, 3, 0],
+                    }
+                },
+            }
+        )
+    )
+    manager = _manager(monkeypatch, replay_path)
+    manager.register_layer(key, _FakeExperts())
+    layer = manager.layers[key]
+    layer.slot_to_logical = torch.tensor([0, 1, 1, 2, 3, -1], dtype=torch.long)
+    manager._refresh_layer_mapping_from_slots(layer, (0, 1, 3, 4))
+    manager._ablation_initial_layout = "fixed_r2"
+    monkeypatch.setattr(expert_swap_module, "_FIXED_R2_LAYOUT", True)
+    monkeypatch.setattr(expert_swap_module, "synchronize", lambda: None)
+
+    executed: list[tuple[str, int]] = []
+
+    def execute(current_layer, plan, **_kwargs):
+        executed.append((current_layer.key, len(plan.actions)))
+        current_layer.slot_to_logical = torch.tensor(plan.final_layout, dtype=torch.long)
+        manager._refresh_layer_mapping_from_slots(current_layer, plan.final_owner_slots)
+        return [f"{current_layer.key}:{action.format()}" for action in plan.actions]
+
+    monkeypatch.setattr(manager, "_execute_placement_plan", execute)
+    manager._install_static_ablation_layout()
+
+    assert executed == [(key, 2)]
+    assert layer.slot_to_logical.tolist() == [0, 1, 3, 2, 3, 0]
+    manager.shutdown_pipeline()
+
+
+def test_static_preload_installs_metadata_without_expert_transfer(tmp_path, monkeypatch):
+    key = "layers.0.mlp.experts"
+    replay_path = tmp_path / "preloaded.json"
+    replay_path.write_text(
+        json.dumps(
+            {
+                "topology": {"ep_size": 2},
+                "replay": {
+                    "actions_by_step": {
+                        "1": [{"layer": key, "kind": "replica", "body": "0->5"}],
+                        "2": [{"layer": key, "kind": "replica", "body": "3->2"}],
+                    }
+                },
+                "layers": {
+                    key: {
+                        "slot_to_logical": [0, 1, 3, 2, 3, 0],
+                        "owner_slots": [0, 1, 3, 4],
+                        "source_logical_to_physical": [
+                            [0, 1, 3, 4],
+                            [5, 1, 3, 4],
+                        ],
+                    }
+                },
+            }
+        )
+    )
+    manager = _manager(monkeypatch, replay_path)
+    manager.register_layer(key, _FakeExperts())
+    monkeypatch.setattr(expert_swap_module, "_STATIC_PRELOAD_LAYOUT_PATH", str(replay_path))
+    monkeypatch.setattr(
+        manager,
+        "_execute_placement_plan",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected transfer")),
+    )
+
+    manager._install_static_ablation_layout()
+    layer = manager.layers[key]
+
+    assert layer.slot_to_logical.tolist() == [0, 1, 3, 2, 3, 0]
+    assert layer.logical_to_physical.tolist() == [0, 1, 3, 4]
+    assert layer.source_logical_to_physical.tolist() == [
+        [0, 1, 3, 4],
+        [5, 1, 3, 4],
     ]
     manager.shutdown_pipeline()
 

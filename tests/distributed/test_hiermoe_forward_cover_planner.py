@@ -41,6 +41,7 @@ from veomni.distributed.moe.hiermoe.planner import PlacementAction
 from veomni.distributed.moe.hiermoe.statistical_scorer import (
     prepare_forward_lut_cover_compact_statistics,
     score_forward_lut_cover_compact_statistics,
+    score_forward_lut_move_compact_statistics,
     statistical_forward_lut_cover_local_deltas,
 )
 from veomni.distributed.moe.hiermoe.topology import Hierarchy
@@ -867,10 +868,7 @@ def test_statistical_forward_lut_cover_deltas_match_individual_patch_replay():
         ),
     )
     rows = torch.tensor(
-        [
-            [1, action.src_slot, action.dst_slot, action.src_logical, action.dst_logical]
-            for action in actions
-        ],
+        [[1, action.src_slot, action.dst_slot, action.src_logical, action.dst_logical] for action in actions],
         dtype=torch.long,
     )
     fallbacks = torch.tensor([2, 6], dtype=torch.long)
@@ -930,6 +928,54 @@ def test_statistical_forward_lut_cover_deltas_match_individual_patch_replay():
         torch.testing.assert_close(
             assignment_delta[index],
             exact.assignment_count_delta,
+        )
+
+
+def test_compact_forward_lut_move_statistics_match_exact_physical_routes():
+    selected = _toy_inputs()["selected_experts"]
+    assert isinstance(selected, torch.Tensor)
+    hierarchy = Hierarchy(ep_size=4, group_sizes=(2, 4), source="test")
+    planner = GreedyCommunicationPlanner(
+        hierarchy=hierarchy,
+        perf_model=HierMoEPerfModel.default(),
+        hidden_size=8,
+        bytes_per_element=2,
+        slots_per_rank=2,
+    )
+    source_lut = torch.tensor([0, 1, 3, 5], dtype=torch.long)
+    experts = torch.tensor([0, 3], dtype=torch.long)
+    destination_slots = torch.tensor([7, 6], dtype=torch.long)
+    statistics = prepare_forward_lut_cover_compact_statistics(
+        planner,
+        selected,
+        source_logical_to_physical=source_lut,
+        num_experts=4,
+    )
+
+    communication_delta, assignment_delta = score_forward_lut_move_compact_statistics(
+        planner,
+        statistics,
+        experts,
+        destination_slots,
+        source_logical_to_physical=source_lut,
+        num_experts=4,
+    )
+    baseline_physical = source_lut.index_select(0, selected.reshape(-1)).view_as(selected)
+    baseline_communication = planner._local_packed_counts(baseline_physical)
+    baseline_assignment = planner._local_packed_assignment_counts(baseline_physical)
+
+    for index, (expert, destination) in enumerate(zip(experts, destination_slots, strict=True)):
+        candidate_physical = baseline_physical.clone()
+        candidate_physical[selected == expert] = destination
+        exact_communication_delta = planner._local_packed_counts(candidate_physical) - baseline_communication
+        exact_assignment_delta = planner._local_packed_assignment_counts(candidate_physical) - baseline_assignment
+        torch.testing.assert_close(
+            communication_delta[index],
+            exact_communication_delta.squeeze(0),
+        )
+        torch.testing.assert_close(
+            assignment_delta[index],
+            exact_assignment_delta.squeeze(0)[: planner.ep_size],
         )
 
 

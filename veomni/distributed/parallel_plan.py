@@ -13,7 +13,11 @@
 # limitations under the License.
 
 
+import json
+import os
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Dict, Union
 
 import torch
@@ -25,6 +29,62 @@ from .utils import check_fqn_match, get_module_from_path, set_module_from_path
 
 
 logger = logging.get_logger(__name__)
+
+
+@lru_cache(maxsize=4)
+def _hiermoe_static_preload_layouts(path: str) -> dict[str, tuple[int, ...]]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    raw_layers = payload.get("layers")
+    if not isinstance(raw_layers, dict) or not raw_layers:
+        raise ValueError(f"HierMoE static preload file {path!r} has no layer layouts.")
+    layouts: dict[str, tuple[int, ...]] = {}
+    for layer_key, raw_layer in raw_layers.items():
+        if not isinstance(raw_layer, dict) or "slot_to_logical" not in raw_layer:
+            raise ValueError(f"HierMoE static preload layer {layer_key!r} has no slot_to_logical.")
+        layouts[str(layer_key)] = tuple(int(value) for value in raw_layer["slot_to_logical"])
+    return layouts
+
+
+def _hiermoe_static_preload_shard(
+    tensor: "torch.Tensor",
+    parameter_name: str,
+    target_shape: tuple,
+    *,
+    para_rank: int,
+) -> "torch.Tensor | None":
+    path = os.environ.get("VEOMNI_HIERMOE_STATIC_PRELOAD_LAYOUT_PATH", "").strip()
+    if not path:
+        return None
+    layer_key = parameter_name.rsplit(".", maxsplit=1)[0]
+    layouts = _hiermoe_static_preload_layouts(path)
+    if layer_key not in layouts:
+        raise ValueError(f"HierMoE static preload file {path!r} has no layer {layer_key!r}.")
+    local_slots = int(target_shape[0])
+    slot_start = int(para_rank) * local_slots
+    slot_end = slot_start + local_slots
+    layout = layouts[layer_key]
+    if slot_end > len(layout):
+        raise ValueError(
+            f"HierMoE static preload layer {layer_key!r} has {len(layout)} slots, "
+            f"cannot load EP rank {para_rank} slots [{slot_start}, {slot_end})."
+        )
+    logical_experts = layout[slot_start:slot_end]
+    if any(logical < -1 or logical >= int(tensor.shape[0]) for logical in logical_experts):
+        raise ValueError(
+            f"HierMoE static preload layer {layer_key!r} contains an invalid expert "
+            f"for EP rank {para_rank}: {logical_experts}."
+        )
+    result = tensor.new_zeros(target_shape)
+    active_slots = [slot for slot, logical in enumerate(logical_experts) if logical >= 0]
+    if active_slots:
+        slot_indices = torch.tensor(active_slots, dtype=torch.long, device=tensor.device)
+        indices = torch.tensor(
+            [logical_experts[slot] for slot in active_slots],
+            dtype=torch.long,
+            device=tensor.device,
+        )
+        result.index_copy_(0, slot_indices, tensor.index_select(0, indices))
+    return result
 
 
 def _is_hiermoe_redundant_slot_expert_param(
@@ -214,6 +274,19 @@ class ParallelPlan:
                         if parallel_state.extra_parallel_enabled(shard_group)
                         else 0
                     )
+                    preloaded = _hiermoe_static_preload_shard(
+                        tensor,
+                        parameter_name,
+                        target_shape,
+                        para_rank=para_rank,
+                    )
+                    if preloaded is not None:
+                        logger.info_rank0(
+                            f"{shard_group} parameter {parameter_name}: preloaded final HierMoE layout "
+                            f"{tensor.shape} -> {tuple(preloaded.shape)} for "
+                            f"{shard_group} rank {para_rank}/{para_size}"
+                        )
+                        return preloaded
                     start_idx = para_rank * base_shard
                     end_idx = start_idx + base_shard
                     padded = tensor.new_zeros(target_shape)
