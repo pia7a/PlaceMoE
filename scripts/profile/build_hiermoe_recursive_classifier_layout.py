@@ -36,15 +36,17 @@ from sklearn.cluster import MiniBatchKMeans
 
 from scripts.profile.build_hiermoe_hierarchical_init_layout import (
     HybridCost,
-    _balanced_spectral_partition,
     _HybridEvaluator,
     _load_routes,
     _mirrored_r2,
     _replay_payload,
 )
 from veomni.distributed.moe.hiermoe.placemoe import (
+    PartitionConfig,
     ProfileStatistics,
     build_replica_allocations,
+    map_groups_to_locations,
+    partition_items,
     profile_route_statistics,
     project_statistics_to_copies,
     uniform_copy_statistics,
@@ -256,6 +258,17 @@ def _source_statistics(
     return statistics.demand.copy(), statistics.affinity.copy()
 
 
+def _partition_coefficients(args: argparse.Namespace) -> tuple[float, float, float]:
+    """Return calibrated inter-node, intra-node, and compute coefficients."""
+
+    payload_bytes = float(args.hidden_size * args.bytes_per_element)
+    communication_multiplier = float(args.communication_phase_multiplier)
+    node_omega = communication_multiplier * payload_bytes * float(args.inter_ms_per_byte)
+    rank_omega = communication_multiplier * payload_bytes * float(args.intra_ms_per_byte)
+    gamma = float(args.compute_phase_multiplier) * float(args.compute_ms_per_assignment)
+    return node_omega, rank_omega, gamma
+
+
 def _logical_base_partitions(
     affinity: np.ndarray,
     demand: np.ndarray,
@@ -264,60 +277,31 @@ def _logical_base_partitions(
     restarts: int,
     iterations: int,
     seed: int,
+    omega: float = 1.0,
+    gamma: float = 1.0,
 ) -> list[np.ndarray]:
     num_experts = int(affinity.shape[0])
     if num_experts % num_nodes:
         raise ValueError("Logical experts must divide evenly across nodes.")
+    config = PartitionConfig(
+        capacities=(num_experts // num_nodes,) * num_nodes,
+        ranks_per_group=(1,) * num_nodes,
+        omega=omega,
+        gamma=gamma,
+        restarts=restarts,
+        exchange_limit=iterations,
+        seed=seed,
+    )
     results: list[np.ndarray] = []
-    seen: set[bytes] = set()
-    load_weights = (0.0, 2.0, 8.0, 16.0)
-    for restart in range(restarts):
-        direct_labels = _balanced_spectral_partition(
-            affinity,
-            demand,
-            parts=num_nodes,
-            capacity=num_experts // num_nodes,
-            seed=seed + 7919 * restart,
-            load_weight=load_weights[restart % len(load_weights)],
-            iterations=iterations,
+    for result in partition_items(affinity, demand, config):
+        groups = sorted(
+            (tuple(np.flatnonzero(result.labels == label).tolist()) for label in range(num_nodes)),
+            key=lambda row: row,
         )
-        candidates = [direct_labels]
-        if num_nodes == 4:
-            super_labels = _balanced_spectral_partition(
-                affinity,
-                demand,
-                parts=2,
-                capacity=num_experts // 2,
-                seed=seed + 7919 * restart + 313,
-                load_weight=load_weights[restart % len(load_weights)],
-                iterations=iterations,
-            )
-            recursive_labels = np.full((num_experts,), -1, dtype=np.int64)
-            for super_group in range(2):
-                members = np.flatnonzero(super_labels == super_group)
-                sublabels = _balanced_spectral_partition(
-                    affinity[np.ix_(members, members)],
-                    demand[members],
-                    parts=2,
-                    capacity=num_experts // 4,
-                    seed=seed + 7919 * restart + 617 * (super_group + 1),
-                    load_weight=load_weights[restart % len(load_weights)],
-                    iterations=iterations,
-                )
-                recursive_labels[members] = 2 * super_group + sublabels
-            candidates.append(recursive_labels)
-        for labels in candidates:
-            groups = sorted(
-                (tuple(sorted(np.flatnonzero(labels == label).tolist())) for label in range(num_nodes)),
-                key=lambda row: row,
-            )
-            canonical = np.full_like(labels, -1)
-            for label, experts in enumerate(groups):
-                canonical[list(experts)] = label
-            key = canonical.tobytes()
-            if key not in seen:
-                seen.add(key)
-                results.append(canonical)
+        canonical = np.full_like(result.labels, -1)
+        for label, experts in enumerate(groups):
+            canonical[list(experts)] = label
+        results.append(canonical)
     return results
 
 
@@ -352,6 +336,8 @@ def _replica_allocations(
     iterations: int,
     seed: int,
     candidate_limit: int,
+    omega: float = 1.0,
+    gamma: float = 1.0,
 ) -> list[np.ndarray]:
     """Return exact-size replica multisets for any feasible global budget.
 
@@ -394,6 +380,8 @@ def _replica_allocations(
             restarts=restarts,
             iterations=iterations,
             seed=seed,
+            omega=omega,
+            gamma=gamma,
         )
     )
     return build_replica_allocations(
@@ -902,16 +890,11 @@ def _map_clusters_to_locations(
     *,
     sources_by_location: list[np.ndarray],
 ) -> np.ndarray:
-    parts = len(sources_by_location)
-    benefit = np.zeros((parts, parts), dtype=np.float64)
-    for cluster in range(parts):
-        members = np.flatnonzero(labels == cluster)
-        for location, sources in enumerate(sources_by_location):
-            benefit[cluster, location] = demand_by_source[np.ix_(sources, members)].sum()
-    clusters, locations = linear_sum_assignment(-benefit)
-    cluster_to_location = np.empty((parts,), dtype=np.int64)
-    cluster_to_location[clusters] = locations
-    return cluster_to_location[labels]
+    return map_groups_to_locations(
+        labels,
+        demand_by_source,
+        sources_by_location=sources_by_location,
+    )
 
 
 def _hyperedge_instance_nodes(
@@ -964,46 +947,6 @@ def _hyperedge_instance_nodes(
     if not bool((np.bincount(instance_nodes, minlength=num_nodes) == capacity).all()):
         raise RuntimeError("Hyperedge node-library assignment violates node capacity.")
     return instance_nodes
-
-
-def _classify_ranks_with_fixed_nodes(
-    instance_nodes: np.ndarray,
-    instance_demand: np.ndarray,
-    instance_affinity: np.ndarray,
-    *,
-    ranks_per_node: int,
-    slots_per_rank: int,
-    seed: int,
-    iterations: int,
-    load_weight: float,
-) -> np.ndarray:
-    affinity = instance_affinity.sum(axis=0)
-    demand = instance_demand.sum(axis=0)
-    num_nodes = int(instance_nodes.max()) + 1
-    instance_ranks = np.full_like(instance_nodes, -1)
-    for node in range(num_nodes):
-        members = np.flatnonzero(instance_nodes == node)
-        if len(members) != ranks_per_node * slots_per_rank:
-            raise RuntimeError("Fixed node library does not match its physical capacity.")
-        local_labels = _balanced_spectral_partition(
-            affinity[np.ix_(members, members)],
-            demand[members],
-            parts=ranks_per_node,
-            capacity=slots_per_rank,
-            seed=seed + 104729 * (node + 1),
-            load_weight=load_weight,
-            iterations=max(8, iterations // 2),
-        )
-        rank_sources = [np.asarray([node * ranks_per_node + lane], dtype=np.int64) for lane in range(ranks_per_node)]
-        mapped_lanes = _map_clusters_to_locations(
-            local_labels,
-            instance_demand[:, members],
-            sources_by_location=rank_sources,
-        )
-        instance_ranks[members] = node * ranks_per_node + mapped_lanes
-    if bool((instance_ranks < 0).any()):
-        raise RuntimeError("Fixed-node rank classification is incomplete.")
-    return instance_ranks
 
 
 def _greedy_ranks_with_fixed_nodes(
@@ -1185,7 +1128,9 @@ def _classify_instances(
     slots_per_rank: int,
     seed: int,
     iterations: int,
-    load_weight: float,
+    node_omega: float,
+    rank_omega: float,
+    gamma: float,
 ) -> np.ndarray:
     instances = int(instance_demand.shape[1])
     num_nodes = ep_size // ranks_per_node
@@ -1193,15 +1138,16 @@ def _classify_instances(
         raise ValueError("Instance count must equal the physical slot capacity.")
     affinity = instance_affinity.sum(axis=0)
     demand = instance_demand.sum(axis=0)
-    node_labels = _balanced_spectral_partition(
-        affinity,
-        demand,
-        parts=num_nodes,
-        capacity=instances // num_nodes,
+    node_config = PartitionConfig(
+        capacities=(instances // num_nodes,) * num_nodes,
+        ranks_per_group=(ranks_per_node,) * num_nodes,
+        omega=node_omega,
+        gamma=gamma,
+        restarts=1,
+        exchange_limit=iterations,
         seed=seed,
-        load_weight=load_weight,
-        iterations=iterations,
     )
+    node_labels = partition_items(affinity, demand, node_config)[0].labels
     node_sources = [
         np.arange(node * ranks_per_node, (node + 1) * ranks_per_node, dtype=np.int64) for node in range(num_nodes)
     ]
@@ -1214,15 +1160,20 @@ def _classify_instances(
     instance_ranks = np.full((instances,), -1, dtype=np.int64)
     for node in range(num_nodes):
         members = np.flatnonzero(instance_nodes == node)
-        local_labels = _balanced_spectral_partition(
+        rank_config = PartitionConfig(
+            capacities=(slots_per_rank,) * ranks_per_node,
+            ranks_per_group=(1,) * ranks_per_node,
+            omega=rank_omega,
+            gamma=gamma,
+            restarts=1,
+            exchange_limit=max(1, iterations // 2),
+            seed=seed + 104729 * (node + 1),
+        )
+        local_labels = partition_items(
             affinity[np.ix_(members, members)],
             demand[members],
-            parts=ranks_per_node,
-            capacity=slots_per_rank,
-            seed=seed + 104729 * (node + 1),
-            load_weight=load_weight,
-            iterations=max(8, iterations // 2),
-        )
+            rank_config,
+        )[0].labels
         rank_sources = [np.asarray([node * ranks_per_node + lane], dtype=np.int64) for lane in range(ranks_per_node)]
         mapped_lanes = _map_clusters_to_locations(
             local_labels,
@@ -1531,7 +1482,10 @@ def _build_candidate(
             logical_instances=logical_instances,
         )
     best: _Candidate | None = None
-    load_weights = (8.0, 32.0, 128.0)
+    node_omega, rank_omega, gamma = _partition_coefficients(args)
+    if communication_blind:
+        node_omega = 0.0
+        rank_omega = 0.0
     for alternation in range(args.alternations):
         if fixed_instance_nodes is None:
             instance_ranks = _classify_instances(
@@ -1543,7 +1497,9 @@ def _build_candidate(
                 slots_per_rank=args.slots_per_rank,
                 seed=seed + 1009 * alternation,
                 iterations=args.partition_iterations,
-                load_weight=load_weights[alternation % len(load_weights)],
+                node_omega=node_omega,
+                rank_omega=rank_omega,
+                gamma=gamma,
             )
         else:
             instance_ranks = _greedy_ranks_with_fixed_nodes(
@@ -1762,6 +1718,9 @@ def _plan_layer(
     # count previously rebuilt by a second complete route scan.
     demand_by_rank = source_demand
     affinity = source_affinity.sum(axis=0)
+    node_omega, _, gamma = _partition_coefficients(args)
+    if args.communication_blind_proposals:
+        node_omega = 0.0
     partitions = _logical_base_partitions(
         affinity,
         demand_by_rank.sum(axis=0),
@@ -1769,6 +1728,8 @@ def _plan_layer(
         restarts=args.partition_restarts,
         iterations=args.partition_iterations,
         seed=args.seed + 100_003 * layer,
+        omega=node_omega,
+        gamma=gamma,
     )
     replica_allocations = _replica_allocations(
         affinity,
@@ -1778,6 +1739,8 @@ def _plan_layer(
         iterations=args.partition_iterations,
         seed=args.seed + 100_003 * layer + 53_123,
         candidate_limit=args.replica_candidate_limit,
+        omega=node_omega,
+        gamma=gamma,
     )
     candidates: list[_Candidate] = []
     candidate_jobs: list[dict[str, object]] = []

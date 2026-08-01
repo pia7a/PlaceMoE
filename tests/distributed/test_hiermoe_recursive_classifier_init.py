@@ -412,7 +412,9 @@ def test_generic_classifier_places_full_r2_on_two_and_eight_nodes(ep_size: int) 
         slots_per_rank=2 * num_experts // ep_size,
         seed=3,
         iterations=2,
-        load_weight=8.0,
+        node_omega=1.0,
+        rank_omega=0.1,
+        gamma=1.0,
     )
 
     assert bool((np.bincount(instance_ranks, minlength=ep_size) == 2 * num_experts // ep_size).all())
