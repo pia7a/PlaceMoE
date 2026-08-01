@@ -74,7 +74,7 @@ build_layout() {
   fi
 
   echo "building ${stem}"
-  "${rank0_exec[@]}" python scripts/profile/build_hiermoe_recursive_classifier_layout.py \
+  "${rank0_exec[@]}" python scripts/profile/plan_placemoe.py \
     --route-root "${paper32_container_source_root}/route_captures/${profile_name}" \
     --optimize-steps 0,1,2 \
     --validation-steps 3 \

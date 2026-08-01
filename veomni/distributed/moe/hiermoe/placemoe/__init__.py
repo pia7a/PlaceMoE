@@ -15,6 +15,7 @@
 """Canonical profile-guided PlaceMoE optimizer APIs."""
 
 from .allocation import bounded_group_shortlist, build_replica_allocations
+from .artifacts import PLACEMOE_ARTIFACT_SCHEMA_VERSION, build_placemoe_artifact, validate_placemoe_artifact
 from .mapping import (
     MappingConfig,
     MappingResult,
@@ -50,9 +51,11 @@ __all__ = [
     "PlacementConfig",
     "PlacementResult",
     "PlaceMoETopology",
+    "PLACEMOE_ARTIFACT_SCHEMA_VERSION",
     "ProfileStatistics",
     "bounded_group_shortlist",
     "build_replica_allocations",
+    "build_placemoe_artifact",
     "initialize_mapping",
     "map_groups_to_locations",
     "materialize_plan",
@@ -68,4 +71,5 @@ __all__ = [
     "repair_rank_placement",
     "uniform_copy_statistics",
     "validate_instance_mapping",
+    "validate_placemoe_artifact",
 ]

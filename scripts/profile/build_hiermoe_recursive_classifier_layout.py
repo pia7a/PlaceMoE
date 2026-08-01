@@ -1,20 +1,13 @@
 #!/usr/bin/env python3
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 
-"""Build a capacity-general hierarchical expert layout from captured routes.
+"""Compatibility implementation behind the canonical PlaceMoE planner CLI.
 
-The offline initializer has three independent stages:
-
-1. classify the unique logical experts into topology-derived balanced groups;
-2. allocate an exact arbitrary replica budget from affinity classes;
-3. jointly classify unique and redundant physical instances into nodes and
-   ranks while alternating with the static source-rank routing LUT.
-
-Affinity and assignment load propose complete states.  The existing exact
-HierMoE hybrid evaluator selects states, so the emitted Forward LUT and the
-offline cost model always use the same physical routes. Uniformly reserved
-but inactive physical slots are represented as EMPTY and can be preloaded as
-zero-filled expert state.
+The default path profiles source-conditioned demand and affinity, generates
+exact-budget replica allocations, alternates calibrated hierarchical layout
+and mapping updates, and selects the lowest-cost pair by complete-route replay.
+Legacy structured and hyperedge candidates are available only through explicit
+baseline flags. New launchers should invoke ``scripts/profile/plan_placemoe.py``.
 """
 
 from __future__ import annotations
@@ -39,15 +32,16 @@ from scripts.profile.build_hiermoe_hierarchical_init_layout import (
     _HybridEvaluator,
     _load_routes,
     _mirrored_r2,
-    _replay_payload,
 )
 from veomni.distributed.moe.hiermoe.placemoe import (
+    LayerPlan,
     MappingConfig,
     OptimizerConfig,
     PartitionConfig,
     PlacementConfig,
     PlaceMoETopology,
     ProfileStatistics,
+    build_placemoe_artifact,
     build_replica_allocations,
     initialize_mapping,
     map_groups_to_locations,
@@ -196,14 +190,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--hyperedge-token-sample", type=int, default=16384)
     parser.add_argument("--structured-shortlist", type=int, default=2)
     parser.add_argument(
-        "--generic-instance-seed",
+        "--include-legacy-structured-candidates",
         action="store_true",
-        help="Also evaluate the weaker uniform-copy instance-partition seed.",
+        help="Also evaluate the four-node structured-degree2 baseline candidates.",
     )
     parser.add_argument(
-        "--hyperedge-seed",
+        "--include-legacy-hyperedge-candidates",
         action="store_true",
-        help="Also evaluate the denser token-KMeans node-library seed.",
+        help="Also evaluate the token-KMeans hyperedge baseline candidates.",
     )
     parser.add_argument(
         "--communication-blind-proposals",
@@ -1390,43 +1384,33 @@ def _preloaded_replay_payload(
     args: argparse.Namespace,
     algorithm: str,
 ) -> dict[str, object]:
-    """Serialize layouts with inactive slots for direct startup preload.
+    """Serialize validated plans for direct startup preload or a hot update."""
 
-    The legacy replay action language normalizes a full layout through owner
-    swaps and replica fills. It cannot represent an arbitrary inactive-slot
-    distribution without temporary actions, while the runtime's static
-    preload path already validates and installs the exact layout atomically.
-    """
-
-    layers: dict[str, object] = {}
+    plans: dict[str, LayerPlan] = {}
     for offset, (layout, owner, lut) in enumerate(zip(layouts, owners, luts, strict=True)):
         layer = args.layer_start + offset
         name = args.layer_name_template.format(layer=layer)
-        layers[name] = {
-            "slot_to_logical": [int(value) for value in layout.tolist()],
-            "owner_slots": [int(value) for value in owner.tolist()],
-            "source_logical_to_physical": [[int(value) for value in row] for row in lut.tolist()],
-        }
-    return {
-        "schema_version": 2,
-        "source": {
-            "initial_layout": "preloaded",
+        plans[name] = LayerPlan(
+            slot_to_logical=layout,
+            owner_slots=owner,
+            source_logical_to_physical=lut,
+        )
+    return build_placemoe_artifact(
+        plans,
+        PlaceMoETopology(
+            ep_size=args.ep_size,
+            ranks_per_node=args.ranks_per_node,
+            num_experts=args.num_experts,
+            slots_per_rank=args.slots_per_rank,
+        ),
+        source={
             "algorithm": algorithm,
             "route_root": str(args.route_root.resolve()),
             "optimize_steps": list(args.optimize_steps),
             "validation_steps": list(args.validation_steps),
             "layer_name_template": args.layer_name_template,
-            "requires_static_preload": True,
         },
-        "topology": {
-            "ep_size": args.ep_size,
-            "num_experts": args.num_experts,
-            "num_physical_slots": args.ep_size * args.slots_per_rank,
-            "slots_per_rank": args.slots_per_rank,
-        },
-        "replay": {"actions_by_step": {"1": []}},
-        "layers": layers,
-    }
+    )
 
 
 def _plan_layer(
@@ -1494,7 +1478,6 @@ def _plan_layer(
     candidates: list[_Candidate] = []
     candidate_jobs: list[dict[str, object]] = []
     seen_replica_sets: set[tuple[bytes, bytes]] = set()
-    uniform_statistics: dict[bytes, tuple[np.ndarray, np.ndarray]] = {}
     cost_cache: dict[bytes, HybridCost] = {}
     for partition_index, partition in enumerate(partitions):
         for combination_index, replica_experts in enumerate(replica_allocations):
@@ -1507,16 +1490,15 @@ def _plan_layer(
                 replica_experts,
                 total_slots=args.ep_size * args.slots_per_rank,
             )
-            logical_key = logical_instances.tobytes()
             structured = (
-                []
-                if args.communication_blind_proposals
-                else _structured_instance_node_candidates(
+                _structured_instance_node_candidates(
                     partition,
                     logical_instances,
                     source_demand,
                     ranks_per_node=args.ranks_per_node,
                 )
+                if args.include_legacy_structured_candidates and not args.communication_blind_proposals
+                else []
             )
             structured_route_statistics = (
                 _group_route_statistics(
@@ -1527,25 +1509,15 @@ def _plan_layer(
                 if structured
                 else None
             )
-            if args.generic_instance_seed or not structured:
-                statistics = uniform_statistics.get(logical_key)
-                if statistics is None:
-                    statistics = _uniform_instance_statistics(
-                        logical_instances,
-                        source_demand,
-                        source_affinity,
-                    )
-                    uniform_statistics[logical_key] = statistics
-                candidate_jobs.append(
-                    {
-                        "logical_instances": logical_instances,
-                        "demand_by_source": source_demand,
-                        "affinity_by_source": source_affinity,
-                        "seed": args.seed + 100_003 * layer + 997 * partition_index + 31 * combination_index,
-                        "strategy": f"recursive_classifier_p{partition_index}_c{combination_index}",
-                        "initial_instance_statistics": statistics,
-                    }
-                )
+            candidate_jobs.append(
+                {
+                    "logical_instances": logical_instances,
+                    "demand_by_source": source_demand,
+                    "affinity_by_source": source_affinity,
+                    "seed": args.seed + 100_003 * layer + 997 * partition_index + 31 * combination_index,
+                    "strategy": f"placemoe_p{partition_index}_c{combination_index}",
+                }
+            )
             proxy_rows: list[tuple[float, str, np.ndarray, np.ndarray]] = []
             for structured_strategy, structured_nodes in structured:
                 coherent_lut, proxy_score = _group_coherent_node_lut(
@@ -1589,7 +1561,7 @@ def _plan_layer(
                         "fixed_initial_lut": coherent_lut,
                     }
                 )
-            if args.hyperedge_seed and not args.communication_blind_proposals:
+            if args.include_legacy_hyperedge_candidates and not args.communication_blind_proposals:
                 hyperedge_nodes = _hyperedge_instance_nodes(
                     optimize_samples,
                     logical_instances,
@@ -1659,7 +1631,6 @@ def _plan_layer(
         "planner_ms": layer_ms,
         "winner_planner_ms": best.planner_ms,
         "exact_route_evaluations": len(cost_cache),
-        "uniform_statistics_builds": len(uniform_statistics),
         "alternations": best.alternations,
         "copy_counts": [int(value) for value in copy_counts.tolist()],
         "optimize": asdict(best.optimize_cost),
@@ -1707,7 +1678,7 @@ def main() -> None:
         comparison_ms = float(args.comparison_validation_ms)
     report = {
         "schema_version": 1,
-        "algorithm": "capacity-general-recursive-classifier-v2",
+        "algorithm": "placemoe-v1",
         "configuration": {
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items()
@@ -1727,7 +1698,6 @@ def main() -> None:
             "workers": min(args.workers, len(layer_ids)),
             "candidate_workers": args.candidate_workers,
             "exact_route_evaluations": sum(int(row["exact_route_evaluations"]) for row in rows),
-            "uniform_statistics_builds": sum(int(row["uniform_statistics_builds"]) for row in rows),
             "comparison_validation_ms": comparison_ms,
             "validation_gain_ms": comparison_ms - validation_total,
             "validation_speedup": comparison_ms / validation_total,
@@ -1740,38 +1710,14 @@ def main() -> None:
             ),
         },
     }
-    serialization_mode = "preloaded"
-    serialization_reason = "inactive physical slots require exact static preload"
-    if not capacity.empty_slots:
-        try:
-            payload = _replay_payload(
-                layouts=layouts,
-                owners=owners,
-                luts=luts,
-                args=args,
-                algorithm="capacity-general-recursive-classifier-v2",
-            )
-            serialization_mode = "actions"
-            serialization_reason = ""
-        except RuntimeError as error:
-            serialization_reason = f"legacy action normalization is not feasible: {error}"
-            payload = _preloaded_replay_payload(
-                layouts=layouts,
-                owners=owners,
-                luts=luts,
-                args=args,
-                algorithm="capacity-general-recursive-classifier-v2",
-            )
-    else:
-        payload = _preloaded_replay_payload(
-            layouts=layouts,
-            owners=owners,
-            luts=luts,
-            args=args,
-            algorithm="capacity-general-recursive-classifier-v2",
-        )
-    report["aggregate"]["serialization_mode"] = serialization_mode
-    report["aggregate"]["serialization_reason"] = serialization_reason
+    payload = _preloaded_replay_payload(
+        layouts=layouts,
+        owners=owners,
+        luts=luts,
+        args=args,
+        algorithm="placemoe-v1",
+    )
+    report["aggregate"]["serialization_mode"] = "preloaded"
     for path, value in ((args.output_layout, payload), (args.output_report, report)):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")

@@ -32,7 +32,7 @@ if [[ ! -f "${source_root}/results/${ours_layout}" ]]; then
       -e "PYTHONPATH=${container_root}" \
       -w "${container_root}" \
       "${rank0_container}" \
-      python scripts/profile/build_hiermoe_recursive_classifier_layout.py \
+      python scripts/profile/plan_placemoe.py \
       --route-root "${container_root}/route_captures/${route_name}" \
       --optimize-steps 0,1,2 \
       --validation-steps 3 \

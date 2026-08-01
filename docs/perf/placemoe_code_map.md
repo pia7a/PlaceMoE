@@ -17,11 +17,30 @@ The paper describes the following data flow for each MoE layer:
 6. alternate `L` and `M` and select the pair with the lowest exact route cost;
 7. serialize the selected pair for static preload or a hot update.
 
-The current implementation of this flow is concentrated in
-`scripts/profile/build_hiermoe_recursive_classifier_layout.py`. During the
-refactor, reusable logic moves to
-`veomni/distributed/moe/hiermoe/placemoe/`; the script remains a compatibility
-CLI until launchers and tests use the package API directly.
+The reusable implementation now lives in
+`veomni/distributed/moe/hiermoe/placemoe/`:
+
+| Module | Paper responsibility |
+| --- | --- |
+| `statistics.py` | Source-conditioned demand and co-selection affinity. |
+| `allocation.py` | Exact-budget bounded replica-allocation shortlist. |
+| `partition.py` | Calibrated capacity-constrained affinity partitioning. |
+| `placement.py` | Node-to-rank placement, locality matching, and rank repair. |
+| `mapping.py` | Demand-ordered initialization and calibrated mapping update. |
+| `optimizer.py` | Bounded layout--mapping alternation and exact-cost callback. |
+| `materialize.py` | Physical-slot assignment and mapping relocation. |
+| `artifacts.py` | Validated schema-v2 runtime artifacts. |
+
+The canonical CLI is `scripts/profile/plan_placemoe.py`. The older
+`build_hiermoe_recursive_classifier_layout.py` name remains only as its
+compatibility implementation while downstream imports migrate.
+
+By default, the CLI evaluates only PlaceMoE candidates. The historical
+four-node structured-degree2 and token-KMeans hyperedge candidates remain
+available through `--include-legacy-structured-candidates` and
+`--include-legacy-hyperedge-candidates`; they are not part of the paper path.
+All successful runs emit the same preloaded schema-v2 artifact for both
+static startup and hot updates.
 
 ## Runtime modules retained by PlaceMoE
 

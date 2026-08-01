@@ -98,7 +98,7 @@ build_one_layer() {
     -e "PYTHONPATH=${container_root}" \
     -w "${container_root}" \
     "${rank0_container}" \
-    python scripts/profile/build_hiermoe_recursive_classifier_layout.py \
+    python scripts/profile/plan_placemoe.py \
     --route-root "${container_root}/route_captures/${profile_name}" \
     --optimize-steps "${ours_optimize_steps}" \
     --validation-steps "${ours_validation_steps}" \

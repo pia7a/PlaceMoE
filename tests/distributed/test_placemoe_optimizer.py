@@ -25,6 +25,7 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     PlaceMoETopology,
     ProfileStatistics,
     bounded_group_shortlist,
+    build_placemoe_artifact,
     build_replica_allocations,
     initialize_mapping,
     map_groups_to_locations,
@@ -38,6 +39,7 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     project_statistics_to_copies,
     repair_rank_placement,
     uniform_copy_statistics,
+    validate_placemoe_artifact,
 )
 
 
@@ -361,3 +363,18 @@ def test_optimizer_alternates_layout_and_mapping_with_exact_evaluation_callback(
     assert result.best.cost == min(candidate.cost for candidate in result.candidates)
     for candidate in result.candidates:
         candidate.plan.validate(topology, additional_copies=2)
+
+
+def test_artifact_schema_round_trip_validates_every_layer_plan():
+    topology = PlaceMoETopology(ep_size=2, ranks_per_node=1, num_experts=4, slots_per_rank=3)
+    plan = LayerPlan(
+        slot_to_logical=[0, 1, 0, 2, 3, 3],
+        owner_slots=[0, 1, 3, 4],
+        source_logical_to_physical=[[0, 1, 3, 4], [2, 1, 3, 5]],
+    )
+    payload = build_placemoe_artifact({"layers.0.experts": plan}, topology, source={"route_root": "/tmp/routes"})
+    restored = validate_placemoe_artifact(payload)
+    np.testing.assert_array_equal(restored["layers.0.experts"].slot_to_logical, plan.slot_to_logical)
+    payload["layers"]["layers.0.experts"]["source_logical_to_physical"][0][0] = 1
+    with pytest.raises(ValueError, match="wrong logical expert"):
+        validate_placemoe_artifact(payload)
