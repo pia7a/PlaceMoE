@@ -20,6 +20,7 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     LayerPlan,
     MappingConfig,
     PartitionConfig,
+    PlacementConfig,
     PlaceMoETopology,
     ProfileStatistics,
     bounded_group_shortlist,
@@ -29,8 +30,10 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     optimize_mapping,
     partition_items,
     partition_objective,
+    place_instances,
     profile_route_statistics,
     project_statistics_to_copies,
+    repair_rank_placement,
     uniform_copy_statistics,
 )
 
@@ -250,3 +253,47 @@ def test_calibrated_mapping_score_balances_affinity_reuse_and_compute_load():
     assert compute_aware.mapping[0, 0] == 0
     assert communication_only.peak_rank_load == 21
     assert compute_aware.peak_rank_load == 11
+
+
+def test_rank_repair_separates_copies_without_changing_node_membership():
+    config = PlacementConfig(
+        ep_size=2,
+        ranks_per_node=2,
+        slots_per_rank=2,
+        node_omega=1.0,
+        rank_omega=0.1,
+        gamma=1.0,
+    )
+    logical_instances = np.array([0, 0, 1, 1])
+    repaired = repair_rank_placement(
+        np.zeros((4,), dtype=np.int64),
+        np.array([5, 4, 3, 2], dtype=np.float64),
+        np.zeros((4, 4), dtype=np.float64),
+        logical_instances,
+        config,
+    )
+    np.testing.assert_array_equal(np.bincount(repaired, minlength=2), [2, 2])
+    for rank in range(2):
+        assert len(np.unique(logical_instances[repaired == rank])) == 2
+
+
+def test_hierarchical_placement_respects_rank_capacity_and_copy_uniqueness():
+    config = PlacementConfig(
+        ep_size=4,
+        ranks_per_node=2,
+        slots_per_rank=2,
+        node_omega=1.0,
+        rank_omega=0.1,
+        gamma=1.0,
+        node_exchange_limit=4,
+        rank_exchange_limit=2,
+        seed=7,
+    )
+    logical_instances = np.array([0, 1, 0, 1, 2, 3, 2, 3])
+    demand = np.ones((4, 8), dtype=np.float64)
+    affinity = np.zeros((4, 8, 8), dtype=np.float64)
+    result = place_instances(demand, affinity, logical_instances, config)
+    np.testing.assert_array_equal(np.bincount(result.instance_ranks, minlength=4), [2, 2, 2, 2])
+    for rank in range(4):
+        members = logical_instances[result.instance_ranks == rank]
+        assert len(members) == len(np.unique(members))

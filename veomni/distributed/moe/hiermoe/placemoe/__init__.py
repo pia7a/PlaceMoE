@@ -24,6 +24,13 @@ from .mapping import (
     validate_instance_mapping,
 )
 from .partition import PartitionConfig, PartitionResult, map_groups_to_locations, partition_items, partition_objective
+from .placement import (
+    PlacementConfig,
+    PlacementResult,
+    place_instances,
+    rank_placement_is_unique,
+    repair_rank_placement,
+)
 from .statistics import profile_route_statistics, project_statistics_to_copies, uniform_copy_statistics
 from .types import EMPTY_EXPERT, LayerPlan, PlaceMoETopology, ProfileStatistics
 
@@ -35,6 +42,8 @@ __all__ = [
     "MappingResult",
     "PartitionConfig",
     "PartitionResult",
+    "PlacementConfig",
+    "PlacementResult",
     "PlaceMoETopology",
     "ProfileStatistics",
     "bounded_group_shortlist",
@@ -45,8 +54,11 @@ __all__ = [
     "optimize_mapping",
     "partition_items",
     "partition_objective",
+    "place_instances",
     "profile_route_statistics",
     "project_statistics_to_copies",
+    "rank_placement_is_unique",
+    "repair_rank_placement",
     "uniform_copy_statistics",
     "validate_instance_mapping",
 ]
