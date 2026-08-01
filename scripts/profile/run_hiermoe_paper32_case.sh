@@ -94,6 +94,7 @@ case "${method}" in
       method_slug=$(paper32_method_slug "${method}")
       layout_stem=$(paper32_layout_stem "${method}")
     fi
+    layout_stem=${PAPER32_LAYOUT_STEM_OVERRIDE:-${layout_stem}}
     replay=${paper32_source_root}/results/${layout_stem}_layout.json
     layout_report=${paper32_source_root}/results/${layout_stem}_report.json
     if [[ (! -s "${replay}" || ! -s "${layout_report}") && "${PAPER32_DRY_RUN:-0}" != "1" ]]; then
