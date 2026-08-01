@@ -30,6 +30,11 @@ max_seq_len=${MAX_SEQ_LEN_OVERRIDE:-4096}
 full_route_gather_max_tokens=${HIERMOE_FULL_ROUTE_GATHER_MAX_TOKENS_OVERRIDE:-$((micro_batch_size * max_seq_len))}
 exact_p1_route_sample_size=${HIERMOE_EXACT_P1_ROUTE_SAMPLE_SIZE_OVERRIDE:-0}
 remote_single_ssh_attempts=${HIERMOE_REMOTE_SINGLE_SSH_ATTEMPTS:-1}
+remote_launch_stagger_seconds=${HIERMOE_REMOTE_LAUNCH_STAGGER_SECONDS:-0}
+if [[ ! "${remote_launch_stagger_seconds}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "HIERMOE_REMOTE_LAUNCH_STAGGER_SECONDS must be a nonnegative number" >&2
+  exit 2
+fi
 data_num_workers=${DATA_NUM_WORKERS_OVERRIDE:-4}
 data_prefetch_factor=${DATA_PREFETCH_FACTOR_OVERRIDE:-2}
 freeze_vit=${TRAIN_FREEZE_VIT_OVERRIDE:-false}
@@ -816,6 +821,9 @@ for ((node_rank = 1; node_rank < nnodes; ++node_rank)); do
     "${node_rank}" \
     "${rank_containers[${node_rank}]}" &
   rank_pids[${node_rank}]=$!
+  if [[ "${remote_launch_stagger_seconds}" != "0" ]]; then
+    sleep "${remote_launch_stagger_seconds}"
+  fi
 done
 
 if [[ -n "${rank0_host}" ]]; then
