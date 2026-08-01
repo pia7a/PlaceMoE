@@ -41,6 +41,7 @@ from scripts.profile.build_hiermoe_recursive_classifier_layout import (
     _materialize_layout,
     _optimize_lut_instances,
     _parse_int_list,
+    _partition_coefficients,
     _preloaded_replay_payload,
     _refine_balanced_partition,
     _source_statistics,
@@ -361,9 +362,7 @@ def _calibrated_lut(
     *,
     args: argparse.Namespace,
 ) -> np.ndarray:
-    node_affinity, rank_affinity, assignment = _cost_coefficients(args)
-    total_affinity = max(float(affinity_by_source.sum()), 1.0)
-    total_demand = max(float(demand_by_source.sum()), 1.0)
+    node_omega, rank_omega, gamma = _partition_coefficients(args)
     return _optimize_lut_instances(
         state.logical_instances,
         instance_ranks,
@@ -372,9 +371,9 @@ def _calibrated_lut(
         affinity_by_source,
         ranks_per_node=args.ranks_per_node,
         iterations=args.lut_iterations,
-        node_weight=node_affinity * total_affinity,
-        rank_weight=rank_affinity * total_affinity,
-        assignment_weight=assignment * total_demand,
+        node_omega=node_omega,
+        rank_omega=rank_omega,
+        gamma=gamma,
     )
 
 

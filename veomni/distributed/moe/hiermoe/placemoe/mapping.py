@@ -60,17 +60,19 @@ class MappingResult:
 def _validate_layout(
     logical_instances: np.ndarray,
     instance_ranks: np.ndarray,
-    statistics: ProfileStatistics,
+    *,
+    ep_size: int,
+    num_experts: int,
 ) -> tuple[np.ndarray, np.ndarray, tuple[np.ndarray, ...]]:
     logical_instances = np.asarray(logical_instances, dtype=np.int64)
     instance_ranks = np.asarray(instance_ranks, dtype=np.int64)
     if logical_instances.ndim != 1 or instance_ranks.shape != logical_instances.shape:
         raise ValueError("Logical instances and instance ranks must be matching vectors.")
-    if bool((instance_ranks < 0).any()) or bool((instance_ranks >= statistics.ep_size).any()):
+    if bool((instance_ranks < 0).any()) or bool((instance_ranks >= ep_size).any()):
         raise ValueError("Instance ranks must reference a source rank in the profile.")
-    if bool((logical_instances < -1).any()) or bool((logical_instances >= statistics.num_experts).any()):
+    if bool((logical_instances < -1).any()) or bool((logical_instances >= num_experts).any()):
         raise ValueError("Logical instances contain an invalid expert ID.")
-    choices = tuple(np.flatnonzero(logical_instances == expert) for expert in range(statistics.num_experts))
+    choices = tuple(np.flatnonzero(logical_instances == expert) for expert in range(num_experts))
     if any(len(expert_choices) == 0 for expert_choices in choices):
         raise ValueError("Every logical expert must have at least one physical copy.")
     return logical_instances, instance_ranks, choices
@@ -113,27 +115,32 @@ def mapping_rank_loads(
 def initialize_mapping(
     logical_instances: np.ndarray,
     instance_ranks: np.ndarray,
-    statistics: ProfileStatistics,
+    demand_by_source: np.ndarray,
     *,
     ranks_per_node: int,
     prefer_node_local: bool = True,
 ) -> np.ndarray:
     """Construct the paper's demand-ordered initial mapping."""
 
+    demand_by_source = np.asarray(demand_by_source, dtype=np.float64)
+    if demand_by_source.ndim != 2 or bool((demand_by_source < 0).any()):
+        raise ValueError("Source demand must be a non-negative [source_rank, expert] matrix.")
+    ep_size, num_experts = demand_by_source.shape
     logical_instances, instance_ranks, choices = _validate_layout(
         logical_instances,
         instance_ranks,
-        statistics,
+        ep_size=ep_size,
+        num_experts=num_experts,
     )
-    if statistics.ep_size % ranks_per_node:
+    if ep_size % ranks_per_node:
         raise ValueError("Profile EP size must be divisible by ranks_per_node.")
-    mapping = np.full((statistics.ep_size, statistics.num_experts), -1, dtype=np.int64)
-    rank_loads = np.zeros((statistics.ep_size,), dtype=np.float64)
+    mapping = np.full((ep_size, num_experts), -1, dtype=np.int64)
+    rank_loads = np.zeros((ep_size,), dtype=np.float64)
     jobs = sorted(
         (
-            (float(statistics.demand[source, expert]), source, expert)
-            for source in range(statistics.ep_size)
-            for expert in range(statistics.num_experts)
+            (float(demand_by_source[source, expert]), source, expert)
+            for source in range(ep_size)
+            for expert in range(num_experts)
         ),
         key=lambda row: (-row[0], row[1], row[2]),
     )
@@ -182,7 +189,8 @@ def optimize_mapping(
     logical_instances, instance_ranks, choices = _validate_layout(
         logical_instances,
         instance_ranks,
-        statistics,
+        ep_size=statistics.ep_size,
+        num_experts=statistics.num_experts,
     )
     if statistics.ep_size % config.ranks_per_node:
         raise ValueError("Profile EP size must be divisible by ranks_per_node.")

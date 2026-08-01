@@ -42,10 +42,13 @@ from scripts.profile.build_hiermoe_hierarchical_init_layout import (
     _replay_payload,
 )
 from veomni.distributed.moe.hiermoe.placemoe import (
+    MappingConfig,
     PartitionConfig,
     ProfileStatistics,
     build_replica_allocations,
+    initialize_mapping,
     map_groups_to_locations,
+    optimize_mapping,
     partition_items,
     profile_route_statistics,
     project_statistics_to_copies,
@@ -1257,37 +1260,13 @@ def _initial_lut_instances(
     ranks_per_node: int,
     prefer_local: bool = True,
 ) -> np.ndarray:
-    ep_size, num_experts = demand_by_source.shape
-    choices = [np.flatnonzero(logical_instances == expert) for expert in range(num_experts)]
-    lut = np.full((ep_size, num_experts), -1, dtype=np.int64)
-    rank_loads = np.zeros((ep_size,), dtype=np.float64)
-    jobs = [
-        (float(demand_by_source[source_rank, expert]), source_rank, expert)
-        for source_rank in range(ep_size)
-        for expert in range(num_experts)
-    ]
-    for amount, source_rank, expert in sorted(
-        jobs,
-        key=lambda row: (-row[0], row[1], row[2]),
-    ):
-        source_node = source_rank // ranks_per_node
-        local = choices[expert][instance_ranks[choices[expert]] // ranks_per_node == source_node]
-        candidates = local if prefer_local and len(local) else choices[expert]
-        best: tuple[tuple[float, ...], int] | None = None
-        for instance in candidates.tolist():
-            destination_rank = int(instance_ranks[instance])
-            key = (
-                rank_loads[destination_rank] + amount,
-                float(destination_rank),
-                float(instance),
-            )
-            if best is None or key < best[0]:
-                best = (key, instance)
-        if best is None:
-            raise RuntimeError(f"Logical expert {expert} has no physical instance.")
-        lut[source_rank, expert] = best[1]
-        rank_loads[int(instance_ranks[best[1]])] += amount
-    return lut
+    return initialize_mapping(
+        logical_instances,
+        instance_ranks,
+        demand_by_source,
+        ranks_per_node=ranks_per_node,
+        prefer_node_local=prefer_local,
+    )
 
 
 def _optimize_lut_instances(
@@ -1299,69 +1278,25 @@ def _optimize_lut_instances(
     *,
     ranks_per_node: int,
     iterations: int,
-    node_weight: float,
-    rank_weight: float,
-    assignment_weight: float,
+    node_omega: float,
+    rank_omega: float,
+    gamma: float,
 ) -> np.ndarray:
-    ep_size, num_experts = demand_by_source.shape
-    choices = [np.flatnonzero(logical_instances == expert) for expert in range(num_experts)]
-    lut = initial_lut.copy()
-    rank_loads = np.zeros((ep_size,), dtype=np.float64)
-    for source_rank in range(ep_size):
-        for expert in range(num_experts):
-            rank = int(instance_ranks[lut[source_rank, expert]])
-            rank_loads[rank] += demand_by_source[source_rank, expert]
-    total_affinity = max(float(affinity_by_source.sum()), 1.0)
-    total_demand = max(float(demand_by_source.sum()), 1.0)
-
-    for _ in range(max(0, iterations)):
-        changed = False
-        for source_rank in range(ep_size):
-            order = np.argsort(-demand_by_source[source_rank], kind="stable")
-            selected_ranks = instance_ranks[lut[source_rank]]
-            selected_nodes = selected_ranks // ranks_per_node
-            source_node = source_rank // ranks_per_node
-            for expert in order.tolist():
-                if len(choices[expert]) <= 1:
-                    continue
-                current_instance = int(lut[source_rank, expert])
-                current_rank = int(instance_ranks[current_instance])
-                amount = float(demand_by_source[source_rank, expert])
-                affinity_row = affinity_by_source[source_rank, expert]
-                best: tuple[float, int] | None = None
-                for candidate in choices[expert].tolist():
-                    candidate_rank = int(instance_ranks[candidate])
-                    candidate_node = candidate_rank // ranks_per_node
-                    projected = rank_loads.copy()
-                    projected[current_rank] -= amount
-                    projected[candidate_rank] += amount
-                    node_reward = float(affinity_row[selected_nodes == candidate_node].sum())
-                    rank_reward = float(affinity_row[selected_ranks == candidate_rank].sum())
-                    if candidate_node == source_node:
-                        node_reward += amount
-                    if candidate_rank == source_rank:
-                        rank_reward += amount
-                    score = (
-                        float(node_weight) * node_reward / total_affinity
-                        + float(rank_weight) * rank_reward / total_affinity
-                        - float(assignment_weight) * float(projected.max()) / total_demand
-                    )
-                    key = (score, -candidate_rank, -candidate)
-                    if best is None or key > (best[0], -int(instance_ranks[best[1]]), -best[1]):
-                        best = (score, candidate)
-                if best is None or best[1] == current_instance:
-                    continue
-                new_instance = best[1]
-                new_rank = int(instance_ranks[new_instance])
-                rank_loads[current_rank] -= amount
-                rank_loads[new_rank] += amount
-                lut[source_rank, expert] = new_instance
-                selected_ranks[expert] = new_rank
-                selected_nodes[expert] = new_rank // ranks_per_node
-                changed = True
-        if not changed:
-            break
-    return lut
+    statistics = ProfileStatistics(demand=demand_by_source, affinity=affinity_by_source)
+    result = optimize_mapping(
+        logical_instances,
+        instance_ranks,
+        initial_lut,
+        statistics,
+        MappingConfig(
+            ranks_per_node=ranks_per_node,
+            node_omega=node_omega,
+            rank_omega=rank_omega,
+            gamma=gamma,
+            sweep_limit=iterations,
+        ),
+    )
+    return result.mapping.copy()
 
 
 def _materialize_layout(
@@ -1522,21 +1457,20 @@ def _build_candidate(
             initial_lut = fixed_initial_lut
         lut_variants = [initial_lut]
         if fixed_initial_lut is None:
-            for assignment_weight in (8.0, 32.0, 128.0):
-                lut_variants.append(
-                    _optimize_lut_instances(
-                        logical_instances,
-                        instance_ranks,
-                        initial_lut,
-                        demand_by_source,
-                        affinity_by_source,
-                        ranks_per_node=args.ranks_per_node,
-                        iterations=args.lut_iterations,
-                        node_weight=0.0 if communication_blind else 1.0,
-                        rank_weight=0.0 if communication_blind else 0.15,
-                        assignment_weight=assignment_weight,
-                    )
+            lut_variants.append(
+                _optimize_lut_instances(
+                    logical_instances,
+                    instance_ranks,
+                    initial_lut,
+                    demand_by_source,
+                    affinity_by_source,
+                    ranks_per_node=args.ranks_per_node,
+                    iterations=args.lut_iterations,
+                    node_omega=node_omega,
+                    rank_omega=rank_omega,
+                    gamma=gamma,
                 )
+            )
         for lut_instances in lut_variants:
             try:
                 layout, owners, lut = _materialize_layout(

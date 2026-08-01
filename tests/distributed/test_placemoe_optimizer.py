@@ -211,7 +211,7 @@ def test_mapping_initialization_prefers_local_copies_and_balances_rank_loads():
     mapping = initialize_mapping(
         logical_instances,
         instance_ranks,
-        statistics,
+        statistics.demand,
         ranks_per_node=1,
     )
     np.testing.assert_array_equal(mapping, [[0, 1], [2, 3]])
@@ -229,7 +229,7 @@ def test_calibrated_mapping_score_balances_affinity_reuse_and_compute_load():
     initial = initialize_mapping(
         logical_instances,
         instance_ranks,
-        statistics,
+        statistics.demand,
         ranks_per_node=1,
     )
     communication_only = optimize_mapping(
