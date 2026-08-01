@@ -44,14 +44,18 @@ from scripts.profile.build_hiermoe_hierarchical_init_layout import (
 from veomni.distributed.moe.hiermoe.placemoe import (
     MappingConfig,
     PartitionConfig,
+    PlacementConfig,
     ProfileStatistics,
     build_replica_allocations,
     initialize_mapping,
     map_groups_to_locations,
     optimize_mapping,
     partition_items,
+    place_instances,
     profile_route_statistics,
     project_statistics_to_copies,
+    rank_placement_is_unique,
+    repair_rank_placement,
     uniform_copy_statistics,
 )
 
@@ -961,10 +965,8 @@ def _greedy_ranks_with_fixed_nodes(
     slots_per_rank: int,
     logical_instances: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Balance exact instance assignments before using affinity as a tie-break."""
+    """Compatibility wrapper for the canonical rank-feasibility repair."""
 
-    demand = instance_demand.sum(axis=0)
-    affinity = instance_affinity.sum(axis=0)
     if logical_instances is None:
         logical_instances = np.arange(len(instance_nodes), dtype=np.int64)
     else:
@@ -973,57 +975,20 @@ def _greedy_ranks_with_fixed_nodes(
             raise ValueError("Logical instance shape does not match node assignment.")
     num_nodes = int(instance_nodes.max()) + 1
     ep_size = num_nodes * ranks_per_node
-    num_experts = int(logical_instances.max(initial=-1)) + 1
-    if num_experts % ep_size:
-        raise ValueError("Logical experts must divide evenly across EP ranks.")
-    primary_slots_per_rank = num_experts // ep_size
-    max_empty_per_rank = slots_per_rank - primary_slots_per_rank
-    instance_ranks = np.full_like(instance_nodes, -1)
-    for node in range(num_nodes):
-        members = np.flatnonzero(instance_nodes == node)
-        capacities = np.full((ranks_per_node,), slots_per_rank, dtype=np.int64)
-        loads = np.zeros((ranks_per_node,), dtype=np.float64)
-        lane_members: list[list[int]] = [[] for _ in range(ranks_per_node)]
-        active_members = logical_instances[members]
-        multiplicity = np.bincount(
-            active_members[active_members >= 0],
-            minlength=int(active_members.max(initial=-1)) + 1,
-        )
-        for instance in sorted(
-            members.tolist(),
-            key=lambda value: (
-                -int(multiplicity[int(logical_instances[value])]) if int(logical_instances[value]) >= 0 else 0,
-                -float(demand[value]),
-                value,
-            ),
-        ):
-            best: tuple[float, float, int] | None = None
-            amount = float(demand[instance])
-            logical = int(logical_instances[instance])
-            for lane in range(ranks_per_node):
-                if capacities[lane] <= 0:
-                    continue
-                if logical < 0:
-                    empty_count = sum(int(logical_instances[other]) < 0 for other in lane_members[lane])
-                    if empty_count >= max_empty_per_rank:
-                        continue
-                if logical >= 0 and any(int(logical_instances[other]) == logical for other in lane_members[lane]):
-                    continue
-                projected_peak = max(loads[lane] + amount, float(loads.max()))
-                affinity_gain = sum(float(affinity[instance, other]) for other in lane_members[lane])
-                key = (projected_peak, -affinity_gain, lane)
-                if best is None or key < best:
-                    best = key
-            if best is None:
-                raise RuntimeError("Greedy rank classification exhausted its capacity.")
-            lane = best[2]
-            instance_ranks[instance] = node * ranks_per_node + lane
-            capacities[lane] -= 1
-            loads[lane] += amount
-            lane_members[lane].append(instance)
-    if bool((instance_ranks < 0).any()):
-        raise RuntimeError("Greedy rank classification is incomplete.")
-    return instance_ranks
+    return repair_rank_placement(
+        instance_nodes,
+        instance_demand.sum(axis=0),
+        instance_affinity.sum(axis=0),
+        logical_instances,
+        PlacementConfig(
+            ep_size=ep_size,
+            ranks_per_node=ranks_per_node,
+            slots_per_rank=slots_per_rank,
+            node_omega=0.0,
+            rank_omega=0.0,
+            gamma=0.0,
+        ),
+    )
 
 
 def _rank_assignment_is_device_unique(
@@ -1032,93 +997,7 @@ def _rank_assignment_is_device_unique(
     *,
     ep_size: int,
 ) -> bool:
-    for rank in range(ep_size):
-        active = logical_instances[(instance_ranks == rank) & (logical_instances >= 0)]
-        if len(active) != len(np.unique(active)):
-            return False
-    return True
-
-
-def _rank_assignment_supports_balanced_owners(
-    instance_ranks: np.ndarray,
-    logical_instances: np.ndarray,
-    *,
-    ep_size: int,
-) -> bool:
-    num_experts = int(logical_instances.max(initial=-1)) + 1
-    if num_experts % ep_size:
-        return False
-    minimum_active = num_experts // ep_size
-    for rank in range(ep_size):
-        active = (instance_ranks == rank) & (logical_instances >= 0)
-        if int(active.sum()) < minimum_active:
-            return False
-    return True
-
-
-def _greedy_instance_nodes(
-    instance_demand: np.ndarray,
-    instance_affinity: np.ndarray,
-    logical_instances: np.ndarray,
-    *,
-    num_nodes: int,
-    ranks_per_node: int,
-    slots_per_rank: int,
-) -> np.ndarray:
-    """Build a capacity-feasible node seed when spectral labels overpack a copy kind."""
-
-    demand = instance_demand.sum(axis=0)
-    affinity = instance_affinity.sum(axis=0)
-    capacity = ranks_per_node * slots_per_rank
-    ep_size = num_nodes * ranks_per_node
-    num_experts = int(logical_instances.max(initial=-1)) + 1
-    if num_experts % ep_size:
-        raise ValueError("Logical experts must divide evenly across EP ranks.")
-    primary_slots_per_node = (num_experts // ep_size) * ranks_per_node
-    max_empty_per_node = capacity - primary_slots_per_node
-    capacities = np.full((num_nodes,), capacity, dtype=np.int64)
-    loads = np.zeros((num_nodes,), dtype=np.float64)
-    node_members: list[list[int]] = [[] for _ in range(num_nodes)]
-    active = logical_instances[logical_instances >= 0]
-    multiplicity = np.bincount(active, minlength=int(active.max(initial=-1)) + 1)
-    result = np.full((len(logical_instances),), -1, dtype=np.int64)
-    for instance in sorted(
-        range(len(logical_instances)),
-        key=lambda value: (
-            -int(multiplicity[int(logical_instances[value])]) if int(logical_instances[value]) >= 0 else 0,
-            -float(demand[value]),
-            value,
-        ),
-    ):
-        logical = int(logical_instances[instance])
-        amount = float(demand[instance])
-        best: tuple[tuple[float, float, float, int], int] | None = None
-        for node in range(num_nodes):
-            if capacities[node] <= 0:
-                continue
-            if logical < 0:
-                empty_count = sum(int(logical_instances[other]) < 0 for other in node_members[node])
-                if empty_count >= max_empty_per_node:
-                    continue
-            if logical >= 0:
-                same_kind = sum(int(logical_instances[other]) == logical for other in node_members[node])
-                if same_kind >= ranks_per_node:
-                    continue
-            projected_peak = max(loads[node] + amount, float(loads.max(initial=0.0)))
-            affinity_gain = sum(float(affinity[instance, other]) for other in node_members[node])
-            sources = slice(node * ranks_per_node, (node + 1) * ranks_per_node)
-            locality = float(instance_demand[sources, instance].sum())
-            key = (projected_peak, -affinity_gain, -locality, node)
-            if best is None or key < best[0]:
-                best = (key, node)
-        if best is None:
-            raise RuntimeError("Could not construct a capacity-feasible node assignment.")
-        node = best[1]
-        result[instance] = node
-        capacities[node] -= 1
-        loads[node] += amount
-        node_members[node].append(instance)
-    return result
+    return rank_placement_is_unique(instance_ranks, logical_instances, ep_size=ep_size)
 
 
 def _classify_instances(
@@ -1135,121 +1014,23 @@ def _classify_instances(
     rank_omega: float,
     gamma: float,
 ) -> np.ndarray:
-    instances = int(instance_demand.shape[1])
-    num_nodes = ep_size // ranks_per_node
-    if instances != ep_size * slots_per_rank:
-        raise ValueError("Instance count must equal the physical slot capacity.")
-    affinity = instance_affinity.sum(axis=0)
-    demand = instance_demand.sum(axis=0)
-    node_config = PartitionConfig(
-        capacities=(instances // num_nodes,) * num_nodes,
-        ranks_per_group=(ranks_per_node,) * num_nodes,
-        omega=node_omega,
-        gamma=gamma,
-        restarts=1,
-        exchange_limit=iterations,
-        seed=seed,
-    )
-    node_labels = partition_items(affinity, demand, node_config)[0].labels
-    node_sources = [
-        np.arange(node * ranks_per_node, (node + 1) * ranks_per_node, dtype=np.int64) for node in range(num_nodes)
-    ]
-    instance_nodes = _map_clusters_to_locations(
-        node_labels,
+    result = place_instances(
         instance_demand,
-        sources_by_location=node_sources,
-    )
-
-    instance_ranks = np.full((instances,), -1, dtype=np.int64)
-    for node in range(num_nodes):
-        members = np.flatnonzero(instance_nodes == node)
-        rank_config = PartitionConfig(
-            capacities=(slots_per_rank,) * ranks_per_node,
-            ranks_per_group=(1,) * ranks_per_node,
-            omega=rank_omega,
+        instance_affinity,
+        logical_instances,
+        PlacementConfig(
+            ep_size=ep_size,
+            ranks_per_node=ranks_per_node,
+            slots_per_rank=slots_per_rank,
+            node_omega=node_omega,
+            rank_omega=rank_omega,
             gamma=gamma,
-            restarts=1,
-            exchange_limit=max(1, iterations // 2),
-            seed=seed + 104729 * (node + 1),
-        )
-        local_labels = partition_items(
-            affinity[np.ix_(members, members)],
-            demand[members],
-            rank_config,
-        )[0].labels
-        rank_sources = [np.asarray([node * ranks_per_node + lane], dtype=np.int64) for lane in range(ranks_per_node)]
-        mapped_lanes = _map_clusters_to_locations(
-            local_labels,
-            instance_demand[:, members],
-            sources_by_location=rank_sources,
-        )
-        instance_ranks[members] = node * ranks_per_node + mapped_lanes
-    if bool((instance_ranks < 0).any()):
-        raise RuntimeError("Hierarchical instance classification is incomplete.")
-    counts = np.bincount(instance_ranks, minlength=ep_size)
-    if not bool((counts == slots_per_rank).all()):
-        raise RuntimeError("Hierarchical instance classification violates rank capacity.")
-    valid = _rank_assignment_is_device_unique(
-        instance_ranks,
-        logical_instances,
-        ep_size=ep_size,
-    ) and _rank_assignment_supports_balanced_owners(
-        instance_ranks,
-        logical_instances,
-        ep_size=ep_size,
+            node_exchange_limit=iterations,
+            rank_exchange_limit=max(1, iterations // 2),
+            seed=seed,
+        ),
     )
-    if not valid:
-        try:
-            instance_ranks = _greedy_ranks_with_fixed_nodes(
-                instance_nodes,
-                instance_demand,
-                instance_affinity,
-                ranks_per_node=ranks_per_node,
-                slots_per_rank=slots_per_rank,
-                logical_instances=logical_instances,
-            )
-        except RuntimeError:
-            pass
-        valid = _rank_assignment_is_device_unique(
-            instance_ranks,
-            logical_instances,
-            ep_size=ep_size,
-        ) and _rank_assignment_supports_balanced_owners(
-            instance_ranks,
-            logical_instances,
-            ep_size=ep_size,
-        )
-        if not valid:
-            instance_nodes = _greedy_instance_nodes(
-                instance_demand,
-                instance_affinity,
-                logical_instances,
-                num_nodes=num_nodes,
-                ranks_per_node=ranks_per_node,
-                slots_per_rank=slots_per_rank,
-            )
-            instance_ranks = _greedy_ranks_with_fixed_nodes(
-                instance_nodes,
-                instance_demand,
-                instance_affinity,
-                ranks_per_node=ranks_per_node,
-                slots_per_rank=slots_per_rank,
-                logical_instances=logical_instances,
-            )
-    if not (
-        _rank_assignment_is_device_unique(
-            instance_ranks,
-            logical_instances,
-            ep_size=ep_size,
-        )
-        and _rank_assignment_supports_balanced_owners(
-            instance_ranks,
-            logical_instances,
-            ep_size=ep_size,
-        )
-    ):
-        raise RuntimeError("Hierarchical instance classification violates rank ownership or duplicate constraints.")
-    return instance_ranks
+    return result.instance_ranks.copy()
 
 
 def _initial_lut_instances(
