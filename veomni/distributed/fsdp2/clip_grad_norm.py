@@ -1,4 +1,6 @@
 import math
+import os
+import time
 from typing import List
 
 import torch
@@ -16,6 +18,24 @@ from ..parallel_state import get_parallel_state
 
 
 logger = get_logger(__name__)
+
+
+_HIERMOE_DIAG_PHASES = os.environ.get("VEOMNI_HIERMOE_DIAG_PHASES", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def _clip_diag_phase(phase: str) -> None:
+    if not _HIERMOE_DIAG_PHASES:
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+    print(
+        f"HIERMOE_CLIP_DIAG rank={rank} phase={phase} monotonic={time.monotonic():.6f}",
+        flush=True,
+    )
 
 
 def clip_grad_norm(
@@ -198,7 +218,21 @@ def _local_grad_for_norm(
                 "HierMoE gradient-norm mask does not match the local expert-slot dimension: "
                 f"mask={tuple(mask.shape)}, grad={tuple(grad_local.shape)}."
             )
-        grad_local = grad_local[mask.to(device=grad_local.device)]
+        # Sparse redundant layouts may place no canonical owner for a layer on
+        # this EP rank. Do not feed an empty masked NPU tensor to foreach-norm:
+        # some accelerator backends do not make progress on that input. This
+        # rank contributes the additive identity to the subsequent all-reduce.
+        if not bool(mask.any()):
+            return None
+        # Keep the local tensor shape static. Boolean indexing produces a
+        # rank-dependent first dimension for partial-capacity layouts, which
+        # does not make progress in the NPU foreach-norm path. Zeroing
+        # non-owner rows is mathematically equivalent for every p-norm while
+        # preserving the original tensor shape on every rank.
+        if not bool(mask.all()):
+            mask_device = mask.to(device=grad_local.device, dtype=grad_local.dtype)
+            mask_shape = (int(mask_device.numel()),) + (1,) * (grad_local.ndim - 1)
+            grad_local = grad_local * mask_device.reshape(mask_shape)
     return grad_local.detach().to(torch.float32)
 
 
@@ -207,15 +241,52 @@ def _local_pth_sum(
     p: float,
     grad_row_masks: dict[int, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    grads_local = [
-        grad_local for param in params if (grad_local := _local_grad_for_norm(param, grad_row_masks)) is not None
-    ]
-
     reduce_device = torch.device(get_device_type())
     res = torch.tensor(0.0, device=reduce_device, dtype=torch.float32)
+    grads_local: list[torch.Tensor] = []
+    partial_mask_count = 0
+    with torch.no_grad():
+        for param in params:
+            grad = param.grad
+            if grad is None:
+                continue
+            grad_local = grad.to_local() if isinstance(grad, DTensor) else grad
+            mask = None if grad_row_masks is None else grad_row_masks.get(id(param))
+            if mask is None or bool(mask.all()):
+                grads_local.append(grad_local.detach().to(torch.float32))
+                continue
+            if grad_local.ndim == 0 or int(mask.numel()) != int(grad_local.shape[0]):
+                raise RuntimeError(
+                    "HierMoE gradient-norm mask does not match the local expert-slot dimension: "
+                    f"mask={tuple(mask.shape)}, grad={tuple(grad_local.shape)}."
+                )
+            if not bool(mask.any()):
+                continue
+
+            # A partial owner mask is specific to sparse redundant layouts. Do
+            # not place these tensors in accelerator foreach/vector-norm
+            # kernels: both combinations fail to make progress for the large
+            # expert tensor shape on some NPU runtimes. Use elementary
+            # elementwise power plus row reduction instead. This computes the
+            # exact p-th-power contribution while keeping the tensor shape
+            # identical on every rank.
+            if partial_mask_count == 0:
+                _clip_diag_phase("partial_mask_pth_start")
+            partial_mask_count += 1
+            grad_rows = grad_local.detach().to(torch.float32).reshape(int(grad_local.shape[0]), -1)
+            if p == 2.0:
+                row_pth_sums = torch.sum(torch.square(grad_rows), dim=1)
+            else:
+                row_pth_sums = torch.sum(torch.pow(torch.abs(grad_rows), p), dim=1)
+            mask_device = mask.to(device=row_pth_sums.device, dtype=row_pth_sums.dtype)
+            res = res + torch.sum(row_pth_sums * mask_device).to(reduce_device)
+
+    if partial_mask_count:
+        _clip_diag_phase("partial_mask_pth_done")
     if not grads_local:
         return res
     with torch.no_grad():
+        _clip_diag_phase("foreach_pth_start")
         grouped_grads_local = _group_tensors_by_device_and_dtype([grads_local])
         for (device, _), ([device_grads_local], _) in grouped_grads_local.items():
             if _has_foreach_support(device_grads_local, device) or _device_has_foreach_support(device):
@@ -225,6 +296,7 @@ def _local_pth_sum(
                 for grad_local in device_grads_local:
                     gn = torch.norm(grad_local, p=p)
                     res = res + (gn**p).to(reduce_device)
+        _clip_diag_phase("foreach_pth_done")
     return res
 
 
@@ -266,10 +338,14 @@ def _fsdp2_reduce_group(
         return val
     else:
         p = float(norm_type)
+        _clip_diag_phase("local_pth_sum_start")
         val = _local_pth_sum(params, p, grad_row_masks)
+        _clip_diag_phase("local_pth_sum_done")
         logger.debug_rank0(f"local total grad norm: {val}. ProcessGroups to sum {reduce_groups}")
         for name, group in reduce_groups:
             if group is not None:
+                _clip_diag_phase(f"all_reduce_{name}_start")
                 dist.all_reduce(val, op=dist.ReduceOp.SUM, group=group)
+                _clip_diag_phase(f"all_reduce_{name}_done")
                 logger.debug_rank0(f"After Sum of group {name} total grad norm is {val}")
         return val

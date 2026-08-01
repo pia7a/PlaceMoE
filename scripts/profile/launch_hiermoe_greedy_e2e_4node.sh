@@ -5,21 +5,35 @@ host_root=/home/tzq/npu_profile_outputs/hiermoe_greedy_swap_cover_20260722
 container_root=/workspace/output/hiermoe_greedy_swap_cover_20260722
 source_root=${container_root}/src
 launcher=${source_root}/scripts/profile/run_qwen3_vl_30b_full_ep32_4node_light_profile_100step_npu.sh
+launcher_host=${host_root}/src/scripts/profile/run_qwen3_vl_30b_full_ep32_4node_light_profile_100step_npu.sh
+launcher_source=$(<"${launcher_host}")
+nnodes=${NNODES_OVERRIDE:-4}
+nproc_per_node=${NPROC_PER_NODE_OVERRIDE:-8}
+master_addr=${MASTER_ADDR_OVERRIDE:-192.168.0.55}
 variant=${E2E_VARIANT:-greedy}
 master_port=${MASTER_PORT:-29950}
 run_suffix=${RUN_SUFFIX:-20260722}
 swap_interval=${HIERMOE_SWAP_INTERVAL_OVERRIDE:-1}
 max_steps=${MAX_STEPS_OVERRIDE:-6}
+num_train_epochs=${NUM_TRAIN_EPOCHS_OVERRIDE:-1}
+total_max_steps=${TOTAL_MAX_STEPS_OVERRIDE:-}
+train_lr=${TRAIN_LR_OVERRIDE:-}
 model_path=${MODEL_PATH_OVERRIDE:-/workspace/model/Qwen3-VL-30B-A3B-Instruct}
 model_config_path=${MODEL_CONFIG_PATH_OVERRIDE:-${model_path}}
+train_entrypoint=${TRAIN_ENTRYPOINT_OVERRIDE:-tasks/train_vlm.py}
+train_config=${TRAIN_CONFIG_OVERRIDE:-configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml}
 data_path=${DATA_PATH_OVERRIDE:-/workspace/dataset/ShareGPT4V/sharegpt4v_instruct_gpt4-vision_cap100k_coco_abs_share_full_shards}
 data_source_name=${DATA_SOURCE_NAME_OVERRIDE:-sharegpt4v_sft}
 micro_batch_size=${MICRO_BATCH_SIZE_OVERRIDE:-4}
 global_batch_size=${GLOBAL_BATCH_SIZE_OVERRIDE:-128}
 max_seq_len=${MAX_SEQ_LEN_OVERRIDE:-4096}
+full_route_gather_max_tokens=${HIERMOE_FULL_ROUTE_GATHER_MAX_TOKENS_OVERRIDE:-$((micro_batch_size * max_seq_len))}
+exact_p1_route_sample_size=${HIERMOE_EXACT_P1_ROUTE_SAMPLE_SIZE_OVERRIDE:-0}
+remote_single_ssh_attempts=${HIERMOE_REMOTE_SINGLE_SSH_ATTEMPTS:-1}
 data_num_workers=${DATA_NUM_WORKERS_OVERRIDE:-4}
 data_prefetch_factor=${DATA_PREFETCH_FACTOR_OVERRIDE:-2}
 freeze_vit=${TRAIN_FREEZE_VIT_OVERRIDE:-false}
+npu_allocator_conf=${PYTORCH_NPU_ALLOC_CONF_OVERRIDE:-}
 rms_norm_gated_impl=${RMS_NORM_GATED_IMPLEMENTATION_OVERRIDE:-npu}
 causal_conv1d_impl=${CAUSAL_CONV1D_IMPLEMENTATION_OVERRIDE:-eager}
 chunk_gated_delta_rule_impl=${CHUNK_GATED_DELTA_RULE_IMPLEMENTATION_OVERRIDE:-eager}
@@ -37,9 +51,28 @@ debug_copy_stats=${HIERMOE_DEBUG_COPY_STATS_OVERRIDE:-0}
 debug_copy_layers=${HIERMOE_DEBUG_COPY_LAYERS_OVERRIDE:-1}
 debug_copy_groups=${HIERMOE_DEBUG_COPY_GROUPS_OVERRIDE:-2}
 hccl_if_base_port=${HCCL_IF_BASE_PORT:-55000}
+hccl_buffsize=${HCCL_BUFFSIZE_OVERRIDE:-16}
 ablation_replay_path=${HIERMOE_ABLATION_REPLAY_PATH_OVERRIDE:-${source_root}/results/qwen3vl_greedy_ep32_mb4_gbs128_r2_pipeline_6step_hccl_serial_nonblocking_score_20260726_r3_committed_layout.json}
 static_preload_layout_path=${HIERMOE_STATIC_PRELOAD_LAYOUT_PATH_OVERRIDE:-}
 key=/home/tzq/KeyPair-3bce.pem
+key=${SSH_KEY_OVERRIDE:-${key}}
+rank0_host=${RANK0_HOST_OVERRIDE:-}
+rank1_host=${RANK1_HOST_OVERRIDE:-192.168.0.190}
+rank2_host=${RANK2_HOST_OVERRIDE:-192.168.0.109}
+rank3_host=${RANK3_HOST_OVERRIDE:-192.168.0.9}
+rank4_host=${RANK4_HOST_OVERRIDE:-}
+rank5_host=${RANK5_HOST_OVERRIDE:-}
+rank6_host=${RANK6_HOST_OVERRIDE:-}
+rank7_host=${RANK7_HOST_OVERRIDE:-}
+dp_replicate_size=${DP_REPLICATE_SIZE_OVERRIDE:-1}
+dp_shard_size=${DP_SHARD_SIZE_OVERRIDE:-$((nnodes * nproc_per_node))}
+ep_size=${EP_SIZE_OVERRIDE:-$((nnodes * nproc_per_node))}
+full_profile_enable=${FULL_PROFILE_ENABLE_OVERRIDE:-1}
+convergence_metrics_enable=${CONVERGENCE_METRICS_ENABLE_OVERRIDE:-0}
+moe_monitor_interval=${MOE_MONITOR_INTERVAL_OVERRIDE:-1}
+moe_monitor_jsonl_enable=${MOE_MONITOR_JSONL_ENABLE_OVERRIDE:-1}
+moe_timing_enable=${MOE_TIMING_ENABLE_OVERRIDE:-1}
+env_metrics_jsonl_enable=${ENV_METRICS_JSONL_ENABLE_OVERRIDE:-1}
 
 hiermoe_enable=false
 dedup_only=0
@@ -68,6 +101,16 @@ online_freeze_intra_ms_per_byte=${HIERMOE_ONLINE_FREEZE_INTRA_MS_PER_BYTE_OVERRI
 online_freeze_route_ms_per_assignment=${HIERMOE_ONLINE_FREEZE_ROUTE_MS_PER_ASSIGNMENT_OVERRIDE:-8.746548178958447e-05}
 online_freeze_traffic_intercept_ms=${HIERMOE_ONLINE_FREEZE_TRAFFIC_INTERCEPT_MS_OVERRIDE:-16.771503695343263}
 cost_model_verify=0
+online_lut_update=0
+online_lut_start_step=${HIERMOE_ONLINE_LUT_START_STEP_OVERRIDE:-1}
+online_lut_min_gain=${HIERMOE_ONLINE_LUT_MIN_GAIN_OVERRIDE:-0.0}
+periodic_full_replan=0
+periodic_full_replan_last_step=${HIERMOE_PERIODIC_FULL_REPLAN_LAST_STEP_OVERRIDE:-2147483647}
+periodic_full_replan_workers=${HIERMOE_PERIODIC_FULL_REPLAN_WORKERS_OVERRIDE:-48}
+periodic_full_replan_candidate_workers=${HIERMOE_PERIODIC_FULL_REPLAN_CANDIDATE_WORKERS_OVERRIDE:-4}
+periodic_full_replan_worker_threads=${HIERMOE_PERIODIC_FULL_REPLAN_WORKER_THREADS_OVERRIDE:-1}
+periodic_full_replan_cpu_ids=${HIERMOE_PERIODIC_FULL_REPLAN_CPU_IDS_OVERRIDE:-144-191}
+periodic_full_replan_train_cpu_ids=${HIERMOE_PERIODIC_FULL_REPLAN_TRAIN_CPU_IDS_OVERRIDE:-0-143}
 forward_reuse_cover=0
 forward_reuse_cover_patch_remap=0
 forward_reuse_cover_fast=0
@@ -83,12 +126,14 @@ forward_reuse_cover_aggregate_service_group=${HIERMOE_FORWARD_REUSE_COVER_AGGREG
 forward_reuse_cover_proposal_topk=${HIERMOE_FORWARD_REUSE_COVER_PROPOSAL_TOPK_OVERRIDE:-1}
 forward_reuse_cover_empty_seeding=0
 hiermoe_internal_timing=${VEOMNI_HIERMOE_INTERNAL_TIMING_OVERRIDE:-0}
+hiermoe_log_interval=${HIERMOE_LOG_INTERVAL_OVERRIDE:-1}
 force_fixed_r2_mirrored_remap=0
 full_profile_start_step=${FULL_PROFILE_START_STEP_OVERRIDE:-3}
 full_profile_every_n=${FULL_PROFILE_EVERY_N_OVERRIDE:-1}
 full_profile_ranks=${FULL_PROFILE_RANKS_OVERRIDE:-0}
 num_moe_layers=${NUM_MOE_LAYERS_OVERRIDE:-48}
 redundant_slots_override=${HIERMOE_REDUNDANT_SLOTS_OVERRIDE:-}
+index_add_fp32_chunk_rows=${VEOMNI_HIERMOE_INDEX_ADD_FP32_CHUNK_ROWS:-65536}
 
 case "${variant}" in
   baseline)
@@ -97,6 +142,18 @@ case "${variant}" in
     hiermoe_enable=
     dedup_only=1
     token_dedup=true
+    ;;
+  hiermoe_exact_p1)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    max_pairs=1
+    redundant_slots=0
+    replica_rounds=0
+    fixed_r2=0
+    fixed_pipeline=false
+    swap_mode=step
+    swap_selector=hiermoe_exact_p1
     ;;
   fixed_r2)
     hiermoe_enable=true
@@ -364,6 +421,50 @@ case "${variant}" in
       static_preload_layout_path=${ablation_replay_path}
     fi
     ;;
+  hierarchical_full_static_online_lut)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    max_pairs=0
+    redundant_slots=4
+    replica_rounds=0
+    fixed_r2=0
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    ablation_replay_mode=static
+    ablation_migration_mode=blocking
+    ablation_grad_mode=hidden
+    forward_reuse_cover=1
+    forward_reuse_cover_patch_remap=1
+    forward_reuse_cover_empty_seeding=1
+    online_lut_update=1
+    if [[ -z "${static_preload_layout_path}" ]]; then
+      static_preload_layout_path=${ablation_replay_path}
+    fi
+    ;;
+  hierarchical_full_static_periodic_replan)
+    hiermoe_enable=true
+    token_dedup=true
+    expert_swap=true
+    max_pairs=0
+    redundant_slots=4
+    replica_rounds=0
+    fixed_r2=0
+    fixed_pipeline=true
+    swap_mode=step
+    swap_selector=hiermoe_greedy_cover_p1
+    ablation_replay_mode=static
+    ablation_migration_mode=blocking
+    ablation_grad_mode=hidden
+    forward_reuse_cover=1
+    forward_reuse_cover_patch_remap=1
+    forward_reuse_cover_empty_seeding=1
+    periodic_full_replan=1
+    if [[ -z "${static_preload_layout_path}" ]]; then
+      static_preload_layout_path=${ablation_replay_path}
+    fi
+    ;;
   forward_reuse_cover_patch_multiround)
     hiermoe_enable=true
     token_dedup=true
@@ -440,13 +541,32 @@ esac
 if [[ -n "${redundant_slots_override}" ]]; then
   redundant_slots=${redundant_slots_override}
 fi
+# A zero-capacity static layout still needs the ExpertSwap manager to install
+# its offline owner permutation, but it has no replica candidate for the
+# cover-only selector.  Disable the online cover path while retaining the
+# preloaded layout and hierarchical dedup runtime.
+if [[ "${variant}" == "hierarchical_full_static" && "${redundant_slots}" == "0" ]]; then
+  fixed_pipeline=false
+  swap_selector=current_joint
+  forward_reuse_cover=0
+  forward_reuse_cover_patch_remap=0
+  forward_reuse_cover_empty_seeding=0
+fi
 ablation_grad_mode=${HIERMOE_ABLATION_GRAD_MODE_OVERRIDE:-${ablation_grad_mode}}
 
 run_name=${RUN_NAME_OVERRIDE:-qwen3vl_greedy_ep32_mb${micro_batch_size}_gbs${global_batch_size}_${variant}_${max_steps}step_${run_suffix}}
+periodic_full_replan_work_root=${HIERMOE_PERIODIC_FULL_REPLAN_WORK_ROOT_OVERRIDE:-${source_root}/profile/runs/pretrain/${run_name}/periodic_full_replan}
+convergence_metrics_dir=
+if [[ "${convergence_metrics_enable}" == "1" ]]; then
+  convergence_metrics_dir=${source_root}/profile/runs/pretrain/${run_name}/convergence_metrics
+fi
 common_env=(
   -e "PYTHONPATH=${source_root}"
+  -e "VEOMNI_HIERMOE_DIAG_PHASES=${VEOMNI_HIERMOE_DIAG_PHASES:-0}"
   -e "RUN_NAME=${run_name}"
   -e "RUN_ROOT=${source_root}/pretrain_runs/${run_name}"
+  -e "TRAIN_ENTRYPOINT=${train_entrypoint}"
+  -e "TRAIN_CONFIG=${train_config}"
   -e "MODEL_PATH=${model_path}"
   -e "MODEL_CONFIG_PATH=${model_config_path}"
   -e "DATA_PATH=${data_path}"
@@ -457,17 +577,20 @@ common_env=(
   -e "RMS_NORM_GATED_IMPL=${rms_norm_gated_impl}"
   -e "CAUSAL_CONV1D_IMPL=${causal_conv1d_impl}"
   -e "CHUNK_GATED_DELTA_RULE_IMPL=${chunk_gated_delta_rule_impl}"
-  -e "NNODES=4"
-  -e "NPROC_PER_NODE=8"
-  -e "MASTER_ADDR=192.168.0.55"
+  -e "NNODES=${nnodes}"
+  -e "NPROC_PER_NODE=${nproc_per_node}"
+  -e "MASTER_ADDR=${master_addr}"
   -e "MASTER_PORT=${master_port}"
   -e "MAX_STEPS=${max_steps}"
+  -e "NUM_TRAIN_EPOCHS=${num_train_epochs}"
+  -e "VEOMNI_TOTAL_MAX_STEPS=${total_max_steps}"
+  -e "TRAIN_LR=${train_lr}"
   -e "MICRO_BATCH_SIZE=${micro_batch_size}"
   -e "GLOBAL_BATCH_SIZE=${global_batch_size}"
   -e "MAX_SEQ_LEN=${max_seq_len}"
-  -e "DP_REPLICATE_SIZE=1"
-  -e "DP_SHARD_SIZE=32"
-  -e "EP_SIZE=32"
+  -e "DP_REPLICATE_SIZE=${dp_replicate_size}"
+  -e "DP_SHARD_SIZE=${dp_shard_size}"
+  -e "EP_SIZE=${ep_size}"
   -e "NUM_MOE_LAYERS=${num_moe_layers}"
   -e "HIERMOE_ENABLE=${hiermoe_enable}"
   -e "HIERMOE_DEDUP_ONLY=${dedup_only}"
@@ -475,7 +598,7 @@ common_env=(
   -e "HIERMOE_COMMUNICATION_MODE=hierarchical"
   -e "HIERMOE_EXPERT_SWAP=${expert_swap}"
   -e "HIERMOE_EXPERT_SWAP_INTERVAL=${swap_interval}"
-  -e "HIERMOE_LOG_INTERVAL=1"
+  -e "HIERMOE_LOG_INTERVAL=${hiermoe_log_interval}"
   -e "HIERMOE_EXPERT_SWAP_MAX_PAIRS_PER_LAYER=${max_pairs}"
   -e "HIERMOE_EXPERT_SWAP_SELECTOR=${swap_selector}"
   -e "HIERMOE_REDUNDANT_SLOT_INCREMENT_PER_DEVICE=${redundant_slots}"
@@ -503,6 +626,19 @@ common_env=(
   -e "VEOMNI_HIERMOE_ONLINE_FREEZE_ROUTE_MS_PER_ASSIGNMENT=${online_freeze_route_ms_per_assignment}"
   -e "VEOMNI_HIERMOE_ONLINE_FREEZE_TRAFFIC_INTERCEPT_MS=${online_freeze_traffic_intercept_ms}"
   -e "VEOMNI_HIERMOE_COST_MODEL_VERIFY=${cost_model_verify}"
+  -e "VEOMNI_HIERMOE_EXPORT_COST_MODEL_SAMPLES=${VEOMNI_HIERMOE_EXPORT_COST_MODEL_SAMPLES:-0}"
+  -e "VEOMNI_HIERMOE_COST_MODEL_VALIDATION_STEPS=${VEOMNI_HIERMOE_COST_MODEL_VALIDATION_STEPS:-1}"
+  -e "VEOMNI_HIERMOE_ONLINE_LUT_UPDATE=${online_lut_update}"
+  -e "VEOMNI_HIERMOE_ONLINE_LUT_START_STEP=${online_lut_start_step}"
+  -e "VEOMNI_HIERMOE_ONLINE_LUT_MIN_GAIN=${online_lut_min_gain}"
+  -e "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN=${periodic_full_replan}"
+  -e "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_WORK_ROOT=${periodic_full_replan_work_root}"
+  -e "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_WORKERS=${periodic_full_replan_workers}"
+  -e "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_CANDIDATE_WORKERS=${periodic_full_replan_candidate_workers}"
+  -e "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_WORKER_THREADS=${periodic_full_replan_worker_threads}"
+  -e "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_LAST_STEP=${periodic_full_replan_last_step}"
+  -e "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_CPU_IDS=${periodic_full_replan_cpu_ids}"
+  -e "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_TRAIN_CPU_IDS=${periodic_full_replan_train_cpu_ids}"
   -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER=${forward_reuse_cover}"
   -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_PATCH_REMAP=${forward_reuse_cover_patch_remap}"
   -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_FAST=${forward_reuse_cover_fast}"
@@ -524,19 +660,31 @@ common_env=(
   -e "VEOMNI_HIERMOE_GREEDY_ADAPTIVE_TOPK=${greedy_adaptive_topk}"
   -e "VEOMNI_HIERMOE_GREEDY_ADAPTIVE_TOPK_INITIAL=${greedy_adaptive_topk_initial}"
   -e "VEOMNI_HIERMOE_GREEDY_ADAPTIVE_TOPK_STRICT=${greedy_adaptive_topk_strict}"
-  -e "VEOMNI_HIERMOE_FULL_ROUTE_GATHER_MAX_TOKENS=16384"
-  -e "VEOMNI_FULL_PROFILE_ENABLE=1"
+  -e "VEOMNI_HIERMOE_FULL_ROUTE_GATHER_MAX_TOKENS=${full_route_gather_max_tokens}"
+  -e "VEOMNI_HIERMOE_EXACT_P1_ROUTE_SAMPLE_SIZE=${exact_p1_route_sample_size}"
+  -e "VEOMNI_FULL_PROFILE_ENABLE=${full_profile_enable}"
   -e "VEOMNI_FULL_PROFILE_START_STEP=${full_profile_start_step}"
   -e "VEOMNI_FULL_PROFILE_EVERY_N=${full_profile_every_n}"
   -e "VEOMNI_FULL_PROFILE_RANKS=${full_profile_ranks}"
+  -e "VEOMNI_CONVERGENCE_METRICS_DIR=${convergence_metrics_dir}"
+  -e "VEOMNI_PHYSICAL_LOAD_NUM_LAYERS=${num_moe_layers}"
+  -e "VEOMNI_MOE_MONITOR_JSONL_ENABLE=${moe_monitor_jsonl_enable}"
+  -e "VEOMNI_MOE_TIMING_ENABLE=${moe_timing_enable}"
+  -e "VEOMNI_ENV_METRICS_JSONL_ENABLE=${env_metrics_jsonl_enable}"
   -e "VEOMNI_HIERMOE_INTERNAL_TIMING=${hiermoe_internal_timing}"
+  -e "VEOMNI_HIERMOE_INDEX_ADD_FP32_CHUNK_ROWS=${index_add_fp32_chunk_rows}"
   -e "VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STATS=${debug_copy_stats}"
   -e "VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STATS_MAX_LAYERS=${debug_copy_layers}"
   -e "VEOMNI_HIERMOE_DEBUG_REDUNDANT_COPY_STATS_MAX_GROUPS=${debug_copy_groups}"
   -e "VEOMNI_TORCH_PROFILE_ENABLE=0"
   -e "VEOMNI_MOE_TIMING_SYNC_EVENTS=0"
+  -e "MOE_MONITOR_INTERVAL=${moe_monitor_interval}"
   -e "HCCL_IF_BASE_PORT=${hccl_if_base_port}"
+  -e "HCCL_BUFFSIZE=${hccl_buffsize}"
 )
+if [[ -n "${npu_allocator_conf}" ]]; then
+  common_env+=(-e "PYTORCH_NPU_ALLOC_CONF=${npu_allocator_conf}")
+fi
 
 if [[ "${capture_routes}" == "1" ]]; then
   capture_root=${source_root}/route_captures/${run_name}
@@ -549,17 +697,75 @@ if [[ "${capture_routes}" == "1" ]]; then
   )
 fi
 
+# Keep a defined fallback for the local-rank0 branch and for shell cleanup
+# after background launch_remote jobs. Each remote invocation still shadows
+# this with its node-specific snapshot path.
+launcher_snapshot=
+
 launch_remote() {
   local host=$1
   local node_rank=$2
   local container=$3
-  ssh -i "${key}" -o StrictHostKeyChecking=no "root@${host}" \
+  local launcher_snapshot=${source_root}/scripts/profile/.paper32_${run_name}_node${node_rank}_launcher.sh
+  local snapshot_attempt
+  local snapshot_ready=0
+  local -a ssh_args=(-o StrictHostKeyChecking=no)
+  if [[ -n "${key}" ]]; then
+    ssh_args=(-i "${key}" "${ssh_args[@]}")
+  fi
+  if [[ "${HIERMOE_REMOTE_SINGLE_SSH:-0}" == "1" ]]; then
+    # At 8-node scale, opening one SSH connection to install a snapshot and a
+    # second one to execute it can exceed sshd MaxStartups while all nodes are
+    # launched concurrently. Stream the exact same launcher body directly to
+    # bash inside the container so each node needs only one connection.
+    for ((snapshot_attempt = 1; snapshot_attempt <= remote_single_ssh_attempts; snapshot_attempt++)); do
+      if printf '%s\n' "${launcher_source}" | ssh \
+        -o ConnectionAttempts=5 \
+        -o ConnectTimeout=20 \
+        "${ssh_args[@]}" \
+        "root@${host}" \
+        docker exec \
+        -i \
+        "${common_env[@]}" \
+        -e "NODE_RANK=${node_rank}" \
+        -e "VEOMNI_LAUNCHER_SOURCE_PATH=${launcher}" \
+        -w "${source_root}" \
+        "${container}" \
+        bash -s \
+        >"${host_root}/${run_name}_rank${node_rank}.host.log" 2>&1
+      then
+        return 0
+      fi
+      sleep $((snapshot_attempt * 2))
+    done
+    echo "failed to stream launcher to ${host} after ${remote_single_ssh_attempts} attempts" >&2
+    return 1
+  fi
+  for snapshot_attempt in 1 2 3 4 5; do
+    if printf '%s\n' "${launcher_source}" | ssh "${ssh_args[@]}" "root@${host}" \
+      docker exec \
+      -i \
+      -w "${source_root}" \
+      "${container}" \
+      tee "${launcher_snapshot}" \
+      >/dev/null
+    then
+      snapshot_ready=1
+      break
+    fi
+    sleep $((snapshot_attempt * 2))
+  done
+  if ((snapshot_ready == 0)); then
+    echo "failed to install launcher snapshot on ${host} after 5 attempts" >&2
+    return 1
+  fi
+  ssh "${ssh_args[@]}" "root@${host}" \
     docker exec \
     "${common_env[@]}" \
     -e "NODE_RANK=${node_rank}" \
     -w "${source_root}" \
     "${container}" \
-    bash "${launcher}" \
+    bash "${launcher_snapshot}" \
     >"${host_root}/${run_name}_rank${node_rank}.host.log" 2>&1
 }
 
@@ -567,29 +773,86 @@ rank0_container=${RANK0_CONTAINER_OVERRIDE:-tzq_npu_coremoe_verify_20260717}
 rank1_container=${RANK1_CONTAINER_OVERRIDE:-tzq_npu_static_r2_rank1_20260720}
 rank2_container=${RANK2_CONTAINER_OVERRIDE:-tzq_npu_static_r2_rank2_20260719}
 rank3_container=${RANK3_CONTAINER_OVERRIDE:-tzq_npu_static_r2_rank3_20260719}
+rank4_container=${RANK4_CONTAINER_OVERRIDE:-${rank0_container}}
+rank5_container=${RANK5_CONTAINER_OVERRIDE:-${rank0_container}}
+rank6_container=${RANK6_CONTAINER_OVERRIDE:-${rank0_container}}
+rank7_container=${RANK7_CONTAINER_OVERRIDE:-${rank0_container}}
 
-launch_remote 192.168.0.190 1 "${rank1_container}" &
-rank1_pid=$!
-launch_remote 192.168.0.109 2 "${rank2_container}" &
-rank2_pid=$!
-launch_remote 192.168.0.9 3 "${rank3_container}" &
-rank3_pid=$!
+if ((nnodes < 1 || nnodes > 8)); then
+  echo "NNODES_OVERRIDE must be between 1 and 8; got ${nnodes}" >&2
+  exit 2
+fi
 
-docker exec \
-  "${common_env[@]}" \
-  -e NODE_RANK=0 \
-  -w "${source_root}" \
-  "${rank0_container}" \
-  bash "${launcher}" \
-  >"${host_root}/${run_name}_rank0.host.log" 2>&1
-rank0_rc=$?
+rank_hosts=(
+  "${rank0_host}"
+  "${rank1_host}"
+  "${rank2_host}"
+  "${rank3_host}"
+  "${rank4_host}"
+  "${rank5_host}"
+  "${rank6_host}"
+  "${rank7_host}"
+)
+rank_containers=(
+  "${rank0_container}"
+  "${rank1_container}"
+  "${rank2_container}"
+  "${rank3_container}"
+  "${rank4_container}"
+  "${rank5_container}"
+  "${rank6_container}"
+  "${rank7_container}"
+)
+rank_pids=()
+rank_rcs=()
 
-wait "${rank1_pid}"
-rank1_rc=$?
-wait "${rank2_pid}"
-rank2_rc=$?
-wait "${rank3_pid}"
-rank3_rc=$?
-printf 'run=%s rank0_rc=%s rank1_rc=%s rank2_rc=%s rank3_rc=%s\n' \
-  "${run_name}" "${rank0_rc}" "${rank1_rc}" "${rank2_rc}" "${rank3_rc}"
-exit $((rank0_rc || rank1_rc || rank2_rc || rank3_rc))
+for ((node_rank = 1; node_rank < nnodes; ++node_rank)); do
+  if [[ -z "${rank_hosts[${node_rank}]}" ]]; then
+    echo "missing RANK${node_rank}_HOST_OVERRIDE for NNODES_OVERRIDE=${nnodes}" >&2
+    exit 2
+  fi
+  launch_remote \
+    "${rank_hosts[${node_rank}]}" \
+    "${node_rank}" \
+    "${rank_containers[${node_rank}]}" &
+  rank_pids[${node_rank}]=$!
+done
+
+if [[ -n "${rank0_host}" ]]; then
+  launch_remote "${rank0_host}" 0 "${rank0_container}"
+  rank0_rc=$?
+else
+  launcher_snapshot=${source_root}/scripts/profile/.paper32_${run_name}_node0_launcher.sh
+  printf '%s\n' "${launcher_source}" | docker exec \
+    -i \
+    -w "${source_root}" \
+    "${rank0_container}" \
+    tee "${launcher_snapshot}" \
+    >/dev/null
+  docker exec \
+    "${common_env[@]}" \
+    -e NODE_RANK=0 \
+    -w "${source_root}" \
+    "${rank0_container}" \
+    bash "${launcher_snapshot}" \
+    >"${host_root}/${run_name}_rank0.host.log" 2>&1
+  rank0_rc=$?
+fi
+
+rank_rcs[0]=${rank0_rc}
+overall_rc=${rank0_rc}
+for ((node_rank = 1; node_rank < nnodes; ++node_rank)); do
+  if wait "${rank_pids[${node_rank}]}"; then
+    rank_rcs[${node_rank}]=0
+  else
+    rank_rcs[${node_rank}]=$?
+    overall_rc=1
+  fi
+done
+
+printf 'run=%s' "${run_name}"
+for ((node_rank = 0; node_rank < nnodes; ++node_rank)); do
+  printf ' rank%s_rc=%s' "${node_rank}" "${rank_rcs[${node_rank}]}"
+done
+printf '\n'
+exit "${overall_rc}"

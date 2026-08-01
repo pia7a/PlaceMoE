@@ -39,6 +39,7 @@ from scripts.profile.build_hiermoe_hierarchical_init_layout import (
     _balanced_spectral_partition,
     _HybridEvaluator,
     _load_routes,
+    _mirrored_r2,
     _replay_payload,
 )
 
@@ -87,7 +88,33 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--optimize-steps", type=_parse_int_list, default=(1,))
     parser.add_argument("--validation-steps", type=_parse_int_list, default=(2,))
     parser.add_argument("--layer-start", type=int, default=0)
+    parser.add_argument(
+        "--layer-name-template",
+        default="model.language_model.layers.{layer}.mlp.experts",
+        help="Python format template for the runtime expert-module key.",
+    )
     parser.add_argument("--layers", type=int, default=48)
+    parser.add_argument(
+        "--call-indices",
+        type=_parse_int_list,
+        default=(0,),
+        help="Captured Forward call indices to include for every optimizer step.",
+    )
+    parser.add_argument(
+        "--forward-repeats",
+        type=int,
+        default=1,
+        help=(
+            "Forward microbatches captured per optimizer step. Repeated "
+            "forwards are stored in consecutive layer-index blocks."
+        ),
+    )
+    parser.add_argument(
+        "--expected-total-layers",
+        type=int,
+        default=48,
+        help="Total MoE layers in the model. Used only to gate full-model E2E eligibility.",
+    )
     parser.add_argument(
         "--workers",
         type=int,
@@ -158,6 +185,16 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also evaluate the denser token-KMeans node-library seed.",
     )
+    parser.add_argument(
+        "--communication-blind-proposals",
+        action="store_true",
+        help=(
+            "Generate candidates and source LUTs from assignment demand only. "
+            "This is required for a strict compute-only ablation: token "
+            "co-occurrence, source locality, and hierarchical communication "
+            "must not influence either proposal generation or exact selection."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=20260728)
     parser.add_argument("--hidden-size", type=int, default=2048)
     parser.add_argument("--bytes-per-element", type=int, default=2)
@@ -171,11 +208,38 @@ def _parse_args() -> argparse.Namespace:
         "--comparison-validation-ms",
         type=float,
         default=6116.241273880005,
-        help="Comparison-only held-out cost. It is never used to generate a candidate.",
+        help=(
+            "Comparison-only held-out cost. It is never used to generate a candidate. "
+            "Ignored when --comparison-layout is not 'none'."
+        ),
+    )
+    parser.add_argument(
+        "--comparison-layout",
+        choices=("none", "mirrored-r2"),
+        default="none",
+        help=(
+            "Optionally evaluate a matched comparison layout on the same held-out routes. "
+            "The main paper matrix uses mirrored-r2 instead of a topology-specific constant."
+        ),
     )
     parser.add_argument("--output-layout", type=Path, required=True)
     parser.add_argument("--output-report", type=Path, required=True)
     return parser.parse_args()
+
+
+def _is_e2e_eligible(
+    *,
+    layer_start: int,
+    layers: int,
+    expected_total_layers: int,
+    validation_total_ms: float,
+    comparison_validation_ms: float,
+) -> bool:
+    return bool(
+        layer_start == 0
+        and layers == expected_total_layers
+        and validation_total_ms <= comparison_validation_ms
+    )
 
 
 def _source_statistics(
@@ -1332,6 +1396,7 @@ def _initial_lut_instances(
     demand_by_source: np.ndarray,
     *,
     ranks_per_node: int,
+    prefer_local: bool = True,
 ) -> np.ndarray:
     ep_size, num_experts = demand_by_source.shape
     choices = [np.flatnonzero(logical_instances == expert) for expert in range(num_experts)]
@@ -1348,7 +1413,7 @@ def _initial_lut_instances(
     ):
         source_node = source_rank // ranks_per_node
         local = choices[expert][instance_ranks[choices[expert]] // ranks_per_node == source_node]
-        candidates = local if len(local) else choices[expert]
+        candidates = local if prefer_local and len(local) else choices[expert]
         best: tuple[tuple[float, ...], int] | None = None
         for instance in candidates.tolist():
             destination_rank = int(instance_ranks[instance])
@@ -1530,6 +1595,7 @@ def _build_candidate(
     cost_cache: dict[bytes, HybridCost] | None = None,
 ) -> _Candidate | None:
     started = time.perf_counter()
+    communication_blind = bool(args.communication_blind_proposals)
     if fixed_instance_nodes is None:
         if initial_instance_statistics is None:
             instance_demand, instance_affinity = _uniform_instance_statistics(
@@ -1586,6 +1652,7 @@ def _build_candidate(
                 instance_ranks,
                 demand_by_source,
                 ranks_per_node=args.ranks_per_node,
+                prefer_local=not communication_blind,
             )
         else:
             initial_lut = fixed_initial_lut
@@ -1601,8 +1668,8 @@ def _build_candidate(
                         affinity_by_source,
                         ranks_per_node=args.ranks_per_node,
                         iterations=args.lut_iterations,
-                        node_weight=1.0,
-                        rank_weight=0.15,
+                        node_weight=0.0 if communication_blind else 1.0,
+                        rank_weight=0.0 if communication_blind else 0.15,
                         assignment_weight=assignment_weight,
                     )
                 )
@@ -1647,6 +1714,8 @@ def _build_candidate(
             best.lut_instances,
             instances=len(logical_instances),
         )
+        if communication_blind:
+            instance_affinity.fill(0.0)
     if best is None:
         return None
     return _Candidate(
@@ -1719,7 +1788,7 @@ def _preloaded_replay_payload(
     layers: dict[str, object] = {}
     for offset, (layout, owner, lut) in enumerate(zip(layouts, owners, luts, strict=True)):
         layer = args.layer_start + offset
-        name = f"model.language_model.layers.{layer}.mlp.experts"
+        name = args.layer_name_template.format(layer=layer)
         layers[name] = {
             "slot_to_logical": [int(value) for value in layout.tolist()],
             "owner_slots": [int(value) for value in owner.tolist()],
@@ -1733,6 +1802,7 @@ def _preloaded_replay_payload(
             "route_root": str(args.route_root.resolve()),
             "optimize_steps": list(args.optimize_steps),
             "validation_steps": list(args.validation_steps),
+            "layer_name_template": args.layer_name_template,
             "requires_static_preload": True,
         },
         "topology": {
@@ -1760,17 +1830,25 @@ def _plan_layer(
         steps=args.optimize_steps,
         layer=layer,
         ep_size=args.ep_size,
+        call_indices=args.call_indices,
+        forward_repeats=args.forward_repeats,
+        layer_stride=args.expected_total_layers,
     )
     validation_samples = _load_routes(
         args.route_root,
         steps=args.validation_steps,
         layer=layer,
         ep_size=args.ep_size,
+        call_indices=args.call_indices,
+        forward_repeats=args.forward_repeats,
+        layer_stride=args.expected_total_layers,
     )
     source_demand, source_affinity = _source_statistics(
         optimize_samples,
         num_experts=args.num_experts,
     )
+    if args.communication_blind_proposals:
+        source_affinity.fill(0.0)
     # These are exact identities, not approximations: source statistics retain
     # one row per EP rank, and their affinity sum is the same global pair
     # count previously rebuilt by a second complete route scan.
@@ -1810,11 +1888,15 @@ def _plan_layer(
                 total_slots=args.ep_size * args.slots_per_rank,
             )
             logical_key = logical_instances.tobytes()
-            structured = _structured_instance_node_candidates(
-                partition,
-                logical_instances,
-                source_demand,
-                ranks_per_node=args.ranks_per_node,
+            structured = (
+                []
+                if args.communication_blind_proposals
+                else _structured_instance_node_candidates(
+                    partition,
+                    logical_instances,
+                    source_demand,
+                    ranks_per_node=args.ranks_per_node,
+                )
             )
             structured_route_statistics = (
                 _group_route_statistics(
@@ -1887,7 +1969,7 @@ def _plan_layer(
                         "fixed_initial_lut": coherent_lut,
                     }
                 )
-            if args.hyperedge_seed:
+            if args.hyperedge_seed and not args.communication_blind_proposals:
                 hyperedge_nodes = _hyperedge_instance_nodes(
                     optimize_samples,
                     logical_instances,
@@ -1926,6 +2008,18 @@ def _plan_layer(
         raise RuntimeError(f"No feasible recursive classifier candidate for layer {layer}.")
     best = min(candidates, key=lambda item: item.optimize_cost.total_ms)
     validation_cost = evaluator.evaluate(validation_samples, best.lut)
+    comparison_validation_cost: HybridCost | None = None
+    if args.comparison_layout == "mirrored-r2":
+        if args.ep_size % 2 or args.ep_size * args.slots_per_rank != 2 * args.num_experts:
+            raise ValueError(
+                "mirrored-r2 comparison requires an even EP size and exactly two full expert copies."
+            )
+        _r2_layout, _r2_owners, r2_lut = _mirrored_r2(
+            ep_size=args.ep_size,
+            num_experts=args.num_experts,
+            slots_per_rank=args.slots_per_rank,
+        )
+        comparison_validation_cost = evaluator.evaluate(validation_samples, r2_lut)
     active_layout = best.layout[best.layout >= 0]
     copy_counts = np.bincount(active_layout, minlength=args.num_experts)
     layer_ms = (time.perf_counter() - layer_started) * 1000.0
@@ -1952,6 +2046,9 @@ def _plan_layer(
         "copy_counts": [int(value) for value in copy_counts.tolist()],
         "optimize": asdict(best.optimize_cost),
         "validation": asdict(validation_cost),
+        "comparison_validation": (
+            asdict(comparison_validation_cost) if comparison_validation_cost is not None else None
+        ),
     }
     print(
         f"layer={layer:02d} strategy={best.strategy} candidates={len(candidates)} "
@@ -1965,6 +2062,8 @@ def _plan_layer(
 
 def main() -> None:
     args = _parse_args()
+    if "{layer}" not in args.layer_name_template:
+        raise ValueError("--layer-name-template must contain the '{layer}' placeholder.")
     capacity = _validate_configuration(args)
     if args.workers <= 0 or args.candidate_workers <= 0 or args.worker_threads <= 0:
         raise ValueError("workers, candidate-workers, and worker-threads must be positive.")
@@ -1984,7 +2083,10 @@ def main() -> None:
     rows = [item[4] for item in results]
 
     validation_total = sum(float(row["validation"]["total_ms"]) for row in rows)
-    comparison_ms = float(args.comparison_validation_ms)
+    if args.comparison_layout == "mirrored-r2":
+        comparison_ms = sum(float(row["comparison_validation"]["total_ms"]) for row in rows)
+    else:
+        comparison_ms = float(args.comparison_validation_ms)
     report = {
         "schema_version": 1,
         "algorithm": "capacity-general-recursive-classifier-v2",
@@ -2011,7 +2113,13 @@ def main() -> None:
             "comparison_validation_ms": comparison_ms,
             "validation_gain_ms": comparison_ms - validation_total,
             "validation_speedup": comparison_ms / validation_total,
-            "e2e_eligible": bool(args.layer_start == 0 and args.layers == 48 and validation_total <= comparison_ms),
+            "e2e_eligible": _is_e2e_eligible(
+                layer_start=args.layer_start,
+                layers=args.layers,
+                expected_total_layers=args.expected_total_layers,
+                validation_total_ms=validation_total,
+                comparison_validation_ms=comparison_ms,
+            ),
         },
     }
     serialization_mode = "preloaded"

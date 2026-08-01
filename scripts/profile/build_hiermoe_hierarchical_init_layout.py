@@ -198,20 +198,64 @@ def _load_routes(
     steps: tuple[int, ...],
     layer: int,
     ep_size: int,
+    call_indices: tuple[int, ...] = (0,),
+    forward_repeats: int = 1,
+    layer_stride: int | None = None,
 ) -> list[list[torch.Tensor]]:
+    if not call_indices:
+        raise ValueError("call_indices must not be empty.")
+    if forward_repeats <= 0:
+        raise ValueError("forward_repeats must be positive.")
+    if layer_stride is None:
+        layer_stride = 0
+    if layer_stride < 0:
+        raise ValueError("layer_stride must be non-negative.")
+    if forward_repeats > 1 and layer_stride == 0:
+        raise ValueError("layer_stride must be positive when forward_repeats > 1.")
+
     samples: list[list[torch.Tensor]] = []
     for step in steps:
-        rows: list[torch.Tensor] = []
-        for rank in range(ep_size):
-            path = root / f"step{step:04d}" / f"layer{layer:02d}_call0_rank{rank:02d}.pt"
-            payload = torch.load(path, map_location="cpu", weights_only=False)
-            route = payload.get("routes") if isinstance(payload, dict) else None
-            if not torch.is_tensor(route) or route.ndim != 2:
-                raise ValueError(f"Invalid route capture: {path}.")
-            if int(payload.get("ep_size", -1)) != ep_size:
-                raise ValueError(f"Route capture has a different EP size: {path}.")
-            rows.append(route.to(dtype=torch.long).contiguous())
-        samples.append(rows)
+        for repeat in range(forward_repeats):
+            capture_layer = layer + repeat * layer_stride
+            for call_index in call_indices:
+                bundle_path = (
+                    root
+                    / f"step{step:04d}"
+                    / f"layer{capture_layer:02d}_call{call_index}_all_ranks.pt"
+                )
+                if bundle_path.is_file():
+                    payload = torch.load(bundle_path, map_location="cpu", weights_only=False)
+                    routes_by_rank = payload.get("routes_by_rank") if isinstance(payload, dict) else None
+                    if (
+                        not isinstance(payload, dict)
+                        or payload.get("format") != "hiermoe-local-route-bundle-v1"
+                        or int(payload.get("ep_size", -1)) != ep_size
+                        or not isinstance(routes_by_rank, (list, tuple))
+                        or len(routes_by_rank) != ep_size
+                    ):
+                        raise ValueError(f"Invalid bundled route capture: {bundle_path}.")
+                    rows = []
+                    for route in routes_by_rank:
+                        if not torch.is_tensor(route) or route.ndim != 2:
+                            raise ValueError(f"Invalid bundled route capture: {bundle_path}.")
+                        rows.append(route.to(dtype=torch.long).contiguous())
+                    samples.append(rows)
+                    continue
+                rows: list[torch.Tensor] = []
+                for rank in range(ep_size):
+                    path = (
+                        root
+                        / f"step{step:04d}"
+                        / f"layer{capture_layer:02d}_call{call_index}_rank{rank:02d}.pt"
+                    )
+                    payload = torch.load(path, map_location="cpu", weights_only=False)
+                    route = payload.get("routes") if isinstance(payload, dict) else None
+                    if not torch.is_tensor(route) or route.ndim != 2:
+                        raise ValueError(f"Invalid route capture: {path}.")
+                    if int(payload.get("ep_size", -1)) != ep_size:
+                        raise ValueError(f"Route capture has a different EP size: {path}.")
+                    rows.append(route.to(dtype=torch.long).contiguous())
+                samples.append(rows)
     return samples
 
 

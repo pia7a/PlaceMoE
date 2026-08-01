@@ -57,6 +57,34 @@ def test_static_preload_shards_checkpoint_by_final_slot_layout(tmp_path, monkeyp
     torch.testing.assert_close(rank1, tensor.index_select(0, torch.tensor([3, 2, 0])))
 
 
+def test_static_preload_resolves_checkpoint_wrapper_prefix(tmp_path, monkeypatch):
+    layout_key = "model.language_model.layers.0.mlp.experts"
+    replay_path = tmp_path / "wrapped_layout.json"
+    replay_path.write_text(
+        json.dumps(
+            {
+                "layers": {
+                    layout_key: {
+                        "slot_to_logical": [3, 0, 1, 3, 2, 0],
+                    }
+                }
+            }
+        )
+    )
+    _hiermoe_static_preload_layouts.cache_clear()
+    monkeypatch.setenv("VEOMNI_HIERMOE_STATIC_PRELOAD_LAYOUT_PATH", str(replay_path))
+    tensor = torch.arange(8, dtype=torch.float32).view(4, 2)
+
+    shard = _hiermoe_static_preload_shard(
+        tensor,
+        "model.layers.0.mlp.experts.down_proj",
+        (3, 2),
+        para_rank=1,
+    )
+
+    torch.testing.assert_close(shard, tensor.index_select(0, torch.tensor([3, 2, 0])))
+
+
 def test_static_preload_zero_fills_inactive_slots(tmp_path, monkeypatch):
     key = "layers.0.mlp.experts"
     replay_path = tmp_path / "layout_with_empty.json"
@@ -360,6 +388,50 @@ def test_static_preload_installs_metadata_without_expert_transfer(tmp_path, monk
         [5, 1, 3, 4],
     ]
     manager.shutdown_pipeline()
+
+
+def test_ablation_replay_resolves_model_wrapper_prefix(tmp_path, monkeypatch):
+    replay_key = "model.language_model.layers.0.mlp.experts"
+    model_key = "model.layers.0.mlp.experts"
+    replay_path = tmp_path / "wrapped_replay.json"
+    replay_path.write_text(
+        json.dumps(
+            {
+                "topology": {"ep_size": 2},
+                "replay": {
+                    "actions_by_step": {
+                        "1": [{"layer": replay_key, "kind": "replica", "body": "0->5"}],
+                    }
+                },
+                "layers": {
+                    replay_key: {
+                        "slot_to_logical": [0, 1, 3, 2, 3, 0],
+                        "owner_slots": [0, 1, 3, 4],
+                    }
+                },
+            }
+        )
+    )
+    manager = _manager(monkeypatch, replay_path)
+    manager.register_layer(model_key, _FakeExperts())
+
+    manager._normalize_ablation_layer_keys()
+
+    assert set(manager._ablation_expected_layouts) == {model_key}
+    assert set(manager._ablation_expected_owner_slots) == {model_key}
+    assert set(manager._ablation_actions_by_step[1]) == {model_key}
+    manager.shutdown_pipeline()
+
+
+def test_dedicated_gradient_group_does_not_wait_before_dispatch():
+    manager = object.__new__(expert_swap_module.ExpertSwapManager)
+    manager.fixed_pipeline_overlap = True
+    manager._ablation_grad_mode = "hidden"
+    manager._pipeline_micro_step = 1
+    manager._pipeline_num_micro_steps = 2
+    manager._owns_pipeline_grad_group = True
+
+    manager.close_pipeline_gradient_window_before_dispatch("layers.0.mlp.experts")
 
 
 def _blocking_gradient_sync_worker():

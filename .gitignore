@@ -9,6 +9,7 @@ dist/
 *.egg-info/
 log.txt
 *.md
+!docs/perf/hiermoe_e2e_ablation_guide_zh.md
 profile/runs/
 profile/figures/
 profile/processed/

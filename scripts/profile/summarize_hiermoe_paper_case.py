@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import statistics
@@ -21,7 +22,9 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--start-step", type=int, default=11)
     parser.add_argument("--end-step", type=int, default=20)
     parser.add_argument("--expected-ranks", type=int, default=32)
+    parser.add_argument("--grad-mode")
     parser.add_argument("--layout-report", type=Path)
+    parser.add_argument("--layout-path", type=Path)
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -30,6 +33,17 @@ def _jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _latest_by_step(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the newest record for each step when a run directory was reused."""
+
+    latest: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        step = int(row.get("step", -1))
+        if step >= 0:
+            latest[step] = row
+    return [latest[step] for step in sorted(latest)]
 
 
 def _mean_std(values: list[float]) -> dict[str, float | int | None]:
@@ -44,6 +58,13 @@ def _mean_std(values: list[float]) -> dict[str, float | int | None]:
 
 def _metric(rows: list[dict[str, Any]], key: str) -> list[float]:
     return [float(row[key]) for row in rows if key in row and isinstance(row[key], (int, float))]
+
+
+def _constant_text(rows: list[dict[str, Any]], key: str) -> str | None:
+    values = {str(row[key]) for row in rows if key in row and row[key] is not None}
+    if len(values) > 1:
+        raise RuntimeError(f"{key} changed inside the steady measurement range: {sorted(values)}")
+    return next(iter(values), None)
 
 
 def _layout_seconds(path: Path | None) -> float | None:
@@ -69,21 +90,51 @@ def _layout_seconds(path: Path | None) -> float | None:
     return None
 
 
+def _sha256(path: Path | None) -> str | None:
+    if path is None or not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _e2e_from_env(
+    rows_by_step: dict[int, dict[str, Any]],
+    selected_steps: list[int],
+) -> list[float]:
+    """Recover step wall time from the lightweight throughput counters."""
+
+    values: list[float] = []
+    for step in selected_steps:
+        row = rows_by_step.get(step)
+        previous = rows_by_step.get(step - 1)
+        if row is None or previous is None:
+            continue
+        consumed = float(row["consume_tokens(M)"]) - float(previous["consume_tokens(M)"])
+        throughput = float(row["tokens_per_second(M)"])
+        if consumed <= 0 or throughput <= 0:
+            continue
+        values.append(consumed / throughput * 1000.0)
+    return values
+
+
 def main() -> None:
     args = _args()
     run_root = args.profile_root / args.run_name
     selected = set(range(args.start_step, args.end_step + 1))
 
-    env_rows = [
-        row
-        for row in _jsonl(run_root / "env_metrics" / "env_metrics_rank0.jsonl")
-        if int(row.get("step", -1)) in selected
-    ]
-    full_rows = [
-        row
-        for row in _jsonl(run_root / "full_timing" / "step_timing_rank0.jsonl")
-        if int(row.get("step", -1)) in selected and row.get("section") == "train_step_total"
-    ]
+    all_env_rows = _latest_by_step(_jsonl(run_root / "env_metrics" / "env_metrics_rank0.jsonl"))
+    env_by_step = {int(row["step"]): row for row in all_env_rows}
+    env_rows = [env_by_step[step] for step in sorted(selected) if step in env_by_step]
+    full_rows = _latest_by_step(
+        [
+            row
+            for row in _jsonl(run_root / "full_timing" / "step_timing_rank0.jsonl")
+            if int(row.get("step", -1)) in selected and row.get("section") == "train_step_total"
+        ]
+    )
 
     component_by_step: dict[tuple[int, str, str], list[float]] = defaultdict(list)
     rank_assignments_by_step: dict[int, list[float]] = defaultdict(list)
@@ -93,13 +144,29 @@ def main() -> None:
         raise RuntimeError(
             f"{args.run_name}: expected {args.expected_ranks} MoE timing ranks, found {len(timing_files)}."
         )
-    if len(full_rows) != expected_steps or len(env_rows) != expected_steps:
+    if len(env_rows) != expected_steps:
         raise RuntimeError(
             f"{args.run_name}: expected {expected_steps} steady records; "
             f"found full_timing={len(full_rows)} env_metrics={len(env_rows)}."
         )
+    if full_rows:
+        if len(full_rows) != expected_steps:
+            raise RuntimeError(
+                f"{args.run_name}: partial Full Profile data is not usable: "
+                f"found {len(full_rows)} of {expected_steps} steady records."
+            )
+        e2e_step_ms = [float(row["wall_ms"]) for row in full_rows]
+        e2e_source = "full_timing"
+    else:
+        e2e_step_ms = _e2e_from_env(env_by_step, sorted(selected))
+        if len(e2e_step_ms) != expected_steps:
+            raise RuntimeError(
+                f"{args.run_name}: lightweight E2E recovery found "
+                f"{len(e2e_step_ms)} of {expected_steps} steady records."
+            )
+        e2e_source = "env_token_delta_over_throughput"
     for path in timing_files:
-        for row in _jsonl(path):
+        for row in _latest_by_step(_jsonl(path)):
             step = int(row.get("step", -1))
             if step not in selected:
                 continue
@@ -139,8 +206,7 @@ def main() -> None:
         )
     ]
     complete_region = [
-        forward_region[index] + backward_a2a[index]
-        for index in range(min(len(forward_region), len(backward_a2a)))
+        forward_region[index] + backward_a2a[index] for index in range(min(len(forward_region), len(backward_a2a)))
     ]
 
     load_cv: list[float] = []
@@ -158,7 +224,8 @@ def main() -> None:
         "run_name": args.run_name,
         "steady_steps": [args.start_step, args.end_step],
         "observed_moe_ranks": len(timing_files),
-        "e2e_step_ms": _mean_std([float(row["wall_ms"]) for row in full_rows]),
+        "e2e_step_ms": _mean_std(e2e_step_ms),
+        "e2e_source": e2e_source,
         "tokens_per_second_millions": _mean_std(_metric(env_rows, "tokens_per_second(M)")),
         "forward_a2a_ms": _mean_std(forward_a2a),
         "backward_a2a_ms": _mean_std(backward_a2a),
@@ -167,9 +234,12 @@ def main() -> None:
         "physical_assignment_rank_cv": _mean_std(load_cv),
         "physical_assignment_rank_max_over_mean": _mean_std(load_max_ratio),
         "dedup_ratio_dispatch": _mean_std(_metric(env_rows, "hiermoe/dedup_ratio_dispatch")),
+        "hiermoe_ablation_grad_mode": (_constant_text(env_rows, "hiermoe/ablation_grad_mode") or args.grad_mode),
         "peak_npu_allocated_gib": max(_metric(env_rows, "max_memory_allocated(GB)"), default=None),
         "peak_npu_reserved_gib": max(_metric(env_rows, "max_memory_reserved(GB)"), default=None),
         "offline_layout_seconds": _layout_seconds(args.layout_report),
+        "layout_sha256": _sha256(args.layout_path),
+        "layout_report_sha256": _sha256(args.layout_report),
     }
     output = args.output or run_root / "paper_summary.json"
     output.parent.mkdir(parents=True, exist_ok=True)

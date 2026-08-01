@@ -138,6 +138,11 @@ def _make_moe_experts_adapter(raw_forward):
     """
 
     def adapter(self, hidden_states, top_k_index, top_k_weights):
+        layer_key = get_hiermoe_expert_layer_key(self) or getattr(
+            self,
+            "_veomni_physical_load_layer_key",
+            None,
+        )
         return raw_forward(
             num_experts=self.num_experts,
             routing_weights=top_k_weights.to(hidden_states.dtype),
@@ -147,7 +152,7 @@ def _make_moe_experts_adapter(raw_forward):
             fc1_2_weight=None,
             fc2_weight=self.down_proj,
             fc1_1_2_weight=self.gate_up_proj,
-            layer_key=get_hiermoe_expert_layer_key(self),
+            layer_key=layer_key,
         )
 
     return adapter

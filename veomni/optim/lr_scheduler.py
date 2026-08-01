@@ -81,6 +81,13 @@ def build_lr_scheduler(
             )
         return MultiLRScheduler(schedulers)
 
+    # A zero learning rate is useful for performance experiments that must run
+    # the complete forward/backward/optimizer path without changing model
+    # parameters. Decay schedules divide by the initial learning rate, so use
+    # a constant multiplicative factor and retain the optimizer's zero base LR.
+    if lr == 0.0:
+        return LambdaLR(optimizer, lambda _current_step: 1.0)
+
     lr_warmup_steps = int(train_steps * lr_warmup_ratio)
     if lr_decay_style == "constant":
         return get_constant_schedule_with_warmup(

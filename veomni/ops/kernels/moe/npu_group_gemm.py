@@ -42,6 +42,7 @@ from ....distributed.moe.timing import (
 from ....distributed.moe.validation import moe_validation_enabled, record_moe_validation_routing
 from ....distributed.parallel_state import get_parallel_state
 from ....utils.device import stream_synchronize
+from ....utils.physical_moe_load import record_physical_moe_load
 from ._kernels.kernel.npu_group_gemm import npu_group_gemm
 
 
@@ -210,6 +211,11 @@ def npu_ep_fused_moe_forward(
                 layer_key=layer_key,
                 placement_already_applied=placement_already_applied,
             )
+        record_physical_moe_load(
+            layer_key,
+            int(hidden_states.shape[0]),
+            device=hidden_states.device,
+        )
         placement_dispatch_end = placement_manager.placement_timing_event() if capture_placement_timing else None
         dispatch_ms = (time.perf_counter() - dispatch_start) * 1000.0 if dispatch_start is not None else None
         region_end = moe_timing_event() if timing_record is not None else None
@@ -345,6 +351,11 @@ def npu_ep_fused_moe_forward(
             num_global_tokens_per_local_expert,
             ep_group,
         )
+    record_physical_moe_load(
+        layer_key,
+        int(hidden_states.shape[0]),
+        device=hidden_states.device,
+    )
     region_end = moe_timing_event() if timing_record is not None else None
     record_moe_timing_span(
         timing_record,

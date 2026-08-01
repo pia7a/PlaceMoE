@@ -6,10 +6,12 @@ import numpy as np
 import pytest
 import torch
 
-from scripts.profile.build_hiermoe_hierarchical_init_layout import _route_statistics
+from scripts.profile.build_hiermoe_hierarchical_init_layout import _load_routes, _route_statistics
 from scripts.profile.build_hiermoe_recursive_classifier_layout import (
     _classify_instances,
     _group_route_statistics,
+    _initial_lut_instances,
+    _is_e2e_eligible,
     _logical_instances,
     _materialize_layout,
     _partition_proxy_cost,
@@ -22,6 +24,80 @@ from scripts.profile.build_hiermoe_recursive_classifier_layout import (
     _uniform_instance_statistics,
     _validate_configuration,
 )
+
+
+def test_compute_only_initial_lut_does_not_prefer_source_locality() -> None:
+    logical_instances = np.asarray([0, 0], dtype=np.int64)
+    instance_ranks = np.asarray([0, 2], dtype=np.int64)
+    demand = np.asarray([[100.0], [90.0], [0.0], [0.0]], dtype=np.float64)
+
+    local = _initial_lut_instances(
+        logical_instances,
+        instance_ranks,
+        demand,
+        ranks_per_node=2,
+        prefer_local=True,
+    )
+    compute_only = _initial_lut_instances(
+        logical_instances,
+        instance_ranks,
+        demand,
+        ranks_per_node=2,
+        prefer_local=False,
+    )
+
+    assert int(local[1, 0]) == 0
+    assert int(compute_only[1, 0]) == 1
+
+
+def test_load_routes_accepts_one_all_rank_bundle(tmp_path) -> None:
+    capture_dir = tmp_path / "step0000"
+    capture_dir.mkdir()
+    expected = [
+        torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+        torch.tensor([[3, 2]], dtype=torch.int32),
+    ]
+    torch.save(
+        {
+            "format": "hiermoe-local-route-bundle-v1",
+            "ep_size": 2,
+            "routes_by_rank": expected,
+        },
+        capture_dir / "layer00_call0_all_ranks.pt",
+    )
+
+    samples = _load_routes(tmp_path, steps=(0,), layer=0, ep_size=2)
+
+    assert len(samples) == 1
+    assert all(torch.equal(actual, wanted.to(torch.long)) for actual, wanted in zip(samples[0], expected, strict=True))
+
+
+@pytest.mark.parametrize("total_layers", [40, 48])
+def test_e2e_eligibility_accepts_complete_model_layer_count(total_layers: int) -> None:
+    assert _is_e2e_eligible(
+        layer_start=0,
+        layers=total_layers,
+        expected_total_layers=total_layers,
+        validation_total_ms=10.0,
+        comparison_validation_ms=11.0,
+    )
+
+
+def test_e2e_eligibility_rejects_partial_or_regressed_layout() -> None:
+    assert not _is_e2e_eligible(
+        layer_start=0,
+        layers=20,
+        expected_total_layers=40,
+        validation_total_ms=10.0,
+        comparison_validation_ms=11.0,
+    )
+    assert not _is_e2e_eligible(
+        layer_start=0,
+        layers=40,
+        expected_total_layers=40,
+        validation_total_ms=12.0,
+        comparison_validation_ms=11.0,
+    )
 
 
 def test_group_route_statistics_match_direct_token_incidence() -> None:

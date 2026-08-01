@@ -58,7 +58,19 @@ def _hiermoe_static_preload_shard(
     layer_key = parameter_name.rsplit(".", maxsplit=1)[0]
     layouts = _hiermoe_static_preload_layouts(path)
     if layer_key not in layouts:
-        raise ValueError(f"HierMoE static preload file {path!r} has no layer {layer_key!r}.")
+        # Some Hugging Face checkpoint converters remove a wrapper such as
+        # ``language_model`` from parameter names, while ``named_modules()``
+        # (and therefore the saved layout) retains it.  Resolve that known
+        # prefix-only difference by the stable transformer-layer suffix.
+        marker = ".layers."
+        suffix = layer_key[layer_key.index(marker) :] if marker in layer_key else ""
+        matches = [key for key in layouts if suffix and key.endswith(suffix)]
+        if len(matches) != 1:
+            raise ValueError(
+                f"HierMoE static preload file {path!r} has no unambiguous layer for {layer_key!r}; "
+                f"suffix={suffix!r}, matches={matches}."
+            )
+        layer_key = matches[0]
     local_slots = int(target_shape[0])
     slot_start = int(para_rank) * local_slots
     slot_end = slot_start + local_slots

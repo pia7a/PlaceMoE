@@ -868,6 +868,42 @@ def _index_add_dim0(output: torch.Tensor, index: torch.Tensor, source: torch.Ten
     return output
 
 
+def _index_add_dim0_fp32(output: torch.Tensor, index: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+    """Accumulate into FP32 without materializing a full-size FP32 source.
+
+    Hierarchical combine payloads can contain hundreds of thousands of hidden
+    rows at EP64. Converting the complete BF16 payload with ``source.float()``
+    creates a multi-GiB temporary even though index-add can consume independent
+    row chunks. Chunking preserves the exact FP32 accumulation semantics and
+    autograd graph while bounding the conversion peak.
+    """
+
+    if output.dtype != torch.float32:
+        raise ValueError(f"FP32 index-add requires a float32 output, got {output.dtype}.")
+    if int(index.numel()) != int(source.shape[0]):
+        raise ValueError(
+            f"index/source row mismatch: index={index.numel()} source={source.shape[0]}."
+        )
+    if source.numel() == 0:
+        return output
+
+    chunk_rows = max(
+        1,
+        int(os.getenv("VEOMNI_HIERMOE_INDEX_ADD_FP32_CHUNK_ROWS", "65536")),
+    )
+    if source.dtype == torch.float32 or int(source.shape[0]) <= chunk_rows:
+        return _index_add_dim0(output, index, source.to(torch.float32))
+
+    for start in range(0, int(source.shape[0]), chunk_rows):
+        end = min(start + chunk_rows, int(source.shape[0]))
+        output = _index_add_dim0(
+            output,
+            index[start:end],
+            source[start:end].to(torch.float32),
+        )
+    return output
+
+
 def _sort_flat_assignments_by_rank_token(
     hidden_states: torch.Tensor,
     target_ranks: torch.Tensor,
@@ -2181,7 +2217,7 @@ def _aggregate_weighted_outputs(
         dtype=torch.float32,
         device=weighted_outputs.device,
     )
-    accum = _index_add_dim0(accum, inverse, weighted_outputs.float())
+    accum = _index_add_dim0_fp32(accum, inverse, weighted_outputs)
     return accum.to(weighted_outputs.dtype), output_splits
 
 
@@ -2198,7 +2234,11 @@ def _hierarchical_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDisp
             device=weighted_outputs.device,
         )
         if weighted_outputs.numel() > 0 and ctx.recv_unique_indices is not None:
-            stage2_accum = _index_add_dim0(stage2_accum, ctx.recv_unique_indices, weighted_outputs.float())
+            stage2_accum = _index_add_dim0_fp32(
+                stage2_accum,
+                ctx.recv_unique_indices,
+                weighted_outputs,
+            )
     finally:
         _end_internal_span(span)
         _finish_hiermoe_internal_event(
@@ -2206,12 +2246,18 @@ def _hierarchical_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDisp
             "combine_stage2_accum",
             internal_start,
         )
+    # The weighted expert output is no longer consumed after the stage-2
+    # accumulation.  Drop its Python reference before materializing the BF16
+    # communication buffer; for long-sequence workloads both tensors can be
+    # hundreds of MiB and otherwise overlap until this function returns.
+    del weighted_outputs
     stage2_send = _mark_backward_a2a_input(
         stage2_accum.to(expert_outputs.dtype),
         ctx.backward_internal_timing_events,
         "backward_combine_stage2_a2a",
         ctx.layer_key,
     )
+    del stage2_accum
     if pipeline_manager is not None:
         pipeline_manager.open_pipeline_planner_prepare_window(ctx.layer_key, 2)
     combine_stage2_a2a_start = _hiermoe_internal_event()
@@ -2221,6 +2267,7 @@ def _hierarchical_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDisp
         ctx.stage2_unique_send_splits or [],
         ctx.stage2_unique_recv_splits or [],
     )
+    del stage2_send
     combine_stage2_a2a_end = _hiermoe_internal_event()
     if pipeline_manager is not None:
         pipeline_manager.close_pipeline_planner_prepare_window(ctx.layer_key, 2)
@@ -2250,7 +2297,11 @@ def _hierarchical_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDisp
             device=relay_partials.device,
         )
         if relay_partials.numel() > 0 and ctx.stage2_send_stage1_unique_indices is not None:
-            stage1_accum = _index_add_dim0(stage1_accum, ctx.stage2_send_stage1_unique_indices, relay_partials.float())
+            stage1_accum = _index_add_dim0_fp32(
+                stage1_accum,
+                ctx.stage2_send_stage1_unique_indices,
+                relay_partials,
+            )
     finally:
         _end_internal_span(span)
         _finish_hiermoe_internal_event(
@@ -2259,12 +2310,17 @@ def _hierarchical_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDisp
             internal_start,
         )
 
+    # relay_partials has been fully reduced into stage1_accum.  Releasing it
+    # before the FP32->payload cast avoids a full-size relay buffer overlapping
+    # the stage-1 send allocation at the peak of checkpoint recomputation.
+    del relay_partials
     stage1_send = _mark_backward_a2a_input(
         stage1_accum.to(expert_outputs.dtype),
         ctx.backward_internal_timing_events,
         "backward_combine_stage1_a2a",
         ctx.layer_key,
     )
+    del stage1_accum
     if pipeline_manager is not None:
         pipeline_manager.open_pipeline_planner_prepare_window(ctx.layer_key, 3)
     combine_stage1_a2a_start = _hiermoe_internal_event()
@@ -2274,6 +2330,7 @@ def _hierarchical_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDisp
         ctx.stage1_unique_send_splits or [],
         ctx.stage1_unique_recv_splits or [],
     )
+    del stage1_send
     combine_stage1_a2a_end = _hiermoe_internal_event()
     if pipeline_manager is not None:
         pipeline_manager.close_pipeline_planner_prepare_window(ctx.layer_key, 3)
@@ -2301,8 +2358,10 @@ def _hierarchical_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDisp
             device=partial_outputs.device,
         )
         if partial_outputs.numel() > 0:
-            final_hidden_states = _index_add_dim0(
-                final_hidden_states, ctx.local_unique_token_indices, partial_outputs.float()
+            final_hidden_states = _index_add_dim0_fp32(
+                final_hidden_states,
+                ctx.local_unique_token_indices,
+                partial_outputs,
             )
     finally:
         _end_internal_span(span)
@@ -2311,7 +2370,9 @@ def _hierarchical_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDisp
             "combine_final_accum",
             internal_start,
         )
-    return final_hidden_states.to(partial_outputs.dtype)
+    output_dtype = partial_outputs.dtype
+    del partial_outputs
+    return final_hidden_states.to(output_dtype)
 
 
 def _hierarchical3d_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDispatchContext) -> torch.Tensor:
@@ -2325,7 +2386,11 @@ def _hierarchical3d_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDi
             device=weighted_outputs.device,
         )
         if weighted_outputs.numel() > 0 and ctx.recv_unique_indices is not None:
-            stage3_accum = _index_add_dim0(stage3_accum, ctx.recv_unique_indices, weighted_outputs.float())
+            stage3_accum = _index_add_dim0_fp32(
+                stage3_accum,
+                ctx.recv_unique_indices,
+                weighted_outputs,
+            )
     finally:
         _end_internal_span(span)
     stage3_partials = _call_all_to_all(
@@ -2344,10 +2409,10 @@ def _hierarchical3d_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDi
             device=stage3_partials.device,
         )
         if stage3_partials.numel() > 0 and ctx.stage3_send_stage2_unique_indices is not None:
-            stage2_accum = _index_add_dim0(
+            stage2_accum = _index_add_dim0_fp32(
                 stage2_accum,
                 ctx.stage3_send_stage2_unique_indices,
-                stage3_partials.float(),
+                stage3_partials,
             )
     finally:
         _end_internal_span(span)
@@ -2367,10 +2432,10 @@ def _hierarchical3d_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDi
             device=stage2_partials.device,
         )
         if stage2_partials.numel() > 0 and ctx.stage2_send_stage1_unique_indices is not None:
-            stage1_accum = _index_add_dim0(
+            stage1_accum = _index_add_dim0_fp32(
                 stage1_accum,
                 ctx.stage2_send_stage1_unique_indices,
-                stage2_partials.float(),
+                stage2_partials,
             )
     finally:
         _end_internal_span(span)
@@ -2389,10 +2454,10 @@ def _hierarchical3d_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDi
             device=partial_outputs.device,
         )
         if partial_outputs.numel() > 0:
-            final_hidden_states = _index_add_dim0(
+            final_hidden_states = _index_add_dim0_fp32(
                 final_hidden_states,
                 ctx.local_unique_token_indices,
-                partial_outputs.float(),
+                partial_outputs,
             )
     finally:
         _end_internal_span(span)
@@ -2426,9 +2491,9 @@ def rank_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDispatchConte
         device=partial_outputs.device,
     )
     if partial_outputs.numel() > 0:
-        final_hidden_states = _index_add_dim0(
+        final_hidden_states = _index_add_dim0_fp32(
             final_hidden_states,
             ctx.local_unique_token_indices,
-            partial_outputs.float(),
+            partial_outputs,
         )
     return final_hidden_states.to(partial_outputs.dtype)

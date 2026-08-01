@@ -28,7 +28,7 @@ from ..utils import helper
 from ..utils.device import synchronize
 from ..utils.loss_utils import count_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
-from .base import BaseTrainer, _collect_muon_kwargs, _scalar_float
+from .base import BaseTrainer, _collect_muon_kwargs, _hiermoe_diag_phase, _scalar_float
 
 
 logger = helper.create_logger(__name__)
@@ -311,11 +311,15 @@ class VLMTrainer:
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
+        _hiermoe_diag_phase("redundant_grad_sync_start")
         self.base.sync_hiermoe_redundant_gradients()
+        _hiermoe_diag_phase("redundant_grad_sync_done")
 
         # Gradient clipping
+        _hiermoe_diag_phase("grad_clip_start")
         with self.base._full_profile_range("grad_clip"):
             grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+        _hiermoe_diag_phase("grad_clip_done")
 
         # Optimizer and scheduler step
         with self.base._full_profile_range("optimizer_step"):
@@ -338,11 +342,14 @@ class VLMTrainer:
             f"Rank{args.train.local_rank} Start training. "
             f"Start step: {self.base.start_step}. "
             f"Train steps: {args.train_steps}. "
+            f"Total train steps: {self.base.total_train_steps}. "
             f"Start epoch: {self.base.start_epoch}. "
             f"Train epochs: {args.train.num_train_epochs}."
         )
 
         for epoch in range(self.base.start_epoch, args.train.num_train_epochs):
+            if self.base.reached_total_train_steps():
+                break
             if hasattr(self.base.train_dataloader, "set_epoch"):
                 self.base.train_dataloader.set_epoch(epoch)
             self.base.state.epoch = epoch
@@ -353,6 +360,8 @@ class VLMTrainer:
             data_iterator = iter(self.base.train_dataloader)
 
             for _ in range(self.base.start_step, args.train_steps):
+                if self.base.reached_total_train_steps():
+                    break
                 try:
                     self.train_step(data_iterator)
                 except StopIteration:

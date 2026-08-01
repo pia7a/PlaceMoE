@@ -27,6 +27,8 @@ Features:
 """
 
 import json
+import os
+import time
 import warnings
 from abc import ABC
 from collections import defaultdict
@@ -86,6 +88,7 @@ from ..utils.device import (
 from ..utils.full_timing_profiler import get_full_timing_profiler
 from ..utils.loss_utils import count_loss_token, mean_global_loss
 from ..utils.model_utils import pretty_print_trainable_parameters
+from ..utils.physical_moe_load import bind_physical_moe_layer_keys, physical_moe_load_enabled
 from .callbacks import (
     CheckpointerCallback,
     EnvironMeterCallback,
@@ -103,10 +106,43 @@ from .callbacks import (
 logger = logging.get_logger(__name__)
 
 
+_HIERMOE_DIAG_PHASES = os.environ.get("VEOMNI_HIERMOE_DIAG_PHASES", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def _hiermoe_diag_phase(phase: str) -> None:
+    if not _HIERMOE_DIAG_PHASES:
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+    print(
+        f"HIERMOE_DIAG_PHASE rank={rank} phase={phase} monotonic={time.monotonic():.6f}",
+        flush=True,
+    )
+
+
 def _scalar_float(value: Any) -> float:
     if hasattr(value, "item"):
         return float(value.item())
     return float(value)
+
+
+def _resolve_total_train_steps(planned_steps: int) -> int:
+    """Apply an optional run-wide step cap across epoch boundaries."""
+
+    raw = os.environ.get("VEOMNI_TOTAL_MAX_STEPS", "").strip()
+    if not raw:
+        return planned_steps
+    try:
+        total_max_steps = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"VEOMNI_TOTAL_MAX_STEPS must be an integer, got {raw!r}.") from exc
+    if total_max_steps <= 0:
+        raise ValueError(f"VEOMNI_TOTAL_MAX_STEPS must be positive, got {total_max_steps}.")
+    return min(planned_steps, total_max_steps)
 
 
 def _hiermoe_gradient_bytes_per_element(mixed_precision) -> int:
@@ -196,6 +232,7 @@ class BaseTrainer(Stateful, ABC):
 
     # Training states
     train_steps: int = 0  # total training steps
+    total_train_steps: int = 0  # run-wide training steps across epochs
     start_epoch: int = 0  # start epoch
     start_step: int = 0  # start step
 
@@ -447,6 +484,11 @@ class BaseTrainer(Stateful, ABC):
         )
         self.model.train()
         bind_hiermoe_model(self.model)
+        if physical_moe_load_enabled():
+            attached = bind_physical_moe_layer_keys(self.model)
+            if attached == 0:
+                raise RuntimeError("Physical MoE load metrics were enabled but no expert modules were found.")
+            logger.info_rank0(f"Physical MoE load metrics: registered {attached} expert layer(s).")
 
     def _build_optimizer(self):
         args: VeOmniArguments = self.args
@@ -466,9 +508,11 @@ class BaseTrainer(Stateful, ABC):
     def _build_lr_scheduler(self):
         args: VeOmniArguments = self.args
         # Build lr scheduler
+        planned_steps = args.train_steps * args.train.num_train_epochs
+        self.total_train_steps = _resolve_total_train_steps(planned_steps)
         self.lr_scheduler = build_lr_scheduler(
             self.optimizer,
-            train_steps=args.train_steps * args.train.num_train_epochs,
+            train_steps=self.total_train_steps,
             lr=args.train.optimizer.lr,
             lr_min=args.train.optimizer.lr_min,
             lr_decay_style=args.train.optimizer.lr_decay_style,
@@ -476,6 +520,11 @@ class BaseTrainer(Stateful, ABC):
             lr_warmup_ratio=args.train.optimizer.lr_warmup_ratio,
             lr_start=args.train.optimizer.lr_start,
         )
+
+    def reached_total_train_steps(self) -> bool:
+        """Return whether the run-wide training-step limit has been reached."""
+
+        return self.total_train_steps > 0 and self.state.global_step >= self.total_train_steps
 
     def _build_training_context(self):
         """Build training context for distributed training."""
@@ -646,9 +695,12 @@ class BaseTrainer(Stateful, ABC):
     def forward_backward_step(
         self, micro_batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        _hiermoe_diag_phase("preforward_start")
         with self._full_profile_range("preforward"):
             micro_batch = self.preforward(micro_batch)
+        _hiermoe_diag_phase("preforward_done")
 
+        _hiermoe_diag_phase("forward_start")
         with self._full_profile_range("forward"):
             with (
                 self.model_fwd_context,
@@ -656,16 +708,20 @@ class BaseTrainer(Stateful, ABC):
                 self.hiermoe_layer_swap_forward(),
             ):
                 outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
+        _hiermoe_diag_phase("forward_done")
 
         loss: torch.Tensor
         loss_dict: Dict[str, torch.Tensor]
         with self._full_profile_range("loss"):
             loss, loss_dict = self.postforward(outputs, micro_batch)
+        _hiermoe_diag_phase("loss_done")
 
         # Backward pass
+        _hiermoe_diag_phase("backward_start")
         with self._full_profile_range("backward"):
             with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
                 loss.backward()
+        _hiermoe_diag_phase("backward_done")
 
         del micro_batch
         return loss, loss_dict
@@ -768,11 +824,14 @@ class BaseTrainer(Stateful, ABC):
             f"Rank{args.train.local_rank} Start training. "
             f"Start step: {self.start_step}. "
             f"Train steps: {args.train_steps}. "
+            f"Total train steps: {self.total_train_steps}. "
             f"Start epoch: {self.start_epoch}. "
             f"Train epochs: {args.train.num_train_epochs}."
         )
 
         for epoch in range(self.start_epoch, args.train.num_train_epochs):
+            if self.reached_total_train_steps():
+                break
             if hasattr(self.train_dataloader, "set_epoch"):
                 self.train_dataloader.set_epoch(epoch)
             self.state.epoch = epoch
@@ -783,6 +842,8 @@ class BaseTrainer(Stateful, ABC):
             data_iterator = iter(self.train_dataloader)
 
             for _ in range(self.start_step, args.train_steps):
+                if self.reached_total_train_steps():
+                    break
                 try:
                     self.train_step(data_iterator)
                 except StopIteration:

@@ -47,6 +47,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--route-root", type=Path, required=True)
     parser.add_argument("--profile-steps", type=_parse_int_list, default=(0, 1, 2, 3))
     parser.add_argument("--layer-start", type=int, default=0)
+    parser.add_argument(
+        "--layer-name-template",
+        default="model.language_model.layers.{layer}.mlp.experts",
+        help="Python format template for the runtime expert-module key.",
+    )
     parser.add_argument("--layers", type=int, default=48)
     parser.add_argument("--ep-size", type=int, default=32)
     parser.add_argument("--ranks-per-node", type=int, default=8)
@@ -54,6 +59,30 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--primary-slots-per-rank", type=int, default=4)
     parser.add_argument("--redundant-slots-per-rank", type=int, required=True)
     parser.add_argument("--call-index", type=int, default=0)
+    parser.add_argument(
+        "--call-indices",
+        type=_parse_int_list,
+        default=None,
+        help=(
+            "Captured Forward call indices to include for every optimizer step. "
+            "Defaults to the legacy single --call-index value."
+        ),
+    )
+    parser.add_argument(
+        "--forward-repeats",
+        type=int,
+        default=1,
+        help=(
+            "Forward microbatches captured per optimizer step. Repeated "
+            "forwards are stored in consecutive layer-index blocks."
+        ),
+    )
+    parser.add_argument(
+        "--capture-layer-stride",
+        type=int,
+        default=None,
+        help="Layer-index stride between repeated Forward captures. Defaults to --layers.",
+    )
     parser.add_argument("--output-layout", type=Path, required=True)
     parser.add_argument("--output-report", type=Path, required=True)
     return parser.parse_args()
@@ -90,6 +119,13 @@ def _route_path(
 
 
 def _profile_demand(args: argparse.Namespace) -> np.ndarray:
+    if args.forward_repeats <= 0:
+        raise ValueError("forward_repeats must be positive.")
+    layer_stride = args.layers if args.capture_layer_stride is None else args.capture_layer_stride
+    call_indices = (args.call_index,) if args.call_indices is None else args.call_indices
+    if args.forward_repeats > 1 and layer_stride <= 0:
+        raise ValueError("capture_layer_stride must be positive when forward_repeats > 1.")
+
     demand = np.zeros(
         (args.layers, args.ep_size, args.num_experts),
         dtype=np.float64,
@@ -97,21 +133,24 @@ def _profile_demand(args: argparse.Namespace) -> np.ndarray:
     for layer_offset in range(args.layers):
         layer = args.layer_start + layer_offset
         for step in args.profile_steps:
-            for rank in range(args.ep_size):
-                path = _route_path(
-                    args.route_root,
-                    step=step,
-                    layer=layer,
-                    rank=rank,
-                    call_index=args.call_index,
-                )
-                payload = torch.load(path, map_location="cpu", weights_only=False)
-                routes = payload["routes"] if isinstance(payload, dict) else payload
-                counts = torch.bincount(
-                    routes.to(dtype=torch.long).reshape(-1),
-                    minlength=args.num_experts,
-                )
-                demand[layer_offset, rank] += counts.numpy()
+            for repeat in range(args.forward_repeats):
+                capture_layer = layer + repeat * layer_stride
+                for call_index in call_indices:
+                    for rank in range(args.ep_size):
+                        path = _route_path(
+                            args.route_root,
+                            step=step,
+                            layer=capture_layer,
+                            rank=rank,
+                            call_index=call_index,
+                        )
+                        payload = torch.load(path, map_location="cpu", weights_only=False)
+                        routes = payload["routes"] if isinstance(payload, dict) else payload
+                        counts = torch.bincount(
+                            routes.to(dtype=torch.long).reshape(-1),
+                            minlength=args.num_experts,
+                        )
+                        demand[layer_offset, rank] += counts.numpy()
     demand /= float(len(args.profile_steps))
     return demand
 
@@ -438,6 +477,8 @@ def _coefficient_of_variation(values: np.ndarray) -> float:
 
 def main() -> None:
     args = _parse_args()
+    if "{layer}" not in args.layer_name_template:
+        raise ValueError("--layer-name-template must contain the '{layer}' placeholder.")
     args.slots_per_rank = args.primary_slots_per_rank + args.redundant_slots_per_rank
     args.optimize_steps = args.profile_steps
     args.validation_steps = ()
@@ -494,7 +535,7 @@ def main() -> None:
                 args=args,
             )
         )
-        layer_name = f"model.language_model.layers.{layer}.mlp.experts"
+        layer_name = args.layer_name_template.format(layer=layer)
         layers[layer_name] = _layer_payload(
             layout=normalized_layout,
             owners=normalized_owners,
@@ -522,6 +563,7 @@ def main() -> None:
             "official_repository": "https://github.com/deepseek-ai/EPLB",
             "route_root": str(args.route_root.resolve()),
             "profile_steps": list(args.profile_steps),
+            "layer_name_template": args.layer_name_template,
             "source_lut_policy": "global-rank-load-greedy-locality-tiebreak",
         },
         "topology": {

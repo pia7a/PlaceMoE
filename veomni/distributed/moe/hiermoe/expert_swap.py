@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import subprocess
+import sys
 import time
 import zlib
 from collections import defaultdict
@@ -43,6 +45,7 @@ from .core_planner import (
     CORE_MOE_ALGORITHM_VERSION,
     CoReMoEPlanner,
     QuotaPolicyEntry,
+    _deterministic_sample_indices,
     assign_tokens_to_copies_with_quota,
 )
 from .forward_cover_planner import (
@@ -57,6 +60,7 @@ from .forward_cover_planner import (
     rotating_service_target_rank,
 )
 from .greedy_planner import GreedyCommunicationPlanner, assign_tokens_to_copies_greedy
+from .online_lut_planner import propose_online_lut_move
 from .perf_model import HierMoEPerfModel
 from .planner import (
     CurrentRoutePlanner,
@@ -109,6 +113,11 @@ _MAX_SWAP_BUCKET_BYTES = _env_int("VEOMNI_HIERMOE_SWAP_BUCKET_MIB", 1024) * 1024
 _MAX_SWAP_WAVE_BYTES = _env_int("VEOMNI_HIERMOE_SWAP_WAVE_MIB", 2048) * 1024 * 1024
 _EXACT_SINGLE_SWAP_MAX_EXPERTS = 256
 _EXACT_SINGLE_SWAP_MAX_STATS_BYTES = 64 * 1024 * 1024
+_EXACT_P1_ROUTE_SAMPLE_SIZE = _env_int(
+    "VEOMNI_HIERMOE_EXACT_P1_ROUTE_SAMPLE_SIZE",
+    0,
+    minimum=0,
+)
 _SWAP_COST_CHUNK_CANDIDATES = _env_int("VEOMNI_HIERMOE_SWAP_COST_CHUNK_CANDIDATES", 96)
 _GREEDY_LAYER_PARALLEL_STREAMS = _env_int("VEOMNI_HIERMOE_GREEDY_LAYER_STREAMS", 8)
 _GREEDY_ADAPTIVE_TOPK_INITIAL = _env_int("VEOMNI_HIERMOE_GREEDY_ADAPTIVE_TOPK_INITIAL", 32)
@@ -139,6 +148,7 @@ _GREEDY_ADAPTIVE_TOPK_STRICT = _env_flag("VEOMNI_HIERMOE_GREEDY_ADAPTIVE_TOPK_ST
 _GREEDY_POST_SHORTLIST_COMPACT_PAIR = _env_flag("VEOMNI_HIERMOE_GREEDY_POST_SHORTLIST_COMPACT_PAIR")
 _GREEDY_EXACT_PRIMITIVE_MAX_ONLY = _env_flag("VEOMNI_HIERMOE_GREEDY_EXACT_PRIMITIVE_MAX_ONLY")
 _PIPELINE_STAGE_TIMING = _env_flag("VEOMNI_HIERMOE_PIPELINE_STAGE_TIMING")
+_HIERMOE_DIAG_PHASES = _env_flag("VEOMNI_HIERMOE_DIAG_PHASES")
 _PIPELINE_PREPARE_SUBSTAGES = (
     "planner_setup",
     "context",
@@ -178,6 +188,47 @@ _NPU_LAYER_OWNER_COLLECTIVE = (
     .strip()
     .lower()
 )
+_PERIODIC_FULL_REPLAN = _env_flag("VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN")
+_PERIODIC_FULL_REPLAN_WORK_ROOT = os.environ.get(
+    "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_WORK_ROOT",
+    "/tmp/veomni_hiermoe_periodic_full_replan",
+).strip()
+_PERIODIC_FULL_REPLAN_BUILDER = os.environ.get(
+    "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_BUILDER",
+    "",
+).strip()
+_PERIODIC_FULL_REPLAN_WORKERS = _env_int("VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_WORKERS", 48)
+_PERIODIC_FULL_REPLAN_CANDIDATE_WORKERS = _env_int(
+    "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_CANDIDATE_WORKERS",
+    4,
+)
+_PERIODIC_FULL_REPLAN_WORKER_THREADS = _env_int(
+    "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_WORKER_THREADS",
+    1,
+)
+_PERIODIC_FULL_REPLAN_LAST_STEP = _env_int(
+    "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_LAST_STEP",
+    2**31 - 1,
+    minimum=0,
+)
+_PERIODIC_FULL_REPLAN_CPU_IDS = os.environ.get(
+    "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_CPU_IDS",
+    "",
+).strip()
+_PERIODIC_FULL_REPLAN_TRAIN_CPU_IDS = os.environ.get(
+    "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_TRAIN_CPU_IDS",
+    "",
+).strip()
+
+
+def _expert_swap_diag_phase(phase: str) -> None:
+    if not _HIERMOE_DIAG_PHASES:
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+    print(
+        f"HIERMOE_EXPERT_SWAP_DIAG rank={rank} phase={phase} monotonic={time.monotonic():.6f}",
+        flush=True,
+    )
 _ONLINE_FREEZE_COST_MODE = os.environ.get("VEOMNI_HIERMOE_ONLINE_FREEZE_COST_MODE", "off").strip().lower()
 _ONLINE_FREEZE_CALIBRATION_STEP = _env_int(
     "VEOMNI_HIERMOE_ONLINE_FREEZE_CALIBRATION_STEP",
@@ -209,6 +260,22 @@ _ONLINE_FREEZE_TRAFFIC_INTERCEPT_MS = _env_float(
     16.771503695343263,
 )
 _COST_MODEL_VERIFY = _env_flag("VEOMNI_HIERMOE_COST_MODEL_VERIFY")
+_EXPORT_COST_MODEL_SAMPLES = _env_flag("VEOMNI_HIERMOE_EXPORT_COST_MODEL_SAMPLES")
+_COST_MODEL_VALIDATION_STEPS = _env_int(
+    "VEOMNI_HIERMOE_COST_MODEL_VALIDATION_STEPS",
+    1,
+    minimum=1,
+)
+_ONLINE_LUT_UPDATE = _env_flag("VEOMNI_HIERMOE_ONLINE_LUT_UPDATE")
+_ONLINE_LUT_START_STEP = _env_int(
+    "VEOMNI_HIERMOE_ONLINE_LUT_START_STEP",
+    1,
+    minimum=0,
+)
+_ONLINE_LUT_MIN_GAIN = _env_float(
+    "VEOMNI_HIERMOE_ONLINE_LUT_MIN_GAIN",
+    0.0,
+)
 _FORWARD_REUSE_COVER = _env_flag("VEOMNI_HIERMOE_FORWARD_REUSE_COVER")
 _FORWARD_REUSE_COVER_COMPUTE_WEIGHT = _env_float(
     "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_COMPUTE_WEIGHT",
@@ -685,6 +752,19 @@ class _CPUBatchedPlanState:
     future: Future[_CPUBatchedPlanResult] | None = None
 
 
+@dataclass
+class _PeriodicFullReplanState:
+    source_step: int
+    placement_versions: tuple[int, ...]
+    submitted_at: float
+    snapshot_ms: float
+    job_dir: str
+    layout_path: str
+    report_path: str
+    planner_log_path: str
+    process: subprocess.Popen[bytes] | None = None
+
+
 @dataclass(frozen=True)
 class _PendingPipelinePlan:
     plan: PlacementPlan
@@ -759,6 +839,7 @@ class _ReplicaGradGroup:
 class _ReplicaGradSchedule:
     groups: tuple[_ReplicaGradGroup, ...]
     pairwise: bool
+    globally_ordered_pairs: bool
 
 
 @dataclass(frozen=True)
@@ -2855,6 +2936,43 @@ class ExpertSwapManager:
                 "the hiermoe_greedy_cover_p1 selector, zero swaps, and all placement "
                 "experiments disabled."
             )
+        if _ONLINE_LUT_UPDATE and (
+            not self.fixed_pipeline_overlap
+            or self.expert_swap_mode != "step"
+            or self.expert_swap_selector != "hiermoe_greedy_cover_p1"
+            or _ABLATION_REPLAY_MODE != "static"
+            or not _FORWARD_REUSE_COVER
+            or not _FORWARD_REUSE_COVER_PATCH_REMAP
+            or _CPU_PLANNER_MODE != "off"
+            or _NPU_LAYER_OWNER_BLOCKING
+            or _ONLINE_FREEZE_COST_MODE != "off"
+            or _COST_MODEL_VERIFY
+        ):
+            raise ValueError(
+                "Online LUT correction requires a preloaded static layout, fixed-pipeline "
+                "step mode, the hiermoe_greedy_cover_p1 selector, source-LUT Forward "
+                "routing, and all other online planners disabled."
+            )
+        if _PERIODIC_FULL_REPLAN and (
+            not self.fixed_pipeline_overlap
+            or self.expert_swap_mode != "step"
+            or self.expert_swap_selector != "hiermoe_greedy_cover_p1"
+            or _ABLATION_REPLAY_MODE != "static"
+            or not _STATIC_PRELOAD_LAYOUT_PATH
+            or not _FORWARD_REUSE_COVER
+            or not _FORWARD_REUSE_COVER_PATCH_REMAP
+            or _ONLINE_LUT_UPDATE
+            or _CPU_PLANNER_MODE != "off"
+            or _NPU_LAYER_OWNER_BLOCKING
+            or _ONLINE_FREEZE_COST_MODE != "off"
+            or _COST_MODEL_VERIFY
+        ):
+            raise ValueError(
+                "Periodic full replanning requires a preloaded static layout, fixed-pipeline "
+                "step mode, source-LUT Forward routing, and all other online planners disabled."
+            )
+        if _PERIODIC_FULL_REPLAN and not _PERIODIC_FULL_REPLAN_WORK_ROOT:
+            raise ValueError("VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_WORK_ROOT must not be empty.")
         if _FORWARD_REUSE_COVER and (
             not self.fixed_pipeline_overlap
             or self.expert_swap_mode != "step"
@@ -2904,6 +3022,7 @@ class ExpertSwapManager:
         self._online_freeze_route_ms_per_assignment = _ONLINE_FREEZE_ROUTE_MS_PER_ASSIGNMENT
         self._online_freeze_traffic_intercept_ms = _ONLINE_FREEZE_TRAFFIC_INTERCEPT_MS
         self._cost_model_verify = _COST_MODEL_VERIFY
+        self._cost_model_validation_steps = _COST_MODEL_VALIDATION_STEPS
         self._cost_model_verify_coefficients: tuple[float, float, float, float] | None = None
         self._cost_model_verify_receive_only_coefficients: tuple[float, float] | None = None
         self._cost_model_verify_feature_coefficients: (
@@ -2914,6 +3033,9 @@ class ExpertSwapManager:
             | None
         ) = None
         self._cost_model_verify_complete = False
+        self._online_lut_update = _ONLINE_LUT_UPDATE
+        self._online_lut_start_step = _ONLINE_LUT_START_STEP
+        self._online_lut_min_gain = _ONLINE_LUT_MIN_GAIN
         self._forward_reuse_cover = _FORWARD_REUSE_COVER
         self._forward_reuse_cover_patch_remap = _FORWARD_REUSE_COVER_PATCH_REMAP
         self._forward_reuse_cover_fast = _FORWARD_REUSE_COVER_FAST
@@ -2929,6 +3051,16 @@ class ExpertSwapManager:
         self._forward_reuse_cover_proposal_topk = _FORWARD_REUSE_COVER_PROPOSAL_TOPK
         self._forward_reuse_cover_empty_seeding = _FORWARD_REUSE_COVER_EMPTY_SEEDING
         self._forward_reuse_cover_pending: dict[str, tuple[PlacementAction, int]] = {}
+        self._periodic_full_replan = _PERIODIC_FULL_REPLAN
+        self._periodic_full_replan_state: _PeriodicFullReplanState | None = None
+        self._periodic_full_replan_updates = 0
+        self._periodic_full_replan_last_source_step = -1
+        self._periodic_full_replan_last_apply_step = -1
+        self._periodic_full_replan_last_staleness_steps = -1
+        self._periodic_full_replan_last_snapshot_ms = 0.0
+        self._periodic_full_replan_last_planner_ms = 0.0
+        self._periodic_full_replan_last_migration_ms = 0.0
+        self._periodic_full_replan_last_moved_slots = 0
         if self._forward_reuse_cover_service_scope == "rank":
             self._forward_reuse_cover_service_group_size = 1
         else:
@@ -2954,14 +3086,27 @@ class ExpertSwapManager:
             if self.expert_swap_max_pairs_per_layer > 0 and not self.fixed_pipeline_overlap
             else None
         )
-        # All fixed-pipeline communication reuses EP/HCCL to avoid reserving
-        # another device communication workspace. Planner collectives are
-        # serialized through one host executor below, so 48 layer workers can
-        # never race collective launch order.
+        # Planner and migration collectives are serialized and can reuse the
+        # training EP group. Hidden replica-gradient P2P is launched from a
+        # separate NPU stream while backward/FSDP collectives are active.
+        # Arbitrary partial-capacity layouts require multiple peer waves, so
+        # sharing the training group can violate cross-stream HCCL ordering.
+        # Give only that path a dedicated group.
         self._pipeline_background_group = ep_group if self.fixed_pipeline_overlap else None
         self._pipeline_planner_group = self._pipeline_background_group
         self._pipeline_migration_group = self._pipeline_background_group
-        self._pipeline_grad_group = self._pipeline_background_group
+        self._owns_pipeline_grad_group = bool(
+            self.fixed_pipeline_overlap and self._ablation_grad_mode == "hidden" and ep_group is not None
+        )
+        self._pipeline_grad_group = (
+            _create_expert_swap_process_group(
+                ep_group,
+                self.ep_size,
+                group_desc="hiermoe_pipeline_grad",
+            )
+            if self._owns_pipeline_grad_group
+            else self._pipeline_background_group
+        )
         self.gradient_bytes_per_element = max(1, int(gradient_bytes_per_element))
         self.debug_validate = bool(debug_validate)
         self.layers: dict[str, ExpertLayerState] = {}
@@ -3101,6 +3246,52 @@ class ExpertSwapManager:
         self._ablation_expected_owner_slots = expected_owner_slots
         self._ablation_expected_source_luts = expected_source_luts
         self._ablation_initial_layout = str(payload.get("source", {}).get("initial_layout", "fixed_r2"))
+
+    def _normalize_ablation_layer_keys(self) -> None:
+        """Match replay keys to the model after checkpoint wrapper conversion."""
+
+        if not self._ablation_expected_layouts:
+            return
+
+        replay_keys = set(self._ablation_expected_layouts)
+        replay_keys.update(self._ablation_expected_owner_slots)
+        replay_keys.update(self._ablation_expected_source_luts)
+        for layers_by_step in self._ablation_actions_by_step.values():
+            replay_keys.update(layers_by_step)
+
+        key_mapping: dict[str, str] = {}
+        for replay_key in replay_keys:
+            if replay_key in self.layers:
+                key_mapping[replay_key] = replay_key
+                continue
+            marker = ".layers."
+            suffix = replay_key[replay_key.index(marker) :] if marker in replay_key else ""
+            matches = [model_key for model_key in self.layers if suffix and model_key.endswith(suffix)]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"HierMoE ablation layer {replay_key!r} has no unambiguous model layer; "
+                    f"suffix={suffix!r}, matches={matches}."
+                )
+            key_mapping[replay_key] = matches[0]
+
+        def remap_values(values: dict[str, Any]) -> dict[str, Any]:
+            remapped: dict[str, Any] = {}
+            for replay_key, value in values.items():
+                model_key = key_mapping[replay_key]
+                if model_key in remapped:
+                    raise RuntimeError(
+                        f"Multiple HierMoE replay layers resolve to model layer {model_key!r}."
+                    )
+                remapped[model_key] = value
+            return remapped
+
+        self._ablation_expected_layouts = remap_values(self._ablation_expected_layouts)
+        self._ablation_expected_owner_slots = remap_values(self._ablation_expected_owner_slots)
+        self._ablation_expected_source_luts = remap_values(self._ablation_expected_source_luts)
+        self._ablation_actions_by_step = {
+            step: remap_values(layers_by_step)
+            for step, layers_by_step in self._ablation_actions_by_step.items()
+        }
 
     @staticmethod
     def _zero_placement_cost() -> PlacementCost:
@@ -3398,8 +3589,9 @@ class ExpertSwapManager:
         executor.shutdown(wait=True, cancel_futures=False)
 
     def placement_planning_enabled(self) -> bool:
-        return self._ablation_replay_mode == "off" and (
-            self.expert_swap_max_pairs_per_layer > 0 or self.redundant_slot_increment_per_device > 0
+        return self._online_lut_update or (
+            self._ablation_replay_mode == "off"
+            and (self.expert_swap_max_pairs_per_layer > 0 or self.redundant_slot_increment_per_device > 0)
         )
 
     def layer_calibration_enabled(self) -> bool:
@@ -3443,6 +3635,21 @@ class ExpertSwapManager:
             "hiermoe/online_freeze_route_ms_per_assignment": self._online_freeze_route_ms_per_assignment,
             "hiermoe/online_freeze_traffic_intercept_ms": self._online_freeze_traffic_intercept_ms,
             "hiermoe/fixed_r2_mirrored_remap": int(_FORCE_FIXED_R2_MIRRORED_REMAP),
+            "hiermoe/online_lut_update": int(self._online_lut_update),
+            "hiermoe/online_lut_start_step": self._online_lut_start_step,
+            "hiermoe/online_lut_min_gain": self._online_lut_min_gain,
+            "hiermoe/periodic_full_replan": int(self._periodic_full_replan),
+            "hiermoe/periodic_full_replan_running": int(self._periodic_full_replan_state is not None),
+            "hiermoe/periodic_full_replan_updates": self._periodic_full_replan_updates,
+            "hiermoe/periodic_full_replan_last_source_step": self._periodic_full_replan_last_source_step,
+            "hiermoe/periodic_full_replan_last_apply_step": self._periodic_full_replan_last_apply_step,
+            "hiermoe/periodic_full_replan_last_staleness_steps": (
+                self._periodic_full_replan_last_staleness_steps
+            ),
+            "hiermoe/periodic_full_replan_last_snapshot_ms": self._periodic_full_replan_last_snapshot_ms,
+            "hiermoe/periodic_full_replan_last_planner_ms": self._periodic_full_replan_last_planner_ms,
+            "hiermoe/periodic_full_replan_last_migration_ms": self._periodic_full_replan_last_migration_ms,
+            "hiermoe/periodic_full_replan_last_moved_slots": self._periodic_full_replan_last_moved_slots,
             "hiermoe/forward_reuse_cover": int(self._forward_reuse_cover),
             "hiermoe/forward_reuse_cover_patch_remap": int(self._forward_reuse_cover_patch_remap),
             "hiermoe/forward_reuse_cover_fast": int(self._forward_reuse_cover_fast),
@@ -3714,6 +3921,41 @@ class ExpertSwapManager:
             except (OSError, ProcessLookupError):
                 continue
         os.sched_setaffinity(0, cpus)
+
+    @staticmethod
+    def _parse_cpu_ids(value: str) -> tuple[int, ...]:
+        cpu_ids: set[int] = set()
+        for raw_part in value.split(","):
+            part = raw_part.strip()
+            if not part:
+                continue
+            if "-" not in part:
+                cpu_ids.add(int(part))
+                continue
+            raw_start, raw_end = part.split("-", maxsplit=1)
+            start = int(raw_start)
+            end = int(raw_end)
+            if start < 0 or end < start:
+                raise ValueError(f"Invalid CPU range {part!r}.")
+            cpu_ids.update(range(start, end + 1))
+        return tuple(sorted(cpu_ids))
+
+    def _configure_periodic_full_replan_training_affinity(self) -> None:
+        if not self._periodic_full_replan or not _PERIODIC_FULL_REPLAN_TRAIN_CPU_IDS:
+            return
+        node_rank = int(os.environ.get("GROUP_RANK", os.environ.get("NODE_RANK", "0")))
+        if node_rank != 0:
+            return
+        cpu_ids = self._parse_cpu_ids(_PERIODIC_FULL_REPLAN_TRAIN_CPU_IDS)
+        if not cpu_ids:
+            raise ValueError("Periodic full-replan training CPU affinity must not be empty.")
+        visible = set(os.sched_getaffinity(0))
+        unavailable = set(cpu_ids) - visible
+        if unavailable:
+            raise RuntimeError(f"Periodic full-replan training CPUs are not visible: {sorted(unavailable)}.")
+        self._bind_all_process_threads(cpu_ids)
+        self._cpu_training_affinity = cpu_ids
+        logger.info_rank0("HierMoE reserved training CPU affinity %s for periodic full replanning.", cpu_ids)
 
     def _cpu_process_affinity_masks(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
         visible = sorted(os.sched_getaffinity(0))
@@ -4989,6 +5231,13 @@ class ExpertSwapManager:
             or not self._pipeline_is_final_microstep()
         ):
             return
+        if self._owns_pipeline_grad_group:
+            # A dedicated gradient process group is allowed to overlap the
+            # training group's dispatch collectives. Waiting here can form a
+            # cross-group cycle when ranks reach backward layers at different
+            # times: one rank waits for gradient P2P while its peer is already
+            # waiting for that rank in the next dispatch collective.
+            return
         with self._pipeline_grad_submit_lock:
             with self._pipeline_lock:
                 self._pipeline_grad_comm_blocked = True
@@ -5135,6 +5384,19 @@ class ExpertSwapManager:
         if not self.fixed_pipeline_overlap or self._pipeline_shutdown:
             return
         self._pipeline_shutdown = True
+        periodic_state = self._periodic_full_replan_state
+        if periodic_state is not None and periodic_state.process is not None and periodic_state.process.poll() is None:
+            periodic_state.process.terminate()
+            try:
+                periodic_state.process.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                periodic_state.process.kill()
+                periodic_state.process.wait()
+            self._periodic_full_replan_event(
+                "terminated_on_shutdown",
+                source_step=periodic_state.source_step,
+            )
+        self._periodic_full_replan_state = None
         with self._pipeline_lock:
             windows = tuple(self._pipeline_planner_windows.values())
             cpu_state = self._cpu_batch_state
@@ -5174,7 +5436,18 @@ class ExpertSwapManager:
                 executor.shutdown(wait=True, cancel_futures=False)
 
     def destroy_pipeline_process_groups(self) -> None:
-        """No-op while all fixed-pipeline communication reuses the EP group."""
+        if not self._owns_pipeline_grad_group:
+            return
+        group = self._pipeline_grad_group
+        self._pipeline_grad_group = None
+        self._owns_pipeline_grad_group = False
+        if (
+            group is not None
+            and dist.is_available()
+            and dist.is_initialized()
+            and group != dist.GroupMember.NON_GROUP_MEMBER
+        ):
+            dist.destroy_process_group(group)
 
     def bind_optimizer(self, optimizer: Any) -> None:
         self.optimizer = optimizer
@@ -5307,6 +5580,7 @@ class ExpertSwapManager:
         for key, module in model.named_modules():
             if self._is_expert_module(module):
                 self.register_layer(key, module)
+        self._normalize_ablation_layer_keys()
         if _FIXED_R2_LAYOUT:
             self.install_fixed_r2_layout()
         if self._ablation_replay_mode == "static":
@@ -5314,6 +5588,7 @@ class ExpertSwapManager:
         if self._pending_state is not None:
             self.load_state_dict(self._pending_state)
             self._pending_state = None
+        self._configure_periodic_full_replan_training_affinity()
 
     @torch.no_grad()
     def install_fixed_r2_layout(self) -> None:
@@ -5868,11 +6143,10 @@ class ExpertSwapManager:
         layer.pending_timing = timing
         capture_cost_model_sample = (
             self._cost_model_verify
-            and int(step)
-            in {
-                int(self._online_freeze_calibration_step),
-                int(self._online_freeze_calibration_step) + 1,
-            }
+            and int(self._online_freeze_calibration_step)
+            <= int(step)
+            <= int(self._online_freeze_calibration_step)
+            + int(self._cost_model_validation_steps)
         ) or (self._online_freeze_cost_mode != "off" and int(step) == int(self._online_freeze_calibration_step))
         if capture_cost_model_sample:
             physical_routes = layer.latest_physical_routes
@@ -6516,9 +6790,23 @@ class ExpertSwapManager:
                     local_slots=local_slots,
                 )
             )
+        pairwise = all(len(group.copy_ranks) <= 2 for group in groups)
+        peer_neighbors = [set() for _ in range(int(self.ep_size))]
+        if pairwise:
+            for group in groups:
+                if len(group.copy_ranks) != 2:
+                    continue
+                left_rank, right_rank = group.copy_ranks
+                peer_neighbors[int(left_rank)].add(int(right_rank))
+                peer_neighbors[int(right_rank)].add(int(left_rank))
         cached = _ReplicaGradSchedule(
             groups=tuple(groups),
-            pairwise=all(len(group.copy_ranks) <= 2 for group in groups),
+            pairwise=pairwise,
+            # Fixed mirrored R2 has one peer per rank and safely uses one
+            # batched wave. Arbitrary partial-capacity layouts form a general
+            # rank graph; all ranks must traverse its edges in the same order
+            # or HCCL can leave the P2P work pending indefinitely.
+            globally_ordered_pairs=pairwise and any(len(neighbors) > 1 for neighbors in peer_neighbors),
         )
         layer._replica_grad_schedule_cache = cached
         return cached
@@ -6534,6 +6822,12 @@ class ExpertSwapManager:
             tuple[torch.device, torch.dtype],
             dict[tuple[int, int], _ReplicaGradContribution],
         ] = defaultdict(dict)
+        # Pre-seed the local parameter buckets so every rank enters the same
+        # packed collective even when a partial-capacity layout gives this
+        # rank no redundant expert in a particular layer.
+        for local_grad in local_grads:
+            if local_grad is not None:
+                contributions[(local_grad.device, local_grad.dtype)]
         for group in schedule.groups:
             if not group.local_slots:
                 continue
@@ -6677,6 +6971,49 @@ class ExpertSwapManager:
                     work.wait()
         return recv_buffers
 
+    def _run_replica_grad_all_to_all_wave(
+        self,
+        *,
+        send_buffers: dict[int, torch.Tensor],
+        process_group: dist.ProcessGroup | None,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> dict[int, torch.Tensor]:
+        """Exchange an arbitrary pair graph with one globally ordered collective."""
+
+        process_group = self.ep_group if process_group is None else process_group
+        if process_group is None or self.ep_size <= 1:
+            if send_buffers:
+                raise RuntimeError("HierMoE redundant gradient synchronization requires an EP process group.")
+            return {}
+
+        split_sizes = [
+            0 if rank not in send_buffers else int(send_buffers[rank].numel())
+            for rank in range(int(self.ep_size))
+        ]
+        parts = [send_buffers[rank] for rank in range(int(self.ep_size)) if split_sizes[rank] > 0]
+        send_buffer = (
+            torch.cat(parts, dim=0)
+            if parts
+            else torch.empty((0,), dtype=dtype, device=device)
+        )
+        recv_buffer = torch.empty_like(send_buffer)
+        dist.all_to_all_single(
+            recv_buffer,
+            send_buffer,
+            output_split_sizes=split_sizes,
+            input_split_sizes=split_sizes,
+            group=process_group,
+        )
+
+        received: dict[int, torch.Tensor] = {}
+        offset = 0
+        for peer_rank, size in enumerate(split_sizes):
+            if size > 0:
+                received[peer_rank] = recv_buffer[offset : offset + size]
+                offset += size
+        return received
+
     def _sync_pairwise_replica_gradients(
         self,
         schedule: _ReplicaGradSchedule,
@@ -6718,12 +7055,27 @@ class ExpertSwapManager:
             recv_specs = {
                 peer_rank: (int(send_buffer.numel()), dtype, device) for peer_rank, send_buffer in send_buffers.items()
             }
-            recv_buffers = self._run_replica_grad_p2p_wave(
-                phase="pairwise",
-                send_buffers=send_buffers,
-                process_group=process_group,
-                recv_specs=recv_specs,
-            )
+            if schedule.globally_ordered_pairs:
+                # A lexicographic sequence of blocking rank-pair P2P calls is
+                # not a true global order: ranks skip inactive edges and can
+                # form a wait cycle on a general multi-neighbor replica graph.
+                # Pack all incident edges into one collective. Each two-copy
+                # edge is symmetric, so the input/output split vector is the
+                # same and no split-size exchange is required.
+                recv_buffers = self._run_replica_grad_all_to_all_wave(
+                    send_buffers=send_buffers,
+                    process_group=process_group,
+                    dtype=dtype,
+                    device=device,
+                )
+            else:
+                recv_buffers = self._run_replica_grad_p2p_wave(
+                    phase="pairwise",
+                    send_buffers=send_buffers,
+                    process_group=process_group,
+                    recv_specs=recv_specs,
+                    globally_ordered_pairs=False,
+                )
             for peer_rank, items in peer_items.items():
                 recv_buffer = recv_buffers[peer_rank]
                 offset = 0
@@ -7413,6 +7765,23 @@ class ExpertSwapManager:
         self._accumulate_metric(f"{prefix}_compute_mape_percent", float(report["compute"]["mape_percent"]))
         self._accumulate_metric(f"{prefix}_joint_r2", float(report["joint"]["r_squared"]))
         self._accumulate_metric(f"{prefix}_joint_mape_percent", float(report["joint"]["mape_percent"]))
+        network_joint_models = report.get("traffic_feature_models", {}).get("network_joint", {})
+        if network_joint_models:
+            best_network_joint = min(
+                network_joint_models.values(),
+                key=lambda row: (
+                    float(row["mape_percent"]),
+                    -float(row["r_squared"]),
+                ),
+            )
+            self._accumulate_metric(
+                f"{prefix}_network_joint_r2",
+                float(best_network_joint["r_squared"]),
+            )
+            self._accumulate_metric(
+                f"{prefix}_network_joint_mape_percent",
+                float(best_network_joint["mape_percent"]),
+            )
         self._accumulate_metric(
             f"{prefix}_communication_units_min",
             float(report["communication_units"]["min"]),
@@ -7434,8 +7803,8 @@ class ExpertSwapManager:
     @torch.no_grad()
     def _run_cost_model_verification(self, layers: Sequence[ExpertLayerState], step: int) -> str:
         calibration_step = int(self._online_freeze_calibration_step)
-        validation_step = calibration_step + 1
-        if int(step) < calibration_step or int(step) > validation_step:
+        validation_end_step = calibration_step + int(self._cost_model_validation_steps)
+        if int(step) < calibration_step or int(step) > validation_end_step:
             self.latest_pair = "none"
             return self.latest_pair
 
@@ -7531,6 +7900,19 @@ class ExpertSwapManager:
                 feature_coefficients["raw_a2a"] = {
                     name: self._fit_nonnegative_linear_model(rows, actual_raw_a2a) for name, rows in model_rows.items()
                 }
+                # The placement objective is network A2A plus expert compute,
+                # not the wider dispatch/combine region. Compose the two
+                # independently calibrated models so held-out validation
+                # measures exactly the objective consumed by the layout
+                # planner. Keep the wider ``joint`` target above as a
+                # diagnostic for local remap/pack and rank-arrival overheads.
+                feature_coefficients["network_joint"] = {
+                    name: (
+                        (*raw_coefficients, compute_slope),
+                        raw_intercept + compute_constant,
+                    )
+                    for name, (raw_coefficients, raw_intercept) in feature_coefficients["raw_a2a"].items()
+                }
             self._cost_model_verify_feature_coefficients = feature_coefficients
             phase = "calibration"
         else:
@@ -7576,6 +7958,14 @@ class ExpertSwapManager:
         }
         if actual_raw_a2a and "raw_a2a" in self._cost_model_verify_feature_coefficients:
             target_rows["raw_a2a"] = (model_rows, actual_raw_a2a)
+        if actual_raw_a2a and "network_joint" in self._cost_model_verify_feature_coefficients:
+            target_rows["network_joint"] = (
+                joint_model_rows,
+                [
+                    raw_a2a + compute
+                    for raw_a2a, compute in zip(actual_raw_a2a, actual_compute, strict=True)
+                ],
+            )
         for target_name, (rows_by_model, targets) in target_rows.items():
             target_report: dict[str, Any] = {}
             for model_name, rows in rows_by_model.items():
@@ -7584,7 +7974,7 @@ class ExpertSwapManager:
                 target_report[model_name] = {
                     "feature_names": [
                         *base_feature_models[model_name],
-                        *(["peak_assignments"] if target_name == "joint" else []),
+                        *(["peak_assignments"] if target_name in {"joint", "network_joint"} else []),
                     ],
                     "coefficients": list(coefficients),
                     "intercept_ms": float(intercept),
@@ -7631,6 +8021,74 @@ class ExpertSwapManager:
             },
             "elapsed_ms": (time.perf_counter() - started) * 1000.0,
         }
+        if _EXPORT_COST_MODEL_SAMPLES:
+            paired_assignments = [
+                float(value) for value in observations["paired_assignments"]
+            ]
+            paired_compute = [
+                float(value) for value in observations["paired_compute_ms"]
+            ]
+            sample_model = "stage_payload_inter_intra"
+            report["sample_data"] = {
+                "feature_values": {
+                    **{
+                        name: [float(value) for value in values]
+                        for name, values in traffic_features.items()
+                    },
+                    "peak_assignments": [
+                        float(value) for value in peak_assignments
+                    ],
+                },
+                "compute": {
+                    "assignments": paired_assignments,
+                    "measured_ms": paired_compute,
+                    "predicted_ms": [
+                        compute_slope * value + compute_constant
+                        for value in paired_assignments
+                    ],
+                },
+                "communication_region": {
+                    "feature_model": sample_model,
+                    "measured_ms": [float(value) for value in actual_communication],
+                    "predicted_ms": self._predict_linear_model(
+                        model_rows[sample_model],
+                        *self._cost_model_verify_feature_coefficients[
+                            "communication"
+                        ][sample_model],
+                    ),
+                },
+                "joint_moe_region": {
+                    "feature_model": sample_model,
+                    "measured_ms": [float(value) for value in actual_joint],
+                    "predicted_ms": self._predict_linear_model(
+                        joint_model_rows[sample_model],
+                        *self._cost_model_verify_feature_coefficients[
+                            "joint"
+                        ][sample_model],
+                    ),
+                },
+            }
+            if (
+                actual_raw_a2a
+                and "network_joint" in self._cost_model_verify_feature_coefficients
+            ):
+                report["sample_data"]["network_joint"] = {
+                    "feature_model": sample_model,
+                    "measured_ms": [
+                        float(raw_a2a + compute)
+                        for raw_a2a, compute in zip(
+                            actual_raw_a2a,
+                            actual_compute,
+                            strict=True,
+                        )
+                    ],
+                    "predicted_ms": self._predict_linear_model(
+                        joint_model_rows[sample_model],
+                        *self._cost_model_verify_feature_coefficients[
+                            "network_joint"
+                        ][sample_model],
+                    ),
+                }
         if actual_raw_a2a:
             report["raw_a2a_ms"] = {
                 "min": min(actual_raw_a2a),
@@ -7666,7 +8124,7 @@ class ExpertSwapManager:
         self._record_cost_model_report(phase, report)
         for layer in layers:
             layer.cost_model_timings = [timing for timing in layer.cost_model_timings if int(timing.step) != int(step)]
-        if int(step) == validation_step:
+        if int(step) == validation_end_step:
             self._cost_model_verify_complete = True
         self.latest_pair = "none"
         return self.latest_pair
@@ -8411,6 +8869,7 @@ class ExpertSwapManager:
         if not layers:
             return []
 
+        _expert_swap_diag_phase("exact_p1_stats_start")
         with _full_timing_range("hiermoe_exact_p1_stats"):
             stats_started = time.perf_counter()
             local_rows: list[torch.Tensor] = []
@@ -8418,6 +8877,8 @@ class ExpertSwapManager:
             group_rows: list[list[int]] = []
             group_mappings: list[list[torch.Tensor]] = []
             common_device: torch.device | None = None
+            population_token_total = 0
+            sampled_token_total = 0
 
             for layer in layers:
                 if layer.num_experts > _EXACT_SINGLE_SWAP_MAX_EXPERTS:
@@ -8439,6 +8900,21 @@ class ExpertSwapManager:
                 if selected is None or selected.numel() == 0:
                     selected = torch.empty((0, 1), dtype=torch.long, device=layer_device)
                 selected = selected.to(device=layer_device, dtype=torch.long, non_blocking=True)
+                population_tokens = int(selected.shape[0])
+                population_token_total += population_tokens
+                population_scale = 1.0
+                if _EXACT_P1_ROUTE_SAMPLE_SIZE > 0 and population_tokens > _EXACT_P1_ROUTE_SAMPLE_SIZE:
+                    sample_indices = _deterministic_sample_indices(
+                        population_tokens,
+                        _EXACT_P1_ROUTE_SAMPLE_SIZE,
+                        source_rank=self.ep_rank,
+                        step=int(step),
+                        layer_seed=zlib.crc32(layer.key.encode("utf-8")) & 0x7FFFFFFF,
+                        device=layer_device,
+                    )
+                    selected = selected.index_select(0, sample_indices)
+                    population_scale = float(population_tokens) / float(selected.shape[0])
+                sampled_token_total += int(selected.shape[0])
                 token_expert_hits = _token_expert_hit_matrix(selected, layer.num_experts)
                 logical_to_physical = layer.mapping_for_device(layer_device)
 
@@ -8466,6 +8942,8 @@ class ExpertSwapManager:
                     ],
                     dim=0,
                 )
+                if population_scale != 1.0:
+                    flat_row.mul_(population_scale)
                 local_rows.append(flat_row)
                 row_lengths.append(int(flat_row.numel()))
                 group_rows.append(num_group_rows)
@@ -8484,13 +8962,17 @@ class ExpertSwapManager:
             for layer_idx, row in enumerate(local_rows):
                 global_stats[layer_idx, : row.numel()] = row
             stats_ms = (time.perf_counter() - stats_started) * 1000.0
+        _expert_swap_diag_phase("exact_p1_stats_done")
 
+        _expert_swap_diag_phase("exact_p1_collective_start")
         with _full_timing_range("hiermoe_exact_p1_collective"):
             collective_started = time.perf_counter()
             if self.ep_group is not None and self.ep_size > 1:
                 dist.all_reduce(global_stats, op=dist.ReduceOp.SUM, group=self.ep_group)
             collective_ms = (time.perf_counter() - collective_started) * 1000.0
+        _expert_swap_diag_phase("exact_p1_collective_done")
 
+        _expert_swap_diag_phase("exact_p1_score_start")
         with _full_timing_range("hiermoe_exact_p1_score"):
             score_started = time.perf_counter()
             decision_pairs: list[torch.Tensor] = []
@@ -8553,18 +9035,23 @@ class ExpertSwapManager:
                 accepted += int(chosen_pair is not None)
                 selections.append((layer, chosen_pair))
             score_ms = (time.perf_counter() - score_started) * 1000.0
+        _expert_swap_diag_phase("exact_p1_score_done")
 
         self._accumulate_metric("hiermoe/exact_p1_stats_ms", stats_ms)
         self._accumulate_metric("hiermoe/exact_p1_collective_ms", collective_ms)
         self._accumulate_metric("hiermoe/exact_p1_score_ms", score_ms)
         self._accumulate_metric("hiermoe/exact_p1_candidate_count", candidate_total)
         self._accumulate_metric("hiermoe/exact_p1_accepted_count", accepted)
+        self._accumulate_metric("hiermoe/exact_p1_population_tokens", population_token_total)
+        self._accumulate_metric("hiermoe/exact_p1_sampled_tokens", sampled_token_total)
 
         committed: list[str] = []
+        _expert_swap_diag_phase("exact_p1_execute_start")
         for layer, chosen_pair in selections:
             result = self._execute_exact_single_swap(layer, chosen_pair, timing_prefix="hiermoe_exact_p1")
             if result is not None:
                 committed.append(result)
+        _expert_swap_diag_phase("exact_p1_execute_done")
         return committed
 
     @torch.no_grad()
@@ -8941,6 +9428,186 @@ class ExpertSwapManager:
         return committed
 
     @torch.no_grad()
+    @torch.no_grad()
+    def _plan_online_lut_layers(self, layers: Sequence[ExpertLayerState]) -> list[str]:
+        """Apply at most one exact source-LUT correction per layer."""
+
+        if not layers:
+            return []
+        missing_selected = sum(layer.latest_selected_experts is None for layer in layers)
+        missing_physical = sum(layer.latest_physical_routes is None for layer in layers)
+        missing_endpoint = sum(layer.latest_forward_traffic_endpoint_statistics is None for layer in layers)
+        missing_source_lut = sum(layer.source_logical_to_physical is None for layer in layers)
+        self._accumulate_metric("hiermoe/online_lut_missing_selected", missing_selected)
+        self._accumulate_metric("hiermoe/online_lut_missing_physical", missing_physical)
+        self._accumulate_metric("hiermoe/online_lut_missing_endpoint", missing_endpoint)
+        self._accumulate_metric("hiermoe/online_lut_missing_source_lut", missing_source_lut)
+        if missing_selected or missing_physical or missing_source_lut:
+            self._accumulate_metric(
+                "hiermoe/online_lut_skipped_incomplete",
+                missing_selected + missing_physical + missing_source_lut,
+            )
+            return []
+
+        common_device = layers[0].latest_selected_experts.device  # type: ignore[union-attr]
+        if any(
+            layer.latest_selected_experts.device != common_device  # type: ignore[union-attr]
+            for layer in layers
+        ):
+            raise RuntimeError("Online LUT correction requires all layer routes on one device.")
+
+        synchronize()
+        planning_started = time.perf_counter()
+        planner = GreedyCommunicationPlanner(
+            hierarchy=self.hierarchy,
+            perf_model=self.perf_model,
+            hidden_size=layers[0].latest_hidden_size,
+            bytes_per_element=layers[0].latest_bytes_per_element,
+            slots_per_rank=layers[0].num_local_experts,
+            communication_scale=1.0,
+            forward_compute_per_assignment=self._forward_reuse_cover_compute_ms_per_assignment,
+            forward_compute_constant=0.0,
+            smooth_max_gamma=self.smooth_max_gamma,
+            process_group=self.ep_group,
+            max_copies=self.greedy_max_copies_per_expert,
+            assume_unique_routes=True,
+            traffic_inter_ms_per_byte=self._online_freeze_inter_ms_per_byte,
+            traffic_intra_ms_per_byte=self._online_freeze_intra_ms_per_byte,
+            traffic_route_ms_per_assignment=self._online_freeze_route_ms_per_assignment,
+            traffic_communication_phase_multiplier=self._online_freeze_communication_ratio,
+            traffic_compute_phase_multiplier=self._online_freeze_compute_ratio,
+        )
+
+        def baseline_endpoint(layer: ExpertLayerState) -> torch.Tensor:
+            cached = layer.latest_forward_traffic_endpoint_statistics
+            if cached is not None:
+                return cached.to(
+                    device=common_device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+            physical = layer.latest_physical_routes
+            assert physical is not None
+            unique_counts = planner._local_packed_counts(physical)
+            assignment_counts = planner._local_packed_assignment_counts(physical)
+            return planner._local_traffic_endpoint_statistics(
+                unique_counts,
+                assignment_counts,
+                source_rank=self.ep_rank,
+            ).squeeze(0)
+
+        baseline_endpoints = torch.stack(
+            [baseline_endpoint(layer) for layer in layers],
+            dim=0,
+        )
+        self._accumulate_metric("hiermoe/online_lut_endpoint_fallback_layers", missing_endpoint)
+        collective_started = time.perf_counter()
+        self._planner_reduce_sum(baseline_endpoints)
+        synchronize()
+        collective_ms = (time.perf_counter() - collective_started) * 1000.0
+
+        baseline_communication, baseline_compute, *_baseline_details = planner._traffic_endpoint_cost_details(
+            baseline_endpoints
+        )
+        baseline_total = baseline_communication + baseline_compute
+        local_winners = torch.full(
+            (len(layers), 6),
+            float("inf"),
+            dtype=torch.float32,
+            device=common_device,
+        )
+        local_winners[:, 5] = float(self.ep_rank)
+        for layer_index, layer in enumerate(layers):
+            selected = layer.latest_selected_experts
+            source_lut = layer.source_logical_to_physical
+            if selected is None or source_lut is None:
+                continue
+            proposal = propose_online_lut_move(
+                planner=planner,
+                selected_experts=selected,
+                slot_to_logical=self._layer_layout(layer),
+                source_lut=source_lut[self.ep_rank],
+                global_baseline_endpoint=baseline_endpoints[layer_index],
+                source_rank=self.ep_rank,
+                num_experts=layer.num_experts,
+            )
+            if proposal is None:
+                continue
+            local_winners[layer_index] = local_winners.new_tensor(
+                (
+                    proposal.candidate_cost,
+                    proposal.candidate_communication,
+                    proposal.candidate_compute,
+                    proposal.expert,
+                    proposal.destination_slot,
+                    self.ep_rank,
+                )
+            )
+
+        collective_started = time.perf_counter()
+        gathered = self._planner_gather_fixed(local_winners.reshape(-1)).view(
+            self.ep_size,
+            len(layers),
+            local_winners.shape[1],
+        )
+        synchronize()
+        collective_ms += (time.perf_counter() - collective_started) * 1000.0
+        winner_rank_indices = gathered[:, :, 0].argmin(dim=0)
+        layer_indices = torch.arange(len(layers), dtype=torch.long, device=common_device)
+        winners = gathered[winner_rank_indices, layer_indices].detach().to(device="cpu")
+        baseline_cpu = (
+            torch.stack(
+                (baseline_total, baseline_communication, baseline_compute),
+                dim=1,
+            )
+            .detach()
+            .to(device="cpu")
+        )
+
+        committed: list[str] = []
+        total_gain = 0.0
+        communication_gain = 0.0
+        compute_gain = 0.0
+        for layer, winner, baseline in zip(layers, winners, baseline_cpu, strict=True):
+            candidate_cost = float(winner[0].item())
+            gain = float(baseline[0].item()) - candidate_cost
+            if not math.isfinite(candidate_cost) or not gain > self._online_lut_min_gain:
+                continue
+            expert = int(winner[3].item())
+            destination = int(winner[4].item())
+            source_rank = int(winner[5].item())
+            source_lut = layer.source_logical_to_physical
+            if source_lut is None:
+                raise RuntimeError(f"Online LUT correction lost the source LUT for {layer.key}.")
+            old_slot = int(source_lut[source_rank, expert].item())
+            layout = self._layer_layout(layer)
+            if int(layout[destination].item()) != expert:
+                raise RuntimeError(
+                    f"Online LUT correction maps expert {expert} to invalid slot {destination} for {layer.key}."
+                )
+            if destination == old_slot:
+                raise RuntimeError("Online LUT correction selected a no-op move.")
+            source_lut[source_rank, expert] = destination
+            layer._device_source_mapping_cache.clear()
+            layer.placement_version += 1
+            committed.append(f"{layer.key}:lut(rank={source_rank},expert={expert},{old_slot}->{destination})")
+            total_gain += gain
+            communication_gain += float(baseline[1].item()) - float(winner[1].item())
+            compute_gain += float(baseline[2].item()) - float(winner[2].item())
+
+        planning_ms = (time.perf_counter() - planning_started) * 1000.0
+        self._accumulate_metric("hiermoe/online_lut_planning_ms", planning_ms)
+        self._accumulate_metric("hiermoe/online_lut_collective_ms", collective_ms)
+        self._accumulate_metric("hiermoe/online_lut_layers", len(layers))
+        self._accumulate_metric("hiermoe/online_lut_accepted", len(committed))
+        self._accumulate_metric("hiermoe/online_lut_estimated_gain_ms", total_gain)
+        self._accumulate_metric(
+            "hiermoe/online_lut_communication_gain_ms",
+            communication_gain,
+        )
+        self._accumulate_metric("hiermoe/online_lut_compute_gain_ms", compute_gain)
+        return committed
+
     def _plan_forward_reuse_cover_layers(self, layers: Sequence[ExpertLayerState], step: int) -> list[str]:
         """Select at most one positive-gain cover per layer from current Forward state."""
 
@@ -9848,9 +10515,435 @@ class ExpertSwapManager:
         self.latest_pair = ",".join(committed)
         return self.latest_pair
 
+    def _periodic_full_replan_event(self, event: str, **values: Any) -> None:
+        if self.ep_rank != 0:
+            return
+        root = os.path.abspath(_PERIODIC_FULL_REPLAN_WORK_ROOT)
+        os.makedirs(root, exist_ok=True)
+        payload = {
+            "event": str(event),
+            "wall_time": time.time(),
+            **values,
+        }
+        with open(os.path.join(root, "events.jsonl"), "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+    def _periodic_full_replan_builder_path(self) -> str:
+        if _PERIODIC_FULL_REPLAN_BUILDER:
+            return os.path.abspath(_PERIODIC_FULL_REPLAN_BUILDER)
+        repository_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+        return os.path.join(repository_root, "scripts", "profile", "build_hiermoe_recursive_classifier_layout.py")
+
+    @torch.no_grad()
+    def _capture_periodic_full_routes(self, placement_step: int, training_step: int, job_dir: str) -> float:
+        layers = [self.layers[layer_key] for layer_key in sorted(self.layers)]
+        if not layers:
+            raise RuntimeError("Periodic full replanning has no registered expert layers.")
+        if any(
+            layer.latest_selected_experts is None or int(layer.latest_route_step) != int(placement_step)
+            for layer in layers
+        ):
+            missing = [
+                layer.key
+                for layer in layers
+                if layer.latest_selected_experts is None or int(layer.latest_route_step) != int(placement_step)
+            ]
+            raise RuntimeError(
+                f"Periodic full replanning step {training_step} has stale or missing routes for {missing[:4]}."
+            )
+        started = time.perf_counter()
+        capture_dir = os.path.join(job_dir, "routes", "step0000")
+        if self.ep_rank == 0:
+            os.makedirs(capture_dir, exist_ok=True)
+
+        for layer_index, layer in enumerate(layers):
+            selected = layer.latest_selected_experts
+            assert selected is not None
+            if selected.ndim != 2:
+                raise RuntimeError(f"Periodic full replanning requires 2D routes for layer {layer.key}.")
+            route = selected.detach().to(dtype=torch.int32).contiguous()
+            shape = torch.tensor(tuple(int(value) for value in route.shape), dtype=torch.int64, device=route.device)
+            if self.ep_size > 1:
+                gathered_shapes = torch.empty((self.ep_size * 2,), dtype=torch.int64, device=route.device)
+                dist.all_gather_into_tensor(gathered_shapes, shape, group=self.ep_group)
+                shapes = gathered_shapes.view(self.ep_size, 2)
+            else:
+                shapes = shape.view(1, 2)
+            max_numel = int((shapes[:, 0] * shapes[:, 1]).max().item())
+            padded = torch.full((max_numel,), -1, dtype=torch.int32, device=route.device)
+            padded[: route.numel()].copy_(route.reshape(-1))
+            if self.ep_size > 1:
+                gathered_routes = torch.empty(
+                    (self.ep_size * max_numel,),
+                    dtype=torch.int32,
+                    device=route.device,
+                )
+                dist.all_gather_into_tensor(gathered_routes, padded, group=self.ep_group)
+            else:
+                gathered_routes = padded
+            if self.ep_rank == 0:
+                cpu_shapes = shapes.detach().cpu()
+                cpu_routes = gathered_routes.detach().cpu().view(self.ep_size, max_numel)
+                routes_by_rank = []
+                for rank in range(self.ep_size):
+                    rows, width = (int(value) for value in cpu_shapes[rank].tolist())
+                    routes_by_rank.append(cpu_routes[rank, : rows * width].view(rows, width).clone())
+                torch.save(
+                    {
+                        "format": "hiermoe-local-route-bundle-v1",
+                        "ep_size": self.ep_size,
+                        "source_training_step": int(training_step),
+                        "layer_key": layer.key,
+                        "routes_by_rank": routes_by_rank,
+                    },
+                    os.path.join(capture_dir, f"layer{layer_index:02d}_call0_all_ranks.pt"),
+                )
+            del gathered_routes, padded, shapes
+        if self.ep_group is not None and self.ep_size > 1:
+            dist.barrier(group=self.ep_group)
+        return (time.perf_counter() - started) * 1000.0
+
+    def _launch_periodic_full_replan(
+        self,
+        *,
+        placement_step: int,
+        training_step: int,
+    ) -> None:
+        layers = [self.layers[layer_key] for layer_key in sorted(self.layers)]
+        job_dir = os.path.join(
+            os.path.abspath(_PERIODIC_FULL_REPLAN_WORK_ROOT),
+            f"source_step_{int(training_step):06d}",
+        )
+        snapshot_ms = self._capture_periodic_full_routes(placement_step, training_step, job_dir)
+        layout_path = os.path.join(job_dir, "layout.json")
+        report_path = os.path.join(job_dir, "report.json")
+        planner_log_path = os.path.join(job_dir, "planner.log")
+        submitted_at = time.perf_counter()
+        process: subprocess.Popen[bytes] | None = None
+        if self.ep_rank == 0:
+            builder = self._periodic_full_replan_builder_path()
+            if not os.path.isfile(builder):
+                raise RuntimeError(f"Periodic full-replan builder does not exist: {builder}.")
+            primary_slots = layers[0].num_experts // self.ep_size
+            redundant_slots = layers[0].num_local_experts - primary_slots
+            command = [
+                sys.executable,
+                builder,
+                "--route-root",
+                os.path.join(job_dir, "routes"),
+                "--optimize-steps",
+                "0",
+                "--validation-steps",
+                "0",
+                "--layers",
+                str(len(layers)),
+                "--expected-total-layers",
+                str(len(layers)),
+                "--workers",
+                str(_PERIODIC_FULL_REPLAN_WORKERS),
+                "--candidate-workers",
+                str(_PERIODIC_FULL_REPLAN_CANDIDATE_WORKERS),
+                "--worker-threads",
+                str(_PERIODIC_FULL_REPLAN_WORKER_THREADS),
+                "--ep-size",
+                str(self.ep_size),
+                "--ranks-per-node",
+                str(min(self.ep_size, self.hierarchy.local_world_size)),
+                "--num-experts",
+                str(layers[0].num_experts),
+                "--slots-per-rank",
+                str(layers[0].num_local_experts),
+                "--primary-slots-per-rank",
+                str(primary_slots),
+                "--redundant-slots-per-rank",
+                str(redundant_slots),
+                "--active-redundant-slots",
+                str(redundant_slots * self.ep_size),
+                "--hidden-size",
+                str(layers[0].latest_hidden_size),
+                "--bytes-per-element",
+                str(layers[0].latest_bytes_per_element),
+                "--comparison-layout",
+                "none",
+                "--output-layout",
+                layout_path,
+                "--output-report",
+                report_path,
+            ]
+            if _PERIODIC_FULL_REPLAN_CPU_IDS:
+                planner_cpu_ids = self._parse_cpu_ids(_PERIODIC_FULL_REPLAN_CPU_IDS)
+                if not planner_cpu_ids:
+                    raise ValueError("Periodic full-replan planner CPU affinity must not be empty.")
+                command = ["taskset", "-c", _PERIODIC_FULL_REPLAN_CPU_IDS, *command]
+                self._cpu_planner_affinity = planner_cpu_ids
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "OMP_NUM_THREADS": str(_PERIODIC_FULL_REPLAN_WORKER_THREADS),
+                    "MKL_NUM_THREADS": str(_PERIODIC_FULL_REPLAN_WORKER_THREADS),
+                    "OPENBLAS_NUM_THREADS": str(_PERIODIC_FULL_REPLAN_WORKER_THREADS),
+                    "PYTHONUNBUFFERED": "1",
+                }
+            )
+            os.makedirs(job_dir, exist_ok=True)
+            with open(planner_log_path, "wb") as planner_log:
+                process = subprocess.Popen(command, stdout=planner_log, stderr=subprocess.STDOUT, env=environment)
+        self._periodic_full_replan_state = _PeriodicFullReplanState(
+            source_step=int(training_step),
+            placement_versions=tuple(int(layer.placement_version) for layer in layers),
+            submitted_at=submitted_at,
+            snapshot_ms=snapshot_ms,
+            job_dir=job_dir,
+            layout_path=layout_path,
+            report_path=report_path,
+            planner_log_path=planner_log_path,
+            process=process,
+        )
+        self._periodic_full_replan_last_source_step = int(training_step)
+        self._periodic_full_replan_last_snapshot_ms = snapshot_ms
+        self._periodic_full_replan_event(
+            "submitted",
+            source_step=int(training_step),
+            snapshot_ms=snapshot_ms,
+            job_dir=job_dir,
+            planner_pid=None if process is None else process.pid,
+        )
+
+    def _periodic_full_replan_status(self, state: _PeriodicFullReplanState, device: torch.device) -> int:
+        status = 0
+        if self.ep_rank == 0:
+            assert state.process is not None
+            return_code = state.process.poll()
+            status = 0 if return_code is None else (1 if return_code == 0 else 2)
+        if self.ep_size > 1:
+            status_tensor = torch.tensor([status], dtype=torch.int32, device=device)
+            dist.broadcast(
+                status_tensor,
+                src=_ep_global_rank(self.ep_group, 0),
+                group=self.ep_group,
+            )
+            status = int(status_tensor.item())
+        return status
+
+    def _broadcast_periodic_full_replan_payload(
+        self,
+        state: _PeriodicFullReplanState,
+        device: torch.device,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] | None = None
+        if self.ep_rank == 0:
+            with open(state.layout_path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+        if self.ep_size > 1:
+            objects: list[Any] = [payload]
+            dist.broadcast_object_list(
+                objects,
+                src=_ep_global_rank(self.ep_group, 0),
+                group=self.ep_group,
+                device=device,
+            )
+            payload = objects[0]
+        if not isinstance(payload, dict):
+            raise RuntimeError("Periodic full replanning broadcast an invalid layout payload.")
+        return payload
+
+    @torch.no_grad()
+    def _install_periodic_absolute_layer_layout(
+        self,
+        layer: ExpertLayerState,
+        raw_layer: dict[str, Any],
+    ) -> int:
+        target, owners = self._validate_placement_layout(
+            layer,
+            raw_layer.get("slot_to_logical", ()),
+            raw_layer.get("owner_slots"),
+        )
+        if owners is None:
+            raise RuntimeError(f"Periodic full layout for {layer.key} has no owner mapping.")
+        source_lut = torch.as_tensor(
+            raw_layer.get("source_logical_to_physical", ()),
+            dtype=torch.long,
+        ).detach().cpu()
+        expected_lut_shape = (self.ep_size, layer.num_experts)
+        if tuple(source_lut.shape) != expected_lut_shape:
+            raise RuntimeError(
+                f"Periodic full layout source LUT for {layer.key} has shape {tuple(source_lut.shape)}, "
+                f"expected {expected_lut_shape}."
+            )
+        if bool(((source_lut < 0) | (source_lut >= layer.num_physical_slots)).any().item()):
+            raise RuntimeError(f"Periodic full layout source LUT for {layer.key} references an invalid slot.")
+        logical = torch.arange(layer.num_experts, dtype=torch.long).view(1, -1)
+        if not torch.equal(target.index_select(0, source_lut.reshape(-1)).view_as(source_lut), logical.expand_as(source_lut)):
+            raise RuntimeError(f"Periodic full layout source LUT for {layer.key} references the wrong expert.")
+
+        current = self._layer_layout(layer)
+        changed_slots = [slot for slot in range(layer.num_physical_slots) if current[slot] != target[slot]]
+        if changed_slots:
+            state_tensors = self._slot_op_state_tensors(layer)
+            grouped_entries: dict[tuple[int, int], list[_CoverTensorEntry]] = defaultdict(list)
+            zero_entry_groups: list[tuple[int, list[_CoverTensorEntry]]] = []
+            for dst_slot in changed_slots:
+                desired = int(target[dst_slot].item())
+                dst_rank = dst_slot // layer.num_local_experts
+                if desired < 0:
+                    zero_entry_groups.append(
+                        (
+                            dst_rank,
+                            self._slot_op_cover_entries_from_tensors(
+                                state_tensors,
+                                num_local_experts=layer.num_local_experts,
+                                src_slot=dst_slot,
+                                dst_slot=dst_slot,
+                            ),
+                        )
+                    )
+                    continue
+                candidates = [int(value) for value in torch.nonzero(current == desired, as_tuple=False).flatten()]
+                if not candidates:
+                    raise RuntimeError(
+                        f"Periodic full layout cannot find current state for expert {desired} in {layer.key}."
+                    )
+                same_rank = [slot for slot in candidates if slot // layer.num_local_experts == dst_rank]
+                owner_slot = int(layer.logical_to_physical[desired].item())
+                src_slot = min(same_rank or ([owner_slot] if owner_slot in candidates else candidates))
+                src_rank = src_slot // layer.num_local_experts
+                grouped_entries[(src_rank, dst_rank)].extend(
+                    self._slot_op_cover_entries_from_tensors(
+                        state_tensors,
+                        num_local_experts=layer.num_local_experts,
+                        src_slot=src_slot,
+                        dst_slot=dst_slot,
+                    )
+                )
+            _cover_grouped_slot_entries_atomic(
+                grouped_entries,
+                self.ep_rank,
+                self.ep_size,
+                self.ep_group,
+                zero_entry_groups=zero_entry_groups,
+                debug_validate=self.debug_validate,
+            )
+            synchronize()
+
+        layout_changed = not torch.equal(current, target)
+        lut_changed = layer.source_logical_to_physical is None or not torch.equal(
+            layer.source_logical_to_physical,
+            source_lut,
+        )
+        layer.slot_to_logical = target
+        layer.fixed_r2_layout = False
+        layer.active_quota_policy = ()
+        layer.pending_physical_routes = None
+        layer.pending_route_data_ptr = 0
+        layer.latest_physical_routes = None
+        layer.latest_forward_traffic_endpoint_statistics = None
+        self._refresh_layer_mapping_from_slots(layer, owners)
+        layer.source_logical_to_physical = source_lut.clone()
+        layer._device_source_mapping_cache.clear()
+        layer.placement_version += int(layout_changed or lut_changed)
+        return len(changed_slots)
+
+    @torch.no_grad()
+    def _apply_periodic_full_replan(self, state: _PeriodicFullReplanState, training_step: int) -> str:
+        layers = [self.layers[layer_key] for layer_key in sorted(self.layers)]
+        versions = tuple(int(layer.placement_version) for layer in layers)
+        if versions != state.placement_versions:
+            raise RuntimeError(
+                f"Periodic full layout from step {state.source_step} is stale: "
+                f"source versions={state.placement_versions}, current versions={versions}."
+            )
+        device = self._pipeline_device(layers[0])
+        payload = self._broadcast_periodic_full_replan_payload(state, device)
+        raw_layers = payload.get("layers")
+        if not isinstance(raw_layers, dict) or set(raw_layers) != set(self.layers):
+            raise RuntimeError("Periodic full layout layer keys do not match the registered model.")
+        migration_started = time.perf_counter()
+        moved_slots = 0
+        for layer in layers:
+            raw_layer = raw_layers[layer.key]
+            if not isinstance(raw_layer, dict):
+                raise RuntimeError(f"Periodic full layout for {layer.key} is not a mapping.")
+            moved_slots += self._install_periodic_absolute_layer_layout(layer, raw_layer)
+        if self.ep_group is not None and self.ep_size > 1:
+            dist.barrier(group=self.ep_group)
+        migration_ms = (time.perf_counter() - migration_started) * 1000.0
+        planner_ms = (time.perf_counter() - state.submitted_at) * 1000.0
+        if self.ep_rank == 0 and os.path.isfile(state.report_path):
+            with open(state.report_path, encoding="utf-8") as handle:
+                report = json.load(handle)
+            planner_ms = float(report.get("aggregate", {}).get("planner_wall_ms", planner_ms))
+        self._periodic_full_replan_updates += 1
+        self._periodic_full_replan_last_apply_step = int(training_step)
+        self._periodic_full_replan_last_staleness_steps = int(training_step) - int(state.source_step)
+        self._periodic_full_replan_last_planner_ms = planner_ms
+        self._periodic_full_replan_last_migration_ms = migration_ms
+        self._periodic_full_replan_last_moved_slots = moved_slots
+        self._periodic_full_replan_event(
+            "applied",
+            source_step=state.source_step,
+            apply_step=int(training_step),
+            staleness_steps=int(training_step) - int(state.source_step),
+            snapshot_ms=state.snapshot_ms,
+            planner_ms=planner_ms,
+            migration_ms=migration_ms,
+            moved_slots=moved_slots,
+        )
+        return f"periodic_full_replan:{state.source_step}->{int(training_step)}:{moved_slots}"
+
+    @torch.no_grad()
+    def _run_periodic_full_replan_step(self, placement_step: int) -> str:
+        training_step = int(placement_step) + 1
+        state = self._periodic_full_replan_state
+        if state is not None:
+            layers = [self.layers[layer_key] for layer_key in sorted(self.layers)]
+            status = self._periodic_full_replan_status(state, self._pipeline_device(layers[0]))
+            if status == 0:
+                self.latest_pair = "periodic_full_replan_running"
+                return self.latest_pair
+            if status == 2:
+                self._periodic_full_replan_event(
+                    "failed",
+                    source_step=state.source_step,
+                    planner_log_path=state.planner_log_path,
+                )
+                raise RuntimeError(
+                    f"Periodic full layout solver failed for source step {state.source_step}; "
+                    f"see {state.planner_log_path}."
+                )
+            self.latest_pair = self._apply_periodic_full_replan(state, training_step)
+            self._periodic_full_replan_state = None
+            return self.latest_pair
+
+        if (
+            training_step <= 0
+            or self.expert_swap_interval <= 0
+            or training_step % self.expert_swap_interval != 0
+            or training_step > _PERIODIC_FULL_REPLAN_LAST_STEP
+        ):
+            self.latest_pair = "none"
+            return self.latest_pair
+        self._launch_periodic_full_replan(placement_step=placement_step, training_step=training_step)
+        self.latest_pair = f"periodic_full_replan_submitted:{training_step}"
+        return self.latest_pair
+
     @torch.no_grad()
     def maybe_swap(self, step: int) -> str:
         self._begin_metrics_step(step)
+        if self._periodic_full_replan:
+            return self._run_periodic_full_replan_step(int(step))
+        if self._online_lut_update:
+            if (
+                int(step) < self._online_lut_start_step
+                or self.expert_swap_interval <= 0
+                or int(step) % self.expert_swap_interval != 0
+            ):
+                self.latest_pair = "none"
+                return self.latest_pair
+            layers = [self.layers[layer_key] for layer_key in sorted(self.layers)]
+            with _full_timing_range("hiermoe_online_lut_plan"):
+                committed = self._plan_online_lut_layers(layers)
+            self.latest_pair = ",".join(committed) if committed else "none"
+            return self.latest_pair
         if self._ablation_replay_mode != "off":
             return self._queue_ablation_replay_step(int(step))
         if self._cost_model_verify:

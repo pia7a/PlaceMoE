@@ -22,6 +22,7 @@ from tqdm import trange
 
 from ...distributed.parallel_state import get_parallel_state
 from ...utils import helper
+from ...utils.device import synchronize
 from ...utils.dist_utils import all_reduce
 from ...utils.logging import get_logger
 from .base import Callback, TrainerState
@@ -55,6 +56,7 @@ class MoERouterMonitorCallback(Callback):
         self.monitor_jsonl_path: Path | None = None
         self.timing_jsonl_path: Path | None = None
         self.validator_jsonl_path: Path | None = None
+        self.convergence_jsonl_path: Path | None = None
 
         args: "VeOmniArguments" = self.trainer.args
         monitor_dir = os.environ.get("VERL_MOE_MONITOR_DIR")
@@ -64,6 +66,10 @@ class MoERouterMonitorCallback(Callback):
         timing_dir = os.environ.get("VERL_MOE_TIMING_DIR")
         if timing_dir:
             self.timing_jsonl_path = Path(timing_dir) / f"moe_timing_rank{args.train.global_rank}.jsonl"
+
+        convergence_dir = os.environ.get("VEOMNI_CONVERGENCE_METRICS_DIR")
+        if convergence_dir and args.train.global_rank == 0:
+            self.convergence_jsonl_path = Path(convergence_dir) / "convergence_metrics_rank0.jsonl"
 
         validator_dir = (
             os.environ.get("VEOMNI_MOE_VALIDATOR_DIR") if _env_flag("VEOMNI_MOE_VALIDATOR_ENABLE") else None
@@ -143,6 +149,8 @@ class MoERouterMonitorCallback(Callback):
         interval = max(1, int(args.train.moe_load_balance_monitor_interval))
         if state.global_step % interval != 0:
             return
+
+        self._write_convergence_payload(state)
 
         # compute_metrics runs an all-reduce across EP/DP groups, so every rank
         # must call it — but only rank 0 logs.
@@ -240,6 +248,47 @@ class MoERouterMonitorCallback(Callback):
         self.timing_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         with self.timing_jsonl_path.open("a", encoding="utf-8") as writer:
             writer.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def _write_convergence_payload(self, state: TrainerState) -> None:
+        convergence_dir = os.environ.get("VEOMNI_CONVERGENCE_METRICS_DIR")
+        if not convergence_dir:
+            return
+
+        from ...utils.physical_moe_load import flush_physical_moe_load
+
+        ps = get_parallel_state()
+        expected_num_layers = int(os.environ.get("VEOMNI_PHYSICAL_LOAD_NUM_LAYERS", "0"))
+        if expected_num_layers <= 0:
+            raise RuntimeError("VEOMNI_PHYSICAL_LOAD_NUM_LAYERS must be positive for convergence metrics.")
+        physical_load = flush_physical_moe_load(
+            process_group=ps.ep_group if ps.ep_enabled else None,
+            expected_num_layers=expected_num_layers,
+        )
+
+        args: "VeOmniArguments" = self.trainer.args
+        if args.train.global_rank != 0:
+            return
+        if self.convergence_jsonl_path is None:
+            raise RuntimeError("Rank 0 convergence metrics path was not initialized.")
+        metrics = self.trainer.step_env_metrics
+        payload = {
+            "step": int(state.global_step),
+            "loss": metrics["training/total_loss"],
+            "lr": metrics["training/lr"],
+            "grad_norm": metrics["training/grad_norm"],
+            "step_time_s": metrics["step_time_s"],
+            **physical_load,
+        }
+        self.convergence_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.convergence_jsonl_path.open("a", encoding="utf-8") as writer:
+            writer.write(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    default=lambda value: value.item() if hasattr(value, "item") else str(value),
+                )
+                + "\n"
+            )
 
     def _write_validator_payload(self, state: TrainerState) -> None:
         if self.validator_jsonl_path is None:
@@ -343,17 +392,23 @@ class EnvironMeterCallback(Callback):
             data_path=args.data.train_path,
             gc_steps=args.train.gc_steps,
         )
+        self.measure_true_step_time = bool(os.environ.get("VEOMNI_CONVERGENCE_METRICS_DIR"))
 
     def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         for micro_batch in micro_batches:
             self.trainer.environ_meter.add(micro_batch)
-        self.start_time = time.time()
+        self.start_time = time.perf_counter()
 
     def on_step_end(
         self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
     ) -> None:
-        delta_time = time.time() - self.start_time
+        if self.measure_true_step_time:
+            synchronize()
+        delta_time = time.perf_counter() - self.start_time
+        if self.measure_true_step_time:
+            delta_time = all_reduce(delta_time, op="max")
         step_env_metrics = self.trainer.environ_meter.step(delta_time, global_step=state.global_step)
+        step_env_metrics["step_time_s"] = delta_time
 
         step_train_metrics = {
             "total_loss": loss,
@@ -391,7 +446,7 @@ class EnvironMeterCallback(Callback):
         self._write_env_metrics(state, step_env_metrics)
 
     def _write_env_metrics(self, state: TrainerState, metrics: Dict[str, Any]) -> None:
-        if self.env_metrics_jsonl_path is None:
+        if self.env_metrics_jsonl_path is None or not _env_flag("VEOMNI_ENV_METRICS_JSONL_ENABLE", True):
             return
 
         payload = {"step": int(state.global_step), **metrics}

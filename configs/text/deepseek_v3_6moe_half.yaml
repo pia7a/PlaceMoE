@@ -1,0 +1,76 @@
+model:
+  config_path: /workspace/model/DeepSeek-V3-6MoE-Half
+  model_path: /workspace/model/DeepSeek-V3-6MoE-Half
+  tokenizer_path: /workspace/model/DeepSeek-V3-6MoE-Half
+  safetensor_idx_path: /workspace/model/DeepSeek-V3-6MoE-Half/model.safetensors.index.json
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: fused_npu
+    cross_entropy_loss_implementation: npu
+    load_balancing_loss_implementation: eager
+    rms_norm_implementation: npu
+    rotary_pos_emb_implementation: npu
+
+data:
+  train_path: /workspace/dataset/Tulu3/train-00002-of-00006.parquet
+  train_size: 1000000000000
+  train_sample: 10000
+  datasets_type: iterable
+  data_type: conversation
+  chat_template: chatml
+  text_keys: messages
+  max_seq_len: 4096
+  dataloader:
+    type: native
+    drop_last: true
+    num_workers: 4
+    prefetch_factor: 2
+
+train:
+  accelerator:
+    dp_replicate_size: 1
+    dp_shard_size: 32
+    ep_size: 32
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      forward_prefetch: true
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+  gradient_checkpointing:
+    enable: true
+    enable_reentrant: false
+  global_batch_size: 128
+  micro_batch_size: 4
+  max_steps: 4
+  num_train_epochs: 1
+  bsz_warmup_ratio: 0.0
+  optimizer:
+    type: adamw
+    # Match the Qwen3-VL EP32 paper workload. The reduced DeepSeek checkpoint
+    # is deterministically initialized, so the generic text default (3e-4)
+    # destabilizes its router within a few smoke steps.
+    lr: 1.0e-5
+    lr_warmup_ratio: 0.007
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  init_device: meta
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  moe_load_balance_monitor_interval: 0
+  checkpoint:
+    output_dir: deepseek_v3_6moe_half_ep32_smoke
+    manager: dcp
+    save_steps: 0
+    save_epochs: 0
+    hf_save_steps: 0
+    hf_save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
+    project: DeepSeek-V3
+    name: dsv3_6moe_half_ep32_smoke

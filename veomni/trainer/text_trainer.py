@@ -27,7 +27,7 @@ from ..models import build_tokenizer
 from ..utils import helper
 from ..utils.device import synchronize
 from ..utils.loss_utils import count_loss_token
-from .base import BaseTrainer
+from .base import BaseTrainer, _hiermoe_diag_phase
 
 
 logger = helper.create_logger(__name__)
@@ -133,17 +133,25 @@ class TextTrainer:
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
+        _hiermoe_diag_phase("redundant_grad_sync_start")
         self.base.sync_hiermoe_redundant_gradients()
+        _hiermoe_diag_phase("redundant_grad_sync_done")
 
         # Gradient clipping
+        _hiermoe_diag_phase("grad_clip_start")
         grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+        _hiermoe_diag_phase("grad_clip_done")
 
         # Optimizer and scheduler step
+        _hiermoe_diag_phase("optimizer_start")
         self.base.optimizer.step()
         self.base.lr_scheduler.step()
         self.base.optimizer.zero_grad()
+        _hiermoe_diag_phase("optimizer_done")
 
+        _hiermoe_diag_phase("expert_swap_start")
         self.base.run_hiermoe_expert_swap()
+        _hiermoe_diag_phase("expert_swap_done")
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 
     def train(self):

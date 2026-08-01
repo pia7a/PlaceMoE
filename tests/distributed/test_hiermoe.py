@@ -1120,6 +1120,30 @@ def test_repeat_ranks_and_combine_key_stride_keep_rank_token_keys_distinct():
     torch.testing.assert_close(combined, weighted_outputs)
 
 
+def test_chunked_fp32_index_add_matches_full_forward_backward(monkeypatch):
+    monkeypatch.setenv("VEOMNI_HIERMOE_INDEX_ADD_FP32_CHUNK_ROWS", "2")
+    index = torch.tensor([0, 1, 0, 2, 1, 2, 0], dtype=torch.long)
+    source = torch.randn(7, 5, dtype=torch.bfloat16, requires_grad=True)
+    reference_source = source.detach().clone().requires_grad_(True)
+
+    actual = hiermoe_all_to_all._index_add_dim0_fp32(
+        torch.zeros(3, 5, dtype=torch.float32),
+        index,
+        source,
+    )
+    expected = torch.zeros(3, 5, dtype=torch.float32).index_add(
+        0,
+        index,
+        reference_source.float(),
+    )
+    torch.testing.assert_close(actual, expected)
+
+    gradient = torch.randn_like(actual)
+    actual.backward(gradient)
+    expected.backward(gradient)
+    torch.testing.assert_close(source.grad, reference_source.grad)
+
+
 def test_local_expert_sort_indices_is_a_permutation_and_tracks_counts():
     local_expert_ids = torch.tensor([3, 1, 0, 3, 2, 1, 2, 0, 3], dtype=torch.long)
     sort_indices, unsort_indices, tokens_per_local_expert = hiermoe_all_to_all._local_expert_sort_indices(
@@ -2747,6 +2771,52 @@ def test_redundant_slot_state_collection_skips_ep_symmetry_checks(monkeypatch):
     assert len(entries) == 6
 
 
+def test_periodic_absolute_layout_moves_parameter_and_optimizer_state():
+    manager = expert_swap_module.ExpertSwapManager(
+        ep_group=None,
+        ep_size=1,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=1,
+        redundant_slot_increment_per_device=0,
+        max_replica_rounds=0,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=1, group_sizes=(1,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+    )
+    module = _FakeExperts(num_experts=3, local_start=0, local_experts=3, hidden_size=2)
+    key = "layers.0.mlp.experts"
+    manager.register_layer(key, module)
+    optimizer = torch.optim.AdamW([module.gate_up_proj, module.down_proj], lr=0.01)
+    manager.bind_optimizer(optimizer)
+    for param in (module.gate_up_proj, module.down_proj):
+        param.grad = torch.ones_like(param)
+    optimizer.step()
+    optimizer.zero_grad()
+    module.reset_values(0)
+    for param in (module.gate_up_proj, module.down_proj):
+        optimizer.state[param]["exp_avg"].copy_(param.detach() + 1000)
+        optimizer.state[param]["exp_avg_sq"].copy_(param.detach() + 2000)
+
+    moved = manager._install_periodic_absolute_layer_layout(
+        manager.layers[key],
+        {
+            "slot_to_logical": [1, 0, 2],
+            "owner_slots": [1, 0, 2],
+            "source_logical_to_physical": [[1, 0, 2]],
+        },
+    )
+
+    assert moved == 2
+    assert manager.layers[key].slot_to_logical.tolist() == [1, 0, 2]
+    assert manager.layers[key].logical_to_physical.tolist() == [1, 0, 2]
+    torch.testing.assert_close(module.gate_up_proj[:, 0, 0], torch.tensor([2.0, 1.0, 3.0]))
+    torch.testing.assert_close(
+        optimizer.state[module.down_proj]["exp_avg_sq"][:, 0, 0],
+        torch.tensor([2102.0, 2101.0, 2103.0]),
+    )
+
+
 def _placement_executor_atomic_state_worker(fast_sparse_transfer: bool = False):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -3391,6 +3461,76 @@ def _fixed_r2_grad_sync_batches_all_experts_worker():
 
 def test_fixed_r2_grad_sync_batches_all_experts_in_one_wave():
     torchrun(_fixed_r2_grad_sync_batches_all_experts_worker, world_size=2, backend="gloo")
+
+
+def _arbitrary_pair_graph_grad_sync_uses_one_all_to_all_worker():
+    rank = dist.get_rank()
+    configure_hiermoe(
+        _profiled_hiermoe_config(
+            enable=True,
+            token_dedup=True,
+            expert_swap=True,
+            expert_swap_interval=1,
+            hierarchy_group_sizes=[4],
+            redundant_slot_increment_per_device=1,
+        ),
+        dist.group.WORLD,
+        ep_fsdp_size=1,
+    )
+    state = get_hiermoe_state()
+    assert state is not None and state.expert_swap_manager is not None
+    manager = state.expert_swap_manager
+    module = _FakeExperts(num_experts=4, local_start=rank, local_experts=2, hidden_size=2)
+    manager.register_layer("layers.0.mlp.experts", module)
+    layer = manager.layers["layers.0.mlp.experts"]
+    layer.slot_to_logical = torch.tensor([0, 1, 0, 2, 1, 3, 2, 3], dtype=torch.long)
+    manager._refresh_layer_mapping_from_slots(layer, (0, 1, 3, 5))
+
+    module.gate_up_proj.grad = torch.zeros_like(module.gate_up_proj)
+    module.down_proj.grad = torch.zeros_like(module.down_proj)
+    for local_slot, logical_expert in enumerate(
+        layer.slot_to_logical[rank * 2 : (rank + 1) * 2].tolist()
+    ):
+        module.gate_up_proj.grad[local_slot].fill_(10 * (rank + 1) + logical_expert)
+        module.down_proj.grad[local_slot].fill_(100 * (rank + 1) + logical_expert)
+
+    original_all_to_all_single = dist.all_to_all_single
+    collective_calls = 0
+
+    def _count_all_to_all_single(*args, **kwargs):
+        nonlocal collective_calls
+        collective_calls += 1
+        return original_all_to_all_single(*args, **kwargs)
+
+    dist.all_to_all_single = _count_all_to_all_single
+    try:
+        manager.sync_redundant_gradients()
+    finally:
+        dist.all_to_all_single = original_all_to_all_single
+
+    assert collective_calls == 1
+    expected_by_expert = {
+        0: (30.0, 300.0),
+        1: (42.0, 402.0),
+        2: (64.0, 604.0),
+        3: (76.0, 706.0),
+    }
+    for local_slot, logical_expert in enumerate(
+        layer.slot_to_logical[rank * 2 : (rank + 1) * 2].tolist()
+    ):
+        gate_expected, down_expected = expected_by_expert[logical_expert]
+        torch.testing.assert_close(
+            module.gate_up_proj.grad[local_slot],
+            torch.full_like(module.gate_up_proj.grad[local_slot], gate_expected),
+        )
+        torch.testing.assert_close(
+            module.down_proj.grad[local_slot],
+            torch.full_like(module.down_proj.grad[local_slot], down_expected),
+        )
+
+
+def test_arbitrary_pair_graph_grad_sync_uses_one_all_to_all():
+    torchrun(_arbitrary_pair_graph_grad_sync_uses_one_all_to_all_worker, world_size=4, backend="gloo")
 
 
 def _three_copy_owner_grad_sync_uses_two_waves_worker():
@@ -5271,6 +5411,40 @@ def test_exact_p1_batches_layer_statistics_into_one_collective(monkeypatch):
     assert collective_shapes[0][0] == 3
     assert len(direct_calls) == 3
     assert manager.placement_metrics()["hiermoe/exact_p1_candidate_count"] == 3 * 24
+
+
+def test_exact_p1_route_sampling_uses_bounded_weighted_statistics(monkeypatch):
+    manager = expert_swap_module.ExpertSwapManager(
+        ep_group=None,
+        ep_size=4,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=1,
+        redundant_slot_increment_per_device=0,
+        max_replica_rounds=0,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=4, group_sizes=(2, 4), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_selector="hiermoe_exact_p1",
+    )
+    key = "layers.0.mlp.experts"
+    manager.register_layer(key, _FakeExperts(num_experts=8, local_start=0, local_experts=2, hidden_size=4))
+    layer = manager.layers[key]
+    layer.latest_selected_experts = torch.tensor(
+        [[row % 8, (row + 4) % 8] for row in range(10)],
+        dtype=torch.long,
+    )
+    layer.latest_hidden_size = 4
+    layer.latest_bytes_per_element = 2
+
+    monkeypatch.setattr(expert_swap_module, "_EXACT_P1_ROUTE_SAMPLE_SIZE", 4)
+    monkeypatch.setattr(manager, "_execute_exact_single_swap", lambda *_args, **_kwargs: None)
+
+    manager._plan_exact_single_swap_layers([layer], step=1)
+
+    metrics = manager.placement_metrics()
+    assert metrics["hiermoe/exact_p1_population_tokens"] == 10
+    assert metrics["hiermoe/exact_p1_sampled_tokens"] == 4
 
 
 def test_fixed_pipeline_requires_step_greedy_cover_configuration():
