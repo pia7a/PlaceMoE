@@ -15,6 +15,7 @@
 """Canonical profile-guided PlaceMoE optimizer APIs."""
 
 from .allocation import bounded_group_shortlist, build_replica_allocations
+from .partition import PartitionConfig, PartitionResult, map_groups_to_locations, partition_items, partition_objective
 from .statistics import profile_route_statistics, project_statistics_to_copies, uniform_copy_statistics
 from .types import EMPTY_EXPERT, LayerPlan, PlaceMoETopology, ProfileStatistics
 
@@ -22,10 +23,15 @@ from .types import EMPTY_EXPERT, LayerPlan, PlaceMoETopology, ProfileStatistics
 __all__ = [
     "EMPTY_EXPERT",
     "LayerPlan",
+    "PartitionConfig",
+    "PartitionResult",
     "PlaceMoETopology",
     "ProfileStatistics",
     "bounded_group_shortlist",
     "build_replica_allocations",
+    "map_groups_to_locations",
+    "partition_items",
+    "partition_objective",
     "profile_route_statistics",
     "project_statistics_to_copies",
     "uniform_copy_statistics",

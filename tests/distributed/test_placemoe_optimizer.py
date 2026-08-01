@@ -18,9 +18,13 @@ import torch
 
 from veomni.distributed.moe.hiermoe.placemoe import (
     LayerPlan,
+    PartitionConfig,
     PlaceMoETopology,
     bounded_group_shortlist,
     build_replica_allocations,
+    map_groups_to_locations,
+    partition_items,
+    partition_objective,
     profile_route_statistics,
     project_statistics_to_copies,
     uniform_copy_statistics,
@@ -104,3 +108,90 @@ def test_layer_plan_rejects_mapping_to_wrong_expert():
     )
     with pytest.raises(ValueError, match="wrong logical expert"):
         plan.validate(topology, additional_copies=0)
+
+
+def test_partition_respects_capacity_and_refines_the_calibrated_objective():
+    affinity = np.array(
+        [
+            [0, 8, 1, 0],
+            [8, 0, 0, 1],
+            [1, 0, 0, 8],
+            [0, 1, 8, 0],
+        ],
+        dtype=np.float64,
+    )
+    demand = np.array([9, 1, 9, 1], dtype=np.float64)
+    config = PartitionConfig(
+        capacities=(2, 2),
+        ranks_per_group=(1, 1),
+        omega=1.0,
+        gamma=2.0,
+        restarts=3,
+        seed=17,
+    )
+    results = partition_items(affinity, demand, config)
+    assert results
+    for result in results:
+        np.testing.assert_array_equal(np.bincount(result.labels, minlength=2), [2, 2])
+        objective, within, peak = partition_objective(affinity, demand, result.labels, config)
+        assert objective == pytest.approx(result.objective)
+        assert within == pytest.approx(result.within_affinity)
+        assert peak == pytest.approx(result.peak_assignments_per_rank)
+
+
+def test_calibrated_compute_cost_changes_the_preferred_partition():
+    affinity = np.array(
+        [
+            [0, 20, 0, 0],
+            [20, 0, 0, 0],
+            [0, 0, 0, 20],
+            [0, 0, 20, 0],
+        ],
+        dtype=np.float64,
+    )
+    demand = np.array([10, 10, 1, 1], dtype=np.float64)
+    affinity_labels = np.array([0, 0, 1, 1])
+    balanced_labels = np.array([0, 1, 0, 1])
+    communication_only = PartitionConfig((2, 2), (1, 1), omega=1.0, gamma=0.0)
+    compute_aware = PartitionConfig((2, 2), (1, 1), omega=1.0, gamma=5.0)
+    assert (
+        partition_objective(affinity, demand, affinity_labels, communication_only)[0]
+        < partition_objective(affinity, demand, balanced_labels, communication_only)[0]
+    )
+    assert (
+        partition_objective(affinity, demand, balanced_labels, compute_aware)[0]
+        < partition_objective(affinity, demand, affinity_labels, compute_aware)[0]
+    )
+    communication_result = partition_items(
+        affinity,
+        demand,
+        PartitionConfig((2, 2), (1, 1), omega=1.0, gamma=0.0, restarts=3, seed=17),
+    )[0]
+    compute_result = partition_items(
+        affinity,
+        demand,
+        PartitionConfig((2, 2), (1, 1), omega=1.0, gamma=5.0, restarts=3, seed=17),
+    )[0]
+    assert communication_result.within_affinity == 40
+    assert communication_result.peak_assignments_per_rank == 20
+    assert compute_result.within_affinity == 0
+    assert compute_result.peak_assignments_per_rank == 11
+
+
+def test_locality_matching_maps_abstract_groups_to_source_demand():
+    labels = np.array([0, 0, 1, 1])
+    demand_by_source = np.array(
+        [
+            [0, 0, 5, 4],
+            [0, 0, 3, 2],
+            [7, 6, 0, 0],
+            [5, 4, 0, 0],
+        ],
+        dtype=np.float64,
+    )
+    locations = map_groups_to_locations(
+        labels,
+        demand_by_source,
+        sources_by_location=(np.array([0, 1]), np.array([2, 3])),
+    )
+    np.testing.assert_array_equal(locations, [1, 1, 0, 0])
