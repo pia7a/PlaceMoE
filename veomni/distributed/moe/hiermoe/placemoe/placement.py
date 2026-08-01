@@ -37,6 +37,7 @@ class PlacementConfig:
     node_exchange_limit: int = 24
     rank_exchange_limit: int = 12
     seed: int = 0
+    seed_load_weight: float | None = None
 
     def __post_init__(self) -> None:
         if self.ep_size <= 0 or self.ranks_per_node <= 0 or self.slots_per_rank <= 0:
@@ -180,6 +181,7 @@ def place_instances(
             assignment_iterations=config.assignment_iterations,
             exchange_limit=config.node_exchange_limit,
             seed=config.seed,
+            seed_load_weight=config.seed_load_weight,
         ),
     )[0]
     node_sources = tuple(
@@ -208,6 +210,7 @@ def place_instances(
                 assignment_iterations=config.assignment_iterations,
                 exchange_limit=config.rank_exchange_limit,
                 seed=config.seed + 104729 * (node + 1),
+                seed_load_weight=config.seed_load_weight,
             ),
         )[0]
         rank_sources = tuple(

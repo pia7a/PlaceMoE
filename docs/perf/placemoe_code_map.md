@@ -30,6 +30,7 @@ The reusable implementation now lives in
 | `optimizer.py` | Bounded layout--mapping alternation and exact-cost callback. |
 | `materialize.py` | Physical-slot assignment and mapping relocation. |
 | `artifacts.py` | Validated schema-v2 runtime artifacts. |
+| `seeds.py` | Deterministic feasible seeds that prevent needless regressions from the default layout. |
 
 The canonical CLI is `scripts/profile/plan_placemoe.py`. The older
 `build_hiermoe_recursive_classifier_layout.py` name remains only as its
@@ -41,6 +42,13 @@ available through `--include-legacy-structured-candidates` and
 `--include-legacy-hyperedge-candidates`; they are not part of the paper path.
 All successful runs emit the same preloaded schema-v2 artifact for both
 static startup and hot updates.
+
+Partition restarts use scale-independent load weights only to diversify their
+spectral seeds. The calibrated partition objective refines those seeds, and
+complete token-route replay remains the sole selector of the final `L,M`
+pair. When the budget is exactly one extra copy per expert, the default-order
+uniform plan is retained as a feasible safety seed and wins only when its
+profiled joint cost is lower.
 
 ## Runtime modules retained by PlaceMoE
 

@@ -41,6 +41,7 @@ class PartitionConfig:
     exchange_limit: int = 24
     seed: int = 0
     improvement_tolerance: float = 1e-12
+    seed_load_weight: float | None = None
 
     def __post_init__(self) -> None:
         if not self.capacities or any(capacity <= 0 for capacity in self.capacities):
@@ -59,6 +60,8 @@ class PartitionConfig:
             raise ValueError("Exchange limit must be non-negative.")
         if self.improvement_tolerance < 0:
             raise ValueError("Improvement tolerance must be non-negative.")
+        if self.seed_load_weight is not None and self.seed_load_weight < 0:
+            raise ValueError("Normalized seed load weight must be non-negative.")
 
 
 @dataclass(frozen=True)
@@ -207,6 +210,66 @@ def _refine_partition(
     return labels, tuple(exchanges)
 
 
+def _refine_normalized_seed(
+    affinity: np.ndarray,
+    demand: np.ndarray,
+    initial_labels: np.ndarray,
+    config: PartitionConfig,
+) -> np.ndarray:
+    """Diversify a spectral seed with a scale-independent load penalty."""
+
+    if config.seed_load_weight is None or config.exchange_limit == 0:
+        return np.asarray(initial_labels, dtype=np.int64).copy()
+    labels = np.asarray(initial_labels, dtype=np.int64).copy()
+    parts = len(config.capacities)
+    membership = np.eye(parts, dtype=np.float64)[labels]
+    affinity_to_part = affinity @ membership
+    loads = np.bincount(labels, weights=demand, minlength=parts).astype(np.float64)
+    total_affinity = max(float(np.triu(affinity, k=1).sum()), 1.0)
+    total_demand = max(float(demand.sum()), 1.0)
+    target = 1.0 / parts
+    all_left, all_right = np.triu_indices(len(labels), k=1)
+
+    for _ in range(config.exchange_limit):
+        cross_group = labels[all_left] != labels[all_right]
+        left = all_left[cross_group]
+        right = all_right[cross_group]
+        if not len(left):
+            break
+        left_parts = labels[left]
+        right_parts = labels[right]
+        affinity_gain = (
+            affinity_to_part[left, right_parts]
+            - affinity_to_part[left, left_parts]
+            + affinity_to_part[right, left_parts]
+            - affinity_to_part[right, right_parts]
+            - 2.0 * affinity[left, right]
+        )
+        current_imbalance = float((((loads / total_demand) - target) ** 2).sum())
+        candidate_loads = np.broadcast_to(loads, (len(left), parts)).copy()
+        rows = np.arange(len(left))
+        candidate_loads[rows, left_parts] += demand[right] - demand[left]
+        candidate_loads[rows, right_parts] += demand[left] - demand[right]
+        candidate_imbalance = ((((candidate_loads / total_demand) - target) ** 2)).sum(axis=1)
+        score_gain = affinity_gain / total_affinity - float(config.seed_load_weight) * (
+            candidate_imbalance - current_imbalance
+        )
+        best = int(np.argmax(score_gain))
+        if score_gain[best] <= float(config.improvement_tolerance):
+            break
+
+        lhs = int(left[best])
+        rhs = int(right[best])
+        lhs_part = int(labels[lhs])
+        rhs_part = int(labels[rhs])
+        affinity_to_part[:, lhs_part] += affinity[:, rhs] - affinity[:, lhs]
+        affinity_to_part[:, rhs_part] += affinity[:, lhs] - affinity[:, rhs]
+        loads[lhs_part] += demand[rhs] - demand[lhs]
+        loads[rhs_part] += demand[lhs] - demand[rhs]
+        labels[lhs], labels[rhs] = labels[rhs], labels[lhs]
+    return labels
+
+
 def partition_items(affinity: np.ndarray, demand: np.ndarray, config: PartitionConfig) -> tuple[PartitionResult, ...]:
     """Generate unique calibrated partition candidates from spectral restarts."""
 
@@ -216,7 +279,8 @@ def partition_items(affinity: np.ndarray, demand: np.ndarray, config: PartitionC
     seen: set[tuple[tuple[int, int, tuple[int, ...]], ...]] = set()
     for restart in range(config.restarts):
         initial = _capacity_assignment(embedding, config, seed=config.seed + 7919 * restart)
-        labels, exchanges = _refine_partition(affinity, demand, initial, config)
+        diversified = _refine_normalized_seed(affinity, demand, initial, config)
+        labels, exchanges = _refine_partition(affinity, demand, diversified, config)
         groups = tuple(
             sorted(
                 (

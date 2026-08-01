@@ -30,6 +30,7 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     initialize_mapping,
     map_groups_to_locations,
     materialize_plan,
+    mirrored_r2_plan,
     optimize_mapping,
     optimize_replica_allocation,
     partition_items,
@@ -358,11 +359,23 @@ def test_optimizer_alternates_layout_and_mapping_with_exact_evaluation_callback(
         ),
         evaluate,
     )
-    assert len(result.candidates) == 2
-    assert len(evaluated) == 2
+    assert len(result.candidates) >= 2
+    assert len(evaluated) == len(result.candidates)
     assert result.best.cost == min(candidate.cost for candidate in result.candidates)
     for candidate in result.candidates:
         candidate.plan.validate(topology, additional_copies=2)
+
+
+def test_mirrored_r2_seed_is_a_valid_default_order_plan():
+    topology = PlaceMoETopology(ep_size=4, ranks_per_node=2, num_experts=8, slots_per_rank=4)
+
+    plan = mirrored_r2_plan(topology)
+
+    plan.validate(topology, additional_copies=8)
+    np.testing.assert_array_equal(plan.slot_to_logical[:8], np.arange(8))
+    np.testing.assert_array_equal(plan.slot_to_logical[8:], np.arange(8))
+    np.testing.assert_array_equal(plan.source_logical_to_physical[:2], np.tile(np.arange(8), (2, 1)))
+    np.testing.assert_array_equal(plan.source_logical_to_physical[2:], np.tile(np.arange(8, 16), (2, 1)))
 
 
 def test_artifact_schema_round_trip_validates_every_layer_plan():

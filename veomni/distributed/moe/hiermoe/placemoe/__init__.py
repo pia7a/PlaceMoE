@@ -34,6 +34,7 @@ from .placement import (
     rank_placement_is_unique,
     repair_rank_placement,
 )
+from .seeds import mirrored_r2_plan
 from .statistics import profile_route_statistics, project_statistics_to_copies, uniform_copy_statistics
 from .types import EMPTY_EXPERT, LayerPlan, PlaceMoETopology, ProfileStatistics
 
@@ -59,6 +60,7 @@ __all__ = [
     "initialize_mapping",
     "map_groups_to_locations",
     "materialize_plan",
+    "mirrored_r2_plan",
     "mapping_rank_loads",
     "optimize_mapping",
     "optimize_replica_allocation",

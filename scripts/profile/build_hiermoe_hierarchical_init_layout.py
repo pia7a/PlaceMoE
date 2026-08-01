@@ -555,7 +555,7 @@ class _HybridEvaluator:
         peak_assignments = 0.0
         peak_communication_rank = -1
         peak_compute_rank = -1
-        lut = torch.from_numpy(source_lut).to(torch.long)
+        lut = torch.from_numpy(np.array(source_lut, dtype=np.int64, copy=True))
         for sample in samples:
             endpoint = torch.zeros((1, 8 * self.args.ep_size), dtype=torch.float32)
             assignment_totals = torch.zeros((self.args.ep_size,), dtype=torch.float32)

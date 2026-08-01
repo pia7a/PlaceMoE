@@ -44,6 +44,7 @@ class OptimizerConfig:
     mapping_sweep_limit: int = 6
     prefer_node_local: bool = True
     seed: int = 0
+    seed_load_weights: tuple[float, ...] = (8.0, 32.0, 128.0)
 
     def __post_init__(self) -> None:
         if self.primary_slots_per_rank <= 0 or self.primary_slots_per_rank > self.topology.slots_per_rank:
@@ -52,6 +53,8 @@ class OptimizerConfig:
             raise ValueError("Calibrated optimizer coefficients must be non-negative.")
         if self.rounds <= 0:
             raise ValueError("Layout--mapping rounds must be positive.")
+        if not self.seed_load_weights or any(weight < 0 for weight in self.seed_load_weights):
+            raise ValueError("At least one non-negative seed load weight is required.")
 
 
 @dataclass(frozen=True)
@@ -132,6 +135,7 @@ def optimize_replica_allocation(
                     node_exchange_limit=config.node_exchange_limit,
                     rank_exchange_limit=config.rank_exchange_limit,
                     seed=config.seed + 1009 * round_index,
+                    seed_load_weight=config.seed_load_weights[round_index % len(config.seed_load_weights)],
                 ),
             )
         except RuntimeError:
@@ -151,6 +155,28 @@ def optimize_replica_allocation(
             # Mapping entries identify movable physical copies, so they remain
             # valid when a layout update relocates those copies to new ranks.
             initial_mapping = previous_mapping
+        initial_plan = materialize_plan(
+            logical_instances,
+            placement.instance_ranks,
+            initial_mapping,
+            statistics.demand,
+            topology,
+            primary_slots_per_rank=config.primary_slots_per_rank,
+        )
+        initial_cost = float(evaluate(initial_plan))
+        initial_candidate = OptimizerCandidate(
+            plan=initial_plan,
+            logical_instances=logical_instances,
+            instance_ranks=placement.instance_ranks,
+            instance_mapping=initial_mapping,
+            cost=initial_cost,
+            round_index=round_index,
+            placement_repaired=placement.repaired,
+            mapping_sweeps=0,
+            mapping_changes=0,
+        )
+        candidates.append(initial_candidate)
+
         mapping = optimize_mapping(
             logical_instances,
             placement.instance_ranks,
@@ -172,21 +198,25 @@ def optimize_replica_allocation(
             topology,
             primary_slots_per_rank=config.primary_slots_per_rank,
         )
-        cost = float(evaluate(plan))
-        candidates.append(
-            OptimizerCandidate(
-                plan=plan,
-                logical_instances=logical_instances,
-                instance_ranks=placement.instance_ranks,
-                instance_mapping=mapping.mapping,
-                cost=cost,
-                round_index=round_index,
-                placement_repaired=placement.repaired,
-                mapping_sweeps=mapping.sweeps,
-                mapping_changes=mapping.changes,
+        if not np.array_equal(mapping.mapping, initial_mapping):
+            cost = float(evaluate(plan))
+            candidates.append(
+                OptimizerCandidate(
+                    plan=plan,
+                    logical_instances=logical_instances,
+                    instance_ranks=placement.instance_ranks,
+                    instance_mapping=mapping.mapping,
+                    cost=cost,
+                    round_index=round_index,
+                    placement_repaired=placement.repaired,
+                    mapping_sweeps=mapping.sweeps,
+                    mapping_changes=mapping.changes,
+                )
             )
-        )
-        previous_mapping = mapping.mapping.copy()
+            round_mapping = min((initial_candidate, candidates[-1]), key=lambda candidate: candidate.cost).instance_mapping
+        else:
+            round_mapping = initial_mapping
+        previous_mapping = round_mapping.copy()
         instance_demand, instance_affinity = project_statistics_to_copies(
             statistics,
             logical_instances,

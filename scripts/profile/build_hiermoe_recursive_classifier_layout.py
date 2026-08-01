@@ -31,7 +31,6 @@ from scripts.profile.build_hiermoe_hierarchical_init_layout import (
     HybridCost,
     _HybridEvaluator,
     _load_routes,
-    _mirrored_r2,
 )
 from veomni.distributed.moe.hiermoe.placemoe import (
     LayerPlan,
@@ -46,6 +45,7 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     initialize_mapping,
     map_groups_to_locations,
     materialize_plan,
+    mirrored_r2_plan,
     optimize_mapping,
     optimize_replica_allocation,
     partition_items,
@@ -1596,6 +1596,33 @@ def _plan_layer(
         ) as executor:
             built_candidates = list(executor.map(lambda job: build_candidate(**job), candidate_jobs))
     candidates.extend(candidate for candidate in built_candidates if candidate is not None)
+    topology = PlaceMoETopology(
+        ep_size=args.ep_size,
+        ranks_per_node=args.ranks_per_node,
+        num_experts=args.num_experts,
+        slots_per_rank=args.slots_per_rank,
+    )
+    if args.ep_size % 2 == 0 and topology.total_slots == 2 * args.num_experts:
+        seed_plan = mirrored_r2_plan(topology)
+        seed_key = seed_plan.source_logical_to_physical.tobytes()
+        seed_cost = cost_cache.get(seed_key)
+        if seed_cost is None:
+            seed_cost = evaluator.evaluate(optimize_samples, seed_plan.source_logical_to_physical)
+            cost_cache[seed_key] = seed_cost
+        candidates.append(
+            _Candidate(
+                strategy="placemoe_uniform_seed",
+                layout=seed_plan.slot_to_logical.copy(),
+                owners=seed_plan.owner_slots.copy(),
+                lut=seed_plan.source_logical_to_physical.copy(),
+                lut_instances=seed_plan.source_logical_to_physical.copy(),
+                logical_instances=seed_plan.slot_to_logical.copy(),
+                instance_ranks=np.arange(topology.total_slots, dtype=np.int64) // topology.slots_per_rank,
+                optimize_cost=seed_cost,
+                planner_ms=0.0,
+                alternations=0,
+            )
+        )
     if not candidates:
         raise RuntimeError(f"No feasible recursive classifier candidate for layer {layer}.")
     best = min(candidates, key=lambda item: item.optimize_cost.total_ms)
@@ -1604,12 +1631,8 @@ def _plan_layer(
     if args.comparison_layout == "mirrored-r2":
         if args.ep_size % 2 or args.ep_size * args.slots_per_rank != 2 * args.num_experts:
             raise ValueError("mirrored-r2 comparison requires an even EP size and exactly two full expert copies.")
-        _r2_layout, _r2_owners, r2_lut = _mirrored_r2(
-            ep_size=args.ep_size,
-            num_experts=args.num_experts,
-            slots_per_rank=args.slots_per_rank,
-        )
-        comparison_validation_cost = evaluator.evaluate(validation_samples, r2_lut)
+        r2_plan = mirrored_r2_plan(topology)
+        comparison_validation_cost = evaluator.evaluate(validation_samples, r2_plan.source_logical_to_physical)
     active_layout = best.layout[best.layout >= 0]
     copy_counts = np.bincount(active_layout, minlength=args.num_experts)
     layer_ms = (time.perf_counter() - layer_started) * 1000.0
