@@ -62,6 +62,7 @@ from .forward_cover_planner import (
 from .greedy_planner import GreedyCommunicationPlanner, assign_tokens_to_copies_greedy
 from .online_lut_planner import propose_online_lut_move
 from .perf_model import HierMoEPerfModel
+from .placemoe.artifacts import validate_placemoe_artifact
 from .planner import (
     CurrentRoutePlanner,
     PlacementAction,
@@ -10532,7 +10533,7 @@ class ExpertSwapManager:
         if _PERIODIC_FULL_REPLAN_BUILDER:
             return os.path.abspath(_PERIODIC_FULL_REPLAN_BUILDER)
         repository_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
-        return os.path.join(repository_root, "scripts", "profile", "build_hiermoe_recursive_classifier_layout.py")
+        return os.path.join(repository_root, "scripts", "profile", "plan_placemoe.py")
 
     @torch.no_grad()
     def _capture_periodic_full_routes(self, placement_step: int, training_step: int, job_dir: str) -> float:
@@ -10745,6 +10746,10 @@ class ExpertSwapManager:
             payload = objects[0]
         if not isinstance(payload, dict):
             raise RuntimeError("Periodic full replanning broadcast an invalid layout payload.")
+        try:
+            validate_placemoe_artifact(payload)
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError("Periodic full replanning produced an invalid PlaceMoE artifact.") from error
         return payload
 
     @torch.no_grad()
