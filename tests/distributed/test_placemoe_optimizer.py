@@ -19,6 +19,7 @@ import torch
 from veomni.distributed.moe.hiermoe.placemoe import (
     LayerPlan,
     MappingConfig,
+    OptimizerConfig,
     PartitionConfig,
     PlacementConfig,
     PlaceMoETopology,
@@ -29,6 +30,7 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     map_groups_to_locations,
     materialize_plan,
     optimize_mapping,
+    optimize_replica_allocation,
     partition_items,
     partition_objective,
     place_instances,
@@ -322,3 +324,40 @@ def test_materialize_plan_rewrites_mapping_to_relocated_slots():
         plan.slot_to_logical[plan.source_logical_to_physical],
         np.broadcast_to(np.arange(4), (2, 4)),
     )
+
+
+def test_optimizer_alternates_layout_and_mapping_with_exact_evaluation_callback():
+    topology = PlaceMoETopology(ep_size=2, ranks_per_node=1, num_experts=4, slots_per_rank=3)
+    statistics = _profile()
+    logical_instances = np.array([0, 1, 2, 3, 0, 3])
+    evaluated: list[np.ndarray] = []
+
+    def evaluate(plan: LayerPlan) -> float:
+        evaluated.append(plan.source_logical_to_physical.copy())
+        destination_ranks = plan.source_logical_to_physical // topology.slots_per_rank
+        loads = np.zeros((topology.ep_size,), dtype=np.float64)
+        np.add.at(loads, destination_ranks, statistics.demand)
+        return float(loads.max())
+
+    result = optimize_replica_allocation(
+        statistics,
+        logical_instances,
+        OptimizerConfig(
+            topology=topology,
+            primary_slots_per_rank=2,
+            node_omega=1.0,
+            rank_omega=0.1,
+            gamma=1.0,
+            rounds=2,
+            node_exchange_limit=4,
+            rank_exchange_limit=2,
+            mapping_sweep_limit=2,
+            seed=11,
+        ),
+        evaluate,
+    )
+    assert len(result.candidates) == 2
+    assert len(evaluated) == 2
+    assert result.best.cost == min(candidate.cost for candidate in result.candidates)
+    for candidate in result.candidates:
+        candidate.plan.validate(topology, additional_copies=2)

@@ -24,6 +24,7 @@ from .mapping import (
     validate_instance_mapping,
 )
 from .materialize import materialize_plan
+from .optimizer import OptimizationResult, OptimizerCandidate, OptimizerConfig, optimize_replica_allocation
 from .partition import PartitionConfig, PartitionResult, map_groups_to_locations, partition_items, partition_objective
 from .placement import (
     PlacementConfig,
@@ -41,6 +42,9 @@ __all__ = [
     "LayerPlan",
     "MappingConfig",
     "MappingResult",
+    "OptimizationResult",
+    "OptimizerCandidate",
+    "OptimizerConfig",
     "PartitionConfig",
     "PartitionResult",
     "PlacementConfig",
@@ -54,6 +58,7 @@ __all__ = [
     "materialize_plan",
     "mapping_rank_loads",
     "optimize_mapping",
+    "optimize_replica_allocation",
     "partition_items",
     "partition_objective",
     "place_instances",

@@ -43,6 +43,7 @@ from scripts.profile.build_hiermoe_hierarchical_init_layout import (
 )
 from veomni.distributed.moe.hiermoe.placemoe import (
     MappingConfig,
+    OptimizerConfig,
     PartitionConfig,
     PlacementConfig,
     PlaceMoETopology,
@@ -52,6 +53,7 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     map_groups_to_locations,
     materialize_plan,
     optimize_mapping,
+    optimize_replica_allocation,
     partition_items,
     place_instances,
     profile_route_statistics,
@@ -1114,6 +1116,86 @@ def _materialize_layout(
     )
 
 
+def _build_placemoe_candidate(
+    samples: list[list[torch.Tensor]],
+    *,
+    logical_instances: np.ndarray,
+    demand_by_source: np.ndarray,
+    affinity_by_source: np.ndarray,
+    evaluator: _HybridEvaluator,
+    args: argparse.Namespace,
+    seed: int,
+    strategy: str,
+    cost_cache: dict[bytes, HybridCost] | None,
+    started: float,
+) -> _Candidate | None:
+    """Build one allocation through the canonical PlaceMoE optimizer."""
+
+    communication_blind = bool(args.communication_blind_proposals)
+    statistics = ProfileStatistics(
+        demand=demand_by_source,
+        affinity=np.zeros_like(affinity_by_source) if communication_blind else affinity_by_source,
+    )
+    node_omega, rank_omega, gamma = _partition_coefficients(args)
+    if communication_blind:
+        node_omega = 0.0
+        rank_omega = 0.0
+    topology = PlaceMoETopology(
+        ep_size=args.ep_size,
+        ranks_per_node=args.ranks_per_node,
+        num_experts=args.num_experts,
+        slots_per_rank=args.slots_per_rank,
+    )
+    evaluated: dict[bytes, HybridCost] = {}
+
+    def evaluate(plan) -> float:
+        key = plan.source_logical_to_physical.tobytes()
+        cost = None if cost_cache is None else cost_cache.get(key)
+        if cost is None:
+            cost = evaluator.evaluate(samples, plan.source_logical_to_physical)
+            if cost_cache is not None:
+                cost_cache[key] = cost
+        evaluated[key] = cost
+        return cost.compute_ms if communication_blind else cost.total_ms
+
+    try:
+        result = optimize_replica_allocation(
+            statistics,
+            logical_instances,
+            OptimizerConfig(
+                topology=topology,
+                primary_slots_per_rank=args.primary_slots_per_rank,
+                node_omega=node_omega,
+                rank_omega=rank_omega,
+                gamma=gamma,
+                rounds=args.alternations,
+                node_exchange_limit=args.partition_iterations,
+                rank_exchange_limit=max(1, args.partition_iterations // 2),
+                mapping_sweep_limit=args.lut_iterations,
+                prefer_node_local=not communication_blind,
+                seed=seed,
+            ),
+            evaluate,
+        )
+    except RuntimeError:
+        return None
+    best = result.best
+    plan = best.plan
+    cost = evaluated[plan.source_logical_to_physical.tobytes()]
+    return _Candidate(
+        strategy=strategy,
+        layout=plan.slot_to_logical.copy(),
+        owners=plan.owner_slots.copy(),
+        lut=plan.source_logical_to_physical.copy(),
+        lut_instances=best.instance_mapping.copy(),
+        logical_instances=best.logical_instances.copy(),
+        instance_ranks=best.instance_ranks.copy(),
+        optimize_cost=cost,
+        planner_ms=(time.perf_counter() - started) * 1000.0,
+        alternations=best.round_index + 1,
+    )
+
+
 def _build_candidate(
     samples: list[list[torch.Tensor]],
     *,
@@ -1130,16 +1212,22 @@ def _build_candidate(
     cost_cache: dict[bytes, HybridCost] | None = None,
 ) -> _Candidate | None:
     started = time.perf_counter()
-    communication_blind = bool(args.communication_blind_proposals)
     if fixed_instance_nodes is None:
-        if initial_instance_statistics is None:
-            instance_demand, instance_affinity = _uniform_instance_statistics(
-                logical_instances,
-                demand_by_source,
-                affinity_by_source,
-            )
-        else:
-            instance_demand, instance_affinity = initial_instance_statistics
+        return _build_placemoe_candidate(
+            samples,
+            logical_instances=logical_instances,
+            demand_by_source=demand_by_source,
+            affinity_by_source=affinity_by_source,
+            evaluator=evaluator,
+            args=args,
+            seed=seed,
+            strategy=strategy,
+            cost_cache=cost_cache,
+            started=started,
+        )
+    communication_blind = bool(args.communication_blind_proposals)
+    if initial_instance_statistics is not None:
+        instance_demand, instance_affinity = initial_instance_statistics
     else:
         if fixed_initial_lut is None:
             node_lut, _ = _node_proxy_lut(
@@ -1163,29 +1251,14 @@ def _build_candidate(
         node_omega = 0.0
         rank_omega = 0.0
     for alternation in range(args.alternations):
-        if fixed_instance_nodes is None:
-            instance_ranks = _classify_instances(
-                instance_demand,
-                instance_affinity,
-                logical_instances,
-                ep_size=args.ep_size,
-                ranks_per_node=args.ranks_per_node,
-                slots_per_rank=args.slots_per_rank,
-                seed=seed + 1009 * alternation,
-                iterations=args.partition_iterations,
-                node_omega=node_omega,
-                rank_omega=rank_omega,
-                gamma=gamma,
-            )
-        else:
-            instance_ranks = _greedy_ranks_with_fixed_nodes(
-                fixed_instance_nodes,
-                instance_demand,
-                instance_affinity,
-                ranks_per_node=args.ranks_per_node,
-                slots_per_rank=args.slots_per_rank,
-                logical_instances=logical_instances,
-            )
+        instance_ranks = _greedy_ranks_with_fixed_nodes(
+            fixed_instance_nodes,
+            instance_demand,
+            instance_affinity,
+            ranks_per_node=args.ranks_per_node,
+            slots_per_rank=args.slots_per_rank,
+            logical_instances=logical_instances,
+        )
         if fixed_initial_lut is None:
             initial_lut = _initial_lut_instances(
                 logical_instances,

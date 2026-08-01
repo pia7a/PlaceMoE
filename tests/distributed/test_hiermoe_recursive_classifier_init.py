@@ -6,8 +6,9 @@ import numpy as np
 import pytest
 import torch
 
-from scripts.profile.build_hiermoe_hierarchical_init_layout import _load_routes, _route_statistics
+from scripts.profile.build_hiermoe_hierarchical_init_layout import HybridCost, _load_routes, _route_statistics
 from scripts.profile.build_hiermoe_recursive_classifier_layout import (
+    _build_candidate,
     _classify_instances,
     _group_route_statistics,
     _initial_lut_instances,
@@ -24,6 +25,7 @@ from scripts.profile.build_hiermoe_recursive_classifier_layout import (
     _uniform_instance_statistics,
     _validate_configuration,
 )
+from veomni.distributed.moe.hiermoe.placemoe import LayerPlan, PlaceMoETopology
 
 
 def test_compute_only_initial_lut_does_not_prefer_source_locality() -> None:
@@ -48,6 +50,57 @@ def test_compute_only_initial_lut_does_not_prefer_source_locality() -> None:
 
     assert int(local[1, 0]) == 0
     assert int(compute_only[1, 0]) == 1
+
+
+def test_generic_builder_uses_canonical_placemoe_optimizer() -> None:
+    class Evaluator:
+        def evaluate(self, _samples, lut):
+            peak = float(np.bincount(lut.reshape(-1) // 2, minlength=4).max())
+            return HybridCost(0.0, peak, peak, 0, 0, 0.0, 0.0, peak)
+
+    args = Namespace(
+        communication_blind_proposals=False,
+        hidden_size=8,
+        bytes_per_element=2,
+        communication_phase_multiplier=1.0,
+        inter_ms_per_byte=0.1,
+        intra_ms_per_byte=0.01,
+        compute_phase_multiplier=1.0,
+        compute_ms_per_assignment=0.1,
+        ep_size=4,
+        ranks_per_node=2,
+        num_experts=4,
+        slots_per_rank=2,
+        primary_slots_per_rank=1,
+        alternations=2,
+        partition_iterations=4,
+        lut_iterations=2,
+    )
+    logical_instances = np.array([0, 1, 2, 3, 0, 1, 2, 3])
+    demand = np.array(
+        [
+            [5, 4, 1, 1],
+            [4, 5, 1, 1],
+            [1, 1, 5, 4],
+            [1, 1, 4, 5],
+        ],
+        dtype=np.float64,
+    )
+    affinity = np.zeros((4, 4, 4), dtype=np.float64)
+    candidate = _build_candidate(
+        [],
+        logical_instances=logical_instances,
+        demand_by_source=demand,
+        affinity_by_source=affinity,
+        evaluator=Evaluator(),
+        args=args,
+        seed=13,
+        strategy="placemoe_test",
+    )
+    assert candidate is not None
+    plan = LayerPlan(candidate.layout, candidate.lut, candidate.owners)
+    plan.validate(PlaceMoETopology(4, 2, 4, 2), additional_copies=4)
+    assert candidate.alternations in (1, 2)
 
 
 def test_load_routes_accepts_one_all_rank_bundle(tmp_path) -> None:
