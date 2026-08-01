@@ -42,6 +42,13 @@ from scripts.profile.build_hiermoe_hierarchical_init_layout import (
     _mirrored_r2,
     _replay_payload,
 )
+from veomni.distributed.moe.hiermoe.placemoe import (
+    ProfileStatistics,
+    build_replica_allocations,
+    profile_route_statistics,
+    project_statistics_to_copies,
+    uniform_copy_statistics,
+)
 
 
 @dataclass(frozen=True)
@@ -236,9 +243,7 @@ def _is_e2e_eligible(
     comparison_validation_ms: float,
 ) -> bool:
     return bool(
-        layer_start == 0
-        and layers == expected_total_layers
-        and validation_total_ms <= comparison_validation_ms
+        layer_start == 0 and layers == expected_total_layers and validation_total_ms <= comparison_validation_ms
     )
 
 
@@ -247,26 +252,8 @@ def _source_statistics(
     *,
     num_experts: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    ep_size = len(samples[0])
-    demand = np.zeros((ep_size, num_experts), dtype=np.float64)
-    affinity = np.zeros((ep_size, num_experts, num_experts), dtype=np.float64)
-    for sample in samples:
-        for source_rank, route in enumerate(sample):
-            flat = route.reshape(-1)
-            demand[source_rank] += torch.bincount(flat, minlength=num_experts).numpy()
-            top_k = int(route.shape[1])
-            for lhs in range(top_k):
-                for rhs in range(lhs + 1, top_k):
-                    pair = route[:, lhs] * num_experts + route[:, rhs]
-                    counts = torch.bincount(
-                        pair,
-                        minlength=num_experts * num_experts,
-                    ).reshape(num_experts, num_experts)
-                    values = counts.numpy().astype(np.float64, copy=False)
-                    affinity[source_rank] += values + values.T
-    for matrix in affinity:
-        np.fill_diagonal(matrix, 0.0)
-    return demand, affinity
+    statistics = profile_route_statistics(samples, num_experts=num_experts)
+    return statistics.demand.copy(), statistics.affinity.copy()
 
 
 def _logical_base_partitions(
@@ -356,30 +343,6 @@ def _replica_sets_from_partition(
     ]
 
 
-def _top_fixed_cardinality_combinations(
-    scores: np.ndarray,
-    *,
-    selected: int,
-    limit: int,
-) -> list[tuple[int, ...]]:
-    """Return the highest additive-score fixed-size subsets without exhaustive enumeration."""
-
-    groups = int(len(scores))
-    if not 0 <= selected <= groups:
-        raise ValueError("Selected group count is outside the available group range.")
-    states: list[list[tuple[float, tuple[int, ...]]]] = [[] for _ in range(selected + 1)]
-    states[0] = [(0.0, ())]
-    for group, score in enumerate(scores.tolist()):
-        upper = min(selected, group + 1)
-        for count in range(upper, 0, -1):
-            proposals = states[count] + [
-                (value + float(score), indices + (group,)) for value, indices in states[count - 1]
-            ]
-            proposals.sort(key=lambda row: (-row[0], row[1]))
-            states[count] = proposals[:limit]
-    return [indices for _, indices in states[selected]]
-
-
 def _replica_allocations(
     affinity: np.ndarray,
     demand: np.ndarray,
@@ -410,10 +373,14 @@ def _replica_allocations(
     if candidate_limit <= 0:
         raise ValueError("Replica candidate limit must be positive.")
 
-    full_rounds, residual = divmod(int(replicas), num_experts)
-    full = np.tile(np.arange(num_experts, dtype=np.int64), full_rounds)
+    _, residual = divmod(int(replicas), num_experts)
     if residual == 0:
-        return [full]
+        return build_replica_allocations(
+            [],
+            demand,
+            additional_copies=replicas,
+            candidate_limit=candidate_limit,
+        )
 
     group_size = int(np.gcd(num_experts, residual))
     num_groups = num_experts // group_size
@@ -429,28 +396,12 @@ def _replica_allocations(
             seed=seed,
         )
     )
-    rows: list[tuple[float, bytes, np.ndarray]] = []
-    seen: set[bytes] = set()
-    for partition in partitions:
-        groups = [np.flatnonzero(partition == value) for value in range(num_groups)]
-        group_scores = np.asarray([demand[group].sum() for group in groups], dtype=np.float64)
-        for combination in _top_fixed_cardinality_combinations(
-            group_scores,
-            selected=residual // group_size,
-            limit=candidate_limit,
-        ):
-            residual_experts = np.sort(np.concatenate([groups[index] for index in combination]))
-            allocation = np.concatenate([full, residual_experts]).astype(np.int64, copy=False)
-            key = allocation.tobytes()
-            if key in seen:
-                continue
-            seen.add(key)
-            # Demand is only a shortlist proxy. Every retained allocation is
-            # still placed, routed, and selected by the exact hybrid evaluator.
-            proxy = float(demand[residual_experts].sum())
-            rows.append((-proxy, key, allocation))
-    rows.sort(key=lambda row: (row[0], row[1]))
-    return [row[2] for row in rows[:candidate_limit]]
+    return build_replica_allocations(
+        partitions,
+        demand,
+        additional_copies=replicas,
+        candidate_limit=candidate_limit,
+    )
 
 
 def _logical_instances(
@@ -755,63 +706,20 @@ def _uniform_instance_statistics(
     demand_by_source: np.ndarray,
     affinity_by_source: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    instances = len(logical_instances)
-    num_experts = int(demand_by_source.shape[1])
-    active = logical_instances >= 0
-    copies = np.bincount(logical_instances[active], minlength=num_experts).astype(np.float64)
-    if bool((copies <= 0).any()):
-        raise ValueError("Every logical expert must retain at least one physical instance.")
-    instance_demand = np.zeros((demand_by_source.shape[0], instances), dtype=np.float64)
-    active_experts = logical_instances[active]
-    instance_demand[:, active] = demand_by_source[:, active_experts] / copies[active_experts][None, :]
-    instance_affinity = np.zeros(
-        (demand_by_source.shape[0], instances, instances),
-        dtype=np.float64,
+    return uniform_copy_statistics(
+        ProfileStatistics(demand=demand_by_source, affinity=affinity_by_source),
+        logical_instances,
     )
-    for lhs in range(instances):
-        logical_lhs = int(logical_instances[lhs])
-        if logical_lhs < 0:
-            continue
-        for rhs in range(lhs + 1, instances):
-            logical_rhs = int(logical_instances[rhs])
-            if logical_rhs < 0 or logical_lhs == logical_rhs:
-                continue
-            values = affinity_by_source[:, logical_lhs, logical_rhs] / (copies[logical_lhs] * copies[logical_rhs])
-            instance_affinity[:, lhs, rhs] = values
-            instance_affinity[:, rhs, lhs] = values
-    return instance_demand, instance_affinity
 
 
 def _mapped_instance_statistics(
     samples: list[list[torch.Tensor]],
     lut_instances: np.ndarray,
     *,
-    instances: int,
+    logical_instances: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    ep_size = len(samples[0])
-    instance_demand = np.zeros((ep_size, instances), dtype=np.float64)
-    instance_affinity = np.zeros((ep_size, instances, instances), dtype=np.float64)
-    lut = torch.from_numpy(lut_instances).to(torch.long)
-    for sample in samples:
-        for source_rank, logical in enumerate(sample):
-            mapped = lut[source_rank].index_select(0, logical.reshape(-1)).view_as(logical)
-            instance_demand[source_rank] += torch.bincount(
-                mapped.reshape(-1),
-                minlength=instances,
-            ).numpy()
-            top_k = int(mapped.shape[1])
-            for lhs in range(top_k):
-                for rhs in range(lhs + 1, top_k):
-                    pair = mapped[:, lhs] * instances + mapped[:, rhs]
-                    counts = torch.bincount(
-                        pair,
-                        minlength=instances * instances,
-                    ).reshape(instances, instances)
-                    values = counts.numpy().astype(np.float64, copy=False)
-                    instance_affinity[source_rank] += values + values.T
-    for matrix in instance_affinity:
-        np.fill_diagonal(matrix, 0.0)
-    return instance_demand, instance_affinity
+    statistics = profile_route_statistics(samples, num_experts=lut_instances.shape[1])
+    return project_statistics_to_copies(statistics, logical_instances, lut_instances)
 
 
 def _partition_proxy_cost(
@@ -1620,7 +1528,7 @@ def _build_candidate(
         instance_demand, instance_affinity = _mapped_instance_statistics(
             samples,
             node_lut,
-            instances=len(logical_instances),
+            logical_instances=logical_instances,
         )
     best: _Candidate | None = None
     load_weights = (8.0, 32.0, 128.0)
@@ -1712,7 +1620,7 @@ def _build_candidate(
         instance_demand, instance_affinity = _mapped_instance_statistics(
             samples,
             best.lut_instances,
-            instances=len(logical_instances),
+            logical_instances=logical_instances,
         )
         if communication_blind:
             instance_affinity.fill(0.0)
@@ -2011,9 +1919,7 @@ def _plan_layer(
     comparison_validation_cost: HybridCost | None = None
     if args.comparison_layout == "mirrored-r2":
         if args.ep_size % 2 or args.ep_size * args.slots_per_rank != 2 * args.num_experts:
-            raise ValueError(
-                "mirrored-r2 comparison requires an even EP size and exactly two full expert copies."
-            )
+            raise ValueError("mirrored-r2 comparison requires an even EP size and exactly two full expert copies.")
         _r2_layout, _r2_owners, r2_lut = _mirrored_r2(
             ep_size=args.ep_size,
             num_experts=args.num_experts,

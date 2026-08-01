@@ -429,7 +429,7 @@ def _refine_layer(
             statistics_cache[statistics_key] = _mapped_instance_statistics(
                 optimize_samples,
                 incumbent.lut_instances,
-                instances=len(incumbent.logical_instances),
+                logical_instances=incumbent.logical_instances,
             )
         instance_demand, instance_affinity = statistics_cache[statistics_key]
         statistics_ms = (time.perf_counter() - statistics_started) * 1000.0
