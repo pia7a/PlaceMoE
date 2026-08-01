@@ -121,6 +121,9 @@ PlaceMoE extraction.
 
 ## Minimal completion evidence
 
+The completed CPU, offline, EP64 static A/B, and EP64 hot-update results are
+recorded in `docs/perf/placemoe_refactor_validation.md`.
+
 The refactor is complete only when all of the following hold:
 
 - the canonical API validates replica budget, slot capacity, `L`, and `M`;
