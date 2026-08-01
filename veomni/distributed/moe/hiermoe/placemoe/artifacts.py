@@ -44,10 +44,10 @@ def build_placemoe_artifact(
     payload: dict[str, Any] = {
         "schema_version": PLACEMOE_ARTIFACT_SCHEMA_VERSION,
         "source": {
+            **dict(source or {}),
             "algorithm": "placemoe-v1",
             "initial_layout": "preloaded",
             "requires_static_preload": True,
-            **dict(source or {}),
         },
         "topology": {
             "ep_size": topology.ep_size,
@@ -68,6 +68,9 @@ def validate_placemoe_artifact(payload: Mapping[str, Any]) -> dict[str, LayerPla
 
     if int(payload.get("schema_version", -1)) != PLACEMOE_ARTIFACT_SCHEMA_VERSION:
         raise ValueError("Unsupported PlaceMoE artifact schema version.")
+    source_row = payload.get("source")
+    if not isinstance(source_row, Mapping) or source_row.get("algorithm") != "placemoe-v1":
+        raise ValueError("Artifact was not produced by the PlaceMoE optimizer.")
     topology_row = payload.get("topology")
     if not isinstance(topology_row, Mapping):
         raise ValueError("PlaceMoE artifact is missing its topology.")

@@ -69,3 +69,20 @@ def test_periodic_full_replan_rejects_legacy_artifact(tmp_path):
 
     with pytest.raises(RuntimeError, match="invalid PlaceMoE artifact"):
         _runtime_manager()._broadcast_periodic_full_replan_payload(state, torch.device("cpu"))
+
+
+def test_periodic_full_replan_rejects_non_placemoe_schema_v2_artifact(tmp_path):
+    topology = PlaceMoETopology(ep_size=1, ranks_per_node=1, num_experts=2, slots_per_rank=3)
+    plan = LayerPlan(
+        slot_to_logical=[0, 1, 0],
+        owner_slots=[0, 1],
+        source_logical_to_physical=[[2, 1]],
+    )
+    payload = build_placemoe_artifact({"layers.0.experts": plan}, topology)
+    payload["source"]["algorithm"] = "legacy-structured"
+    layout_path = tmp_path / "layout.json"
+    layout_path.write_text(json.dumps(payload), encoding="utf-8")
+    state = SimpleNamespace(layout_path=str(layout_path))
+
+    with pytest.raises(RuntimeError, match="invalid PlaceMoE artifact"):
+        _runtime_manager()._broadcast_periodic_full_replan_payload(state, torch.device("cpu"))
