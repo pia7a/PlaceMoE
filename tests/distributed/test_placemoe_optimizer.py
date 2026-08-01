@@ -18,11 +18,15 @@ import torch
 
 from veomni.distributed.moe.hiermoe.placemoe import (
     LayerPlan,
+    MappingConfig,
     PartitionConfig,
     PlaceMoETopology,
+    ProfileStatistics,
     bounded_group_shortlist,
     build_replica_allocations,
+    initialize_mapping,
     map_groups_to_locations,
+    optimize_mapping,
     partition_items,
     partition_objective,
     profile_route_statistics,
@@ -195,3 +199,54 @@ def test_locality_matching_maps_abstract_groups_to_source_demand():
         sources_by_location=(np.array([0, 1]), np.array([2, 3])),
     )
     np.testing.assert_array_equal(locations, [1, 1, 0, 0])
+
+
+def test_mapping_initialization_prefers_local_copies_and_balances_rank_loads():
+    statistics = ProfileStatistics(
+        demand=np.array([[5, 1], [1, 5]], dtype=np.float64),
+        affinity=np.zeros((2, 2, 2), dtype=np.float64),
+    )
+    logical_instances = np.array([0, 1, 0, 1])
+    instance_ranks = np.array([0, 0, 1, 1])
+    mapping = initialize_mapping(
+        logical_instances,
+        instance_ranks,
+        statistics,
+        ranks_per_node=1,
+    )
+    np.testing.assert_array_equal(mapping, [[0, 1], [2, 3]])
+
+
+def test_calibrated_mapping_score_balances_affinity_reuse_and_compute_load():
+    affinity = np.zeros((2, 2, 2), dtype=np.float64)
+    affinity[0, 0, 1] = affinity[0, 1, 0] = 30
+    statistics = ProfileStatistics(
+        demand=np.array([[10, 1], [0, 10]], dtype=np.float64),
+        affinity=affinity,
+    )
+    logical_instances = np.array([0, 0, 1])
+    instance_ranks = np.array([0, 1, 1])
+    initial = initialize_mapping(
+        logical_instances,
+        instance_ranks,
+        statistics,
+        ranks_per_node=1,
+    )
+    communication_only = optimize_mapping(
+        logical_instances,
+        instance_ranks,
+        initial,
+        statistics,
+        MappingConfig(ranks_per_node=1, node_omega=1.0, rank_omega=0.0, gamma=0.0),
+    )
+    compute_aware = optimize_mapping(
+        logical_instances,
+        instance_ranks,
+        initial,
+        statistics,
+        MappingConfig(ranks_per_node=1, node_omega=1.0, rank_omega=0.0, gamma=3.0),
+    )
+    assert communication_only.mapping[0, 0] == 1
+    assert compute_aware.mapping[0, 0] == 0
+    assert communication_only.peak_rank_load == 21
+    assert compute_aware.peak_rank_load == 11
