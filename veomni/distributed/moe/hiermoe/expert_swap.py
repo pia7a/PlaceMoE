@@ -578,6 +578,16 @@ class ExpertLayerState:
         return cached
 
 
+def _encode_periodic_full_replan_layer_keys(layers: Sequence[ExpertLayerState]) -> str:
+    """Encode captured runtime layer keys without changing their order."""
+    keys = tuple(str(layer.key) for layer in layers)
+    if not keys or any(not key for key in keys):
+        raise ValueError("Periodic full replanning requires nonempty runtime layer keys.")
+    if len(set(keys)) != len(keys):
+        raise ValueError("Periodic full replanning requires unique runtime layer keys.")
+    return ",".join(keys)
+
+
 @dataclass(frozen=True)
 class _SwapTensorEntry:
     tensor: torch.Tensor
@@ -10638,6 +10648,8 @@ class ExpertSwapManager:
                 "0",
                 "--layers",
                 str(len(layers)),
+                "--layer-keys",
+                _encode_periodic_full_replan_layer_keys(layers),
                 "--expected-total-layers",
                 str(len(layers)),
                 "--workers",

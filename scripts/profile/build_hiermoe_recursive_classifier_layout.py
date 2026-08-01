@@ -96,6 +96,13 @@ def _parse_int_list(value: str) -> tuple[int, ...]:
     return values
 
 
+def _parse_str_list(value: str) -> tuple[str, ...]:
+    values = tuple(item.strip() for item in value.split(",") if item.strip())
+    if not values:
+        raise argparse.ArgumentTypeError("Expected at least one string.")
+    return values
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--route-root", type=Path, required=True)
@@ -106,6 +113,16 @@ def _parse_args() -> argparse.Namespace:
         "--layer-name-template",
         default="model.language_model.layers.{layer}.mlp.experts",
         help="Python format template for the runtime expert-module key.",
+    )
+    parser.add_argument(
+        "--layer-keys",
+        type=_parse_str_list,
+        default=(),
+        help=(
+            "Comma-separated runtime expert-module keys in captured layer order. "
+            "This overrides --layer-name-template and is required when hot replanning "
+            "a model whose layer names are not represented by the default template."
+        ),
     )
     parser.add_argument("--layers", type=int, default=48)
     parser.add_argument(
@@ -1389,7 +1406,7 @@ def _preloaded_replay_payload(
     plans: dict[str, LayerPlan] = {}
     for offset, (layout, owner, lut) in enumerate(zip(layouts, owners, luts, strict=True)):
         layer = args.layer_start + offset
-        name = args.layer_name_template.format(layer=layer)
+        name = args.layer_keys[offset] if args.layer_keys else args.layer_name_template.format(layer=layer)
         plans[name] = LayerPlan(
             slot_to_logical=layout,
             owner_slots=owner,
@@ -1409,6 +1426,7 @@ def _preloaded_replay_payload(
             "optimize_steps": list(args.optimize_steps),
             "validation_steps": list(args.validation_steps),
             "layer_name_template": args.layer_name_template,
+            "layer_keys": list(args.layer_keys),
         },
     )
 
@@ -1674,7 +1692,11 @@ def _plan_layer(
 
 def main() -> None:
     args = _parse_args()
-    if "{layer}" not in args.layer_name_template:
+    if args.layer_keys and len(args.layer_keys) != args.layers:
+        raise ValueError(f"--layer-keys contains {len(args.layer_keys)} keys, expected {args.layers}.")
+    if len(set(args.layer_keys)) != len(args.layer_keys):
+        raise ValueError("--layer-keys must contain unique runtime module keys.")
+    if not args.layer_keys and "{layer}" not in args.layer_name_template:
         raise ValueError("--layer-name-template must contain the '{layer}' placeholder.")
     capacity = _validate_configuration(args)
     if args.workers <= 0 or args.candidate_workers <= 0 or args.worker_threads <= 0:

@@ -16,6 +16,7 @@ from scripts.profile.build_hiermoe_recursive_classifier_layout import (
     _logical_instances,
     _materialize_layout,
     _partition_proxy_cost,
+    _preloaded_replay_payload,
     _rank_assignment_is_device_unique,
     _refine_balanced_partition,
     _replica_allocations,
@@ -123,6 +124,35 @@ def test_load_routes_accepts_one_all_rank_bundle(tmp_path) -> None:
 
     assert len(samples) == 1
     assert all(torch.equal(actual, wanted.to(torch.long)) for actual, wanted in zip(samples[0], expected, strict=True))
+
+
+def test_preloaded_payload_preserves_explicit_runtime_layer_keys(tmp_path) -> None:
+    keys = ("model.layers.2.mlp.experts", "model.layers.10.mlp.experts")
+    args = Namespace(
+        layer_start=0,
+        layer_name_template="unused.{layer}",
+        layer_keys=keys,
+        ep_size=1,
+        ranks_per_node=1,
+        num_experts=2,
+        slots_per_rank=2,
+        route_root=tmp_path,
+        optimize_steps=(0,),
+        validation_steps=(0,),
+    )
+    layouts = [np.array([0, 1]), np.array([1, 0])]
+    owners = [np.array([0, 1]), np.array([1, 0])]
+    luts = [np.array([[0, 1]]), np.array([[1, 0]])]
+
+    payload = _preloaded_replay_payload(
+        layouts=layouts,
+        owners=owners,
+        luts=luts,
+        args=args,
+        algorithm="placemoe-v1",
+    )
+
+    assert tuple(payload["layers"]) == keys
 
 
 @pytest.mark.parametrize("total_layers", [40, 48])

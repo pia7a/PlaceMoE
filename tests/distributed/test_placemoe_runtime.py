@@ -21,7 +21,10 @@ import pytest
 import torch
 
 from veomni.distributed.moe.hiermoe import expert_swap as expert_swap_module
-from veomni.distributed.moe.hiermoe.expert_swap import ExpertSwapManager
+from veomni.distributed.moe.hiermoe.expert_swap import (
+    ExpertSwapManager,
+    _encode_periodic_full_replan_layer_keys,
+)
 from veomni.distributed.moe.hiermoe.placemoe import (
     LayerPlan,
     PlaceMoETopology,
@@ -43,6 +46,17 @@ def test_periodic_full_replan_uses_canonical_placemoe_cli(monkeypatch):
     path = _runtime_manager()._periodic_full_replan_builder_path()
 
     assert path.endswith("/scripts/profile/plan_placemoe.py")
+
+
+def test_periodic_full_replan_passes_runtime_layer_keys() -> None:
+    layers = [
+        SimpleNamespace(key="model.layers.2.mlp.experts"),
+        SimpleNamespace(key="model.layers.10.mlp.experts"),
+    ]
+
+    encoded = _encode_periodic_full_replan_layer_keys(layers)
+
+    assert encoded == "model.layers.2.mlp.experts,model.layers.10.mlp.experts"
 
 
 def test_periodic_full_replan_validates_canonical_artifact(tmp_path):
