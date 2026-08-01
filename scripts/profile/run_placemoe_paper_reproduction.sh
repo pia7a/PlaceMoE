@@ -161,7 +161,8 @@ case_env() {
     "PAPER32_LIGHTWEIGHT_TIMING=${lightweight_timing}" \
     "PAPER32_SKIP_COMPLETED=1" \
     "PAPER32_SKIP_PAPER_SUMMARY=0" \
-    "PAPER32_CONVERGENCE_METRICS=0"
+    "PAPER32_CONVERGENCE_METRICS=0" \
+    "HIERMOE_REMOTE_SINGLE_SSH=1"
   if [[ -n "${compute_calibration}" ]]; then
     printf '%s\n' "PAPER32_COMPUTE_CALIBRATION_ARTIFACT=${compute_calibration}"
   fi
