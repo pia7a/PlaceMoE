@@ -473,6 +473,7 @@ def _refine_layer(
                         slots_per_rank=args.slots_per_rank,
                         primary_slots_per_rank=args.primary_slots_per_rank,
                         num_experts=args.num_experts,
+                        ranks_per_node=args.ranks_per_node,
                     )
                 except RuntimeError:
                     continue

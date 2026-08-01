@@ -45,10 +45,12 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     MappingConfig,
     PartitionConfig,
     PlacementConfig,
+    PlaceMoETopology,
     ProfileStatistics,
     build_replica_allocations,
     initialize_mapping,
     map_groups_to_locations,
+    materialize_plan,
     optimize_mapping,
     partition_items,
     place_instances,
@@ -1090,68 +1092,26 @@ def _materialize_layout(
     slots_per_rank: int,
     primary_slots_per_rank: int,
     num_experts: int,
+    ranks_per_node: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    owner_columns = np.repeat(np.arange(ep_size, dtype=np.int64), primary_slots_per_rank)
-    owner_cost = np.full((num_experts, len(owner_columns)), 1e30, dtype=np.float64)
-    served = np.zeros((len(logical_instances),), dtype=np.float64)
-    for source_rank in range(ep_size):
-        for expert in range(num_experts):
-            served[int(lut_instances[source_rank, expert])] += demand_by_source[source_rank, expert]
-    for expert in range(num_experts):
-        instances = np.flatnonzero(logical_instances == expert)
-        for column, rank in enumerate(owner_columns.tolist()):
-            eligible = instances[instance_ranks[instances] == rank]
-            if len(eligible):
-                owner_cost[expert, column] = -float(served[eligible].max())
-    experts, columns = linear_sum_assignment(owner_cost)
-    owner_instance = np.full((num_experts,), -1, dtype=np.int64)
-    if len(experts) == num_experts and not bool((owner_cost[experts, columns] >= 1e29).any()):
-        owner_rank = np.full((num_experts,), -1, dtype=np.int64)
-        owner_rank[experts] = owner_columns[columns]
-        for expert in range(num_experts):
-            instances = np.flatnonzero((logical_instances == expert) & (instance_ranks == owner_rank[expert]))
-            owner_instance[expert] = int(instances[np.argmax(served[instances])])
-    else:
-        # Canonical ownership is a gradient/checkpoint identity, not a
-        # placement capacity. Fall back to the most-served copy when an
-        # arbitrary active/empty budget makes balanced owners infeasible.
-        for expert in range(num_experts):
-            instances = np.flatnonzero(logical_instances == expert)
-            owner_instance[expert] = int(instances[np.argmax(served[instances])])
-
-    layout = np.full((ep_size * slots_per_rank,), -1, dtype=np.int64)
-    owners = np.full((num_experts,), -1, dtype=np.int64)
-    instance_to_slot = np.full((len(logical_instances),), -1, dtype=np.int64)
-    owner_set = {int(instance) for instance in owner_instance.tolist()}
-    for rank in range(ep_size):
-        owner_instances = sorted(
-            np.flatnonzero(
-                (instance_ranks == rank) & np.isin(np.arange(len(logical_instances)), owner_instance)
-            ).tolist(),
-            key=lambda instance: int(logical_instances[instance]),
-        )
-        remaining = sorted(
-            [int(instance) for instance in np.flatnonzero(instance_ranks == rank) if int(instance) not in owner_set],
-            key=lambda instance: (int(logical_instances[instance]), instance),
-        )
-        ordered = owner_instances + remaining
-        if len(ordered) != slots_per_rank:
-            raise RuntimeError(f"Rank {rank} received {len(ordered)} physical instances.")
-        for local_slot, instance in enumerate(ordered):
-            slot = rank * slots_per_rank + local_slot
-            expert = int(logical_instances[instance])
-            instance_to_slot[instance] = slot
-            if expert < 0:
-                continue
-            layout[slot] = expert
-            if instance in owner_set:
-                owners[expert] = slot
-    if bool((owners < 0).any()) or bool((instance_to_slot < 0).any()):
-        raise RuntimeError("Layout materialization lost an owner or physical instance.")
-    lut = instance_to_slot[lut_instances]
-    if not bool((layout[lut] == np.arange(num_experts, dtype=np.int64)[None, :]).all()):
-        raise RuntimeError("Materialized source LUT does not reference the requested expert.")
-    return layout, owners, lut
+    plan = materialize_plan(
+        logical_instances,
+        instance_ranks,
+        lut_instances,
+        demand_by_source,
+        PlaceMoETopology(
+            ep_size=ep_size,
+            ranks_per_node=ranks_per_node,
+            num_experts=num_experts,
+            slots_per_rank=slots_per_rank,
+        ),
+        primary_slots_per_rank=primary_slots_per_rank,
+    )
+    return (
+        plan.slot_to_logical.copy(),
+        plan.owner_slots.copy(),
+        plan.source_logical_to_physical.copy(),
+    )
 
 
 def _build_candidate(
@@ -1263,6 +1223,7 @@ def _build_candidate(
                     slots_per_rank=args.slots_per_rank,
                     primary_slots_per_rank=args.primary_slots_per_rank,
                     num_experts=args.num_experts,
+                    ranks_per_node=args.ranks_per_node,
                 )
             except RuntimeError:
                 continue

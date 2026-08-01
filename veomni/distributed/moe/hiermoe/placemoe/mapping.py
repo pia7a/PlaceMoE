@@ -81,17 +81,19 @@ def _validate_layout(
 def validate_instance_mapping(
     mapping: np.ndarray,
     logical_instances: np.ndarray,
-    statistics: ProfileStatistics,
+    *,
+    ep_size: int,
+    num_experts: int,
 ) -> np.ndarray:
     """Validate and return a mutable source-to-instance mapping copy."""
 
     mapping = np.asarray(mapping, dtype=np.int64).copy()
     logical_instances = np.asarray(logical_instances, dtype=np.int64)
-    if mapping.shape != (statistics.ep_size, statistics.num_experts):
+    if mapping.shape != (ep_size, num_experts):
         raise ValueError("Mapping must have shape [source_rank, logical_expert].")
     if bool((mapping < 0).any()) or bool((mapping >= len(logical_instances)).any()):
         raise ValueError("Mapping references an instance outside the layout.")
-    expected = np.broadcast_to(np.arange(statistics.num_experts, dtype=np.int64), mapping.shape)
+    expected = np.broadcast_to(np.arange(num_experts, dtype=np.int64), mapping.shape)
     if not np.array_equal(logical_instances[mapping], expected):
         raise ValueError("Mapping references a copy of the wrong logical expert.")
     return mapping
@@ -194,7 +196,12 @@ def optimize_mapping(
     )
     if statistics.ep_size % config.ranks_per_node:
         raise ValueError("Profile EP size must be divisible by ranks_per_node.")
-    mapping = validate_instance_mapping(initial_mapping, logical_instances, statistics)
+    mapping = validate_instance_mapping(
+        initial_mapping,
+        logical_instances,
+        ep_size=statistics.ep_size,
+        num_experts=statistics.num_experts,
+    )
     instance_nodes = instance_ranks // config.ranks_per_node
     num_nodes = statistics.ep_size // config.ranks_per_node
     node_cache = _group_affinity_cache(mapping, instance_nodes, statistics, num_groups=num_nodes)

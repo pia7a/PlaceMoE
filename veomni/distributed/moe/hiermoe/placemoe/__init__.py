@@ -23,6 +23,7 @@ from .mapping import (
     optimize_mapping,
     validate_instance_mapping,
 )
+from .materialize import materialize_plan
 from .partition import PartitionConfig, PartitionResult, map_groups_to_locations, partition_items, partition_objective
 from .placement import (
     PlacementConfig,
@@ -50,6 +51,7 @@ __all__ = [
     "build_replica_allocations",
     "initialize_mapping",
     "map_groups_to_locations",
+    "materialize_plan",
     "mapping_rank_loads",
     "optimize_mapping",
     "partition_items",

@@ -27,6 +27,7 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     build_replica_allocations,
     initialize_mapping,
     map_groups_to_locations,
+    materialize_plan,
     optimize_mapping,
     partition_items,
     partition_objective,
@@ -297,3 +298,27 @@ def test_hierarchical_placement_respects_rank_capacity_and_copy_uniqueness():
     for rank in range(4):
         members = logical_instances[result.instance_ranks == rank]
         assert len(members) == len(np.unique(members))
+
+
+def test_materialize_plan_rewrites_mapping_to_relocated_slots():
+    topology = PlaceMoETopology(ep_size=2, ranks_per_node=1, num_experts=4, slots_per_rank=3)
+    statistics = ProfileStatistics(
+        demand=np.array([[5, 4, 1, 1], [1, 1, 5, 4]], dtype=np.float64),
+        affinity=np.zeros((2, 4, 4), dtype=np.float64),
+    )
+    logical_instances = np.array([0, 1, 2, 3, 0, 3])
+    instance_ranks = np.array([1, 0, 0, 1, 0, 1])
+    instance_mapping = np.array([[4, 1, 2, 5], [0, 1, 2, 3]])
+    plan = materialize_plan(
+        logical_instances,
+        instance_ranks,
+        instance_mapping,
+        statistics.demand,
+        topology,
+        primary_slots_per_rank=2,
+    )
+    plan.validate(topology, additional_copies=2)
+    np.testing.assert_array_equal(
+        plan.slot_to_logical[plan.source_logical_to_physical],
+        np.broadcast_to(np.arange(4), (2, 4)),
+    )
