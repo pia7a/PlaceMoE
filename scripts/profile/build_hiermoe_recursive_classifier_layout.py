@@ -209,7 +209,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--include-legacy-structured-candidates",
         action="store_true",
-        help="Also evaluate the four-node structured-degree2 baseline candidates.",
+        help="Deprecated alias that keeps four-node structured-overlap proposals enabled.",
+    )
+    parser.add_argument(
+        "--disable-structured-overlap-candidates",
+        action="store_true",
+        help="Disable the four-node, two-copy structured-overlap proposal family.",
     )
     parser.add_argument(
         "--include-legacy-hyperedge-candidates",
@@ -1139,6 +1144,7 @@ def _build_placemoe_candidate(
     strategy: str,
     cost_cache: dict[bytes, HybridCost] | None,
     started: float,
+    calibrated_partition_refinement: bool = True,
 ) -> _Candidate | None:
     """Build one allocation through the canonical PlaceMoE optimizer."""
 
@@ -1185,6 +1191,12 @@ def _build_placemoe_candidate(
                 mapping_sweep_limit=args.lut_iterations,
                 prefer_node_local=not communication_blind,
                 seed=seed,
+                normalized_mapping_weights=(
+                    () if calibrated_partition_refinement else (8.0, 32.0, 128.0)
+                ),
+                calibrated_mapping_refinement=calibrated_partition_refinement,
+                carry_mapping_across_rounds=calibrated_partition_refinement,
+                calibrated_partition_refinement=calibrated_partition_refinement,
             ),
             evaluate,
         )
@@ -1221,6 +1233,7 @@ def _build_candidate(
     fixed_initial_lut: np.ndarray | None = None,
     initial_instance_statistics: tuple[np.ndarray, np.ndarray] | None = None,
     cost_cache: dict[bytes, HybridCost] | None = None,
+    calibrated_partition_refinement: bool = True,
 ) -> _Candidate | None:
     started = time.perf_counter()
     if fixed_instance_nodes is None:
@@ -1235,6 +1248,7 @@ def _build_candidate(
             strategy=strategy,
             cost_cache=cost_cache,
             started=started,
+            calibrated_partition_refinement=calibrated_partition_refinement,
         )
     communication_blind = bool(args.communication_blind_proposals)
     if initial_instance_statistics is not None:
@@ -1496,6 +1510,7 @@ def _plan_layer(
     candidates: list[_Candidate] = []
     candidate_jobs: list[dict[str, object]] = []
     seen_replica_sets: set[tuple[bytes, bytes]] = set()
+    seen_generic_allocations: set[bytes] = set()
     cost_cache: dict[bytes, HybridCost] = {}
     for partition_index, partition in enumerate(partitions):
         for combination_index, replica_experts in enumerate(replica_allocations):
@@ -1508,6 +1523,39 @@ def _plan_layer(
                 replica_experts,
                 total_slots=args.ep_size * args.slots_per_rank,
             )
+            allocation_key = logical_instances.tobytes()
+            if allocation_key not in seen_generic_allocations:
+                seen_generic_allocations.add(allocation_key)
+                # Keep the calibrated paper heuristic and the normalized
+                # compatibility heuristic as independent state machines. A
+                # shared alternation state can silently remove the historical
+                # low-A2A candidate even when both refinements are invoked.
+                for proposal_restart in range(args.partition_restarts):
+                    proposal_seed = (
+                        args.seed
+                        + 100_003 * layer
+                        + 997 * proposal_restart
+                        + 31 * combination_index
+                    )
+                    candidate_jobs.append(
+                        {
+                            "logical_instances": logical_instances,
+                            "demand_by_source": source_demand,
+                            "affinity_by_source": source_affinity,
+                            "seed": proposal_seed,
+                            "strategy": f"placemoe_p{proposal_restart}_c{combination_index}",
+                        }
+                    )
+                    candidate_jobs.append(
+                        {
+                            "logical_instances": logical_instances,
+                            "demand_by_source": source_demand,
+                            "affinity_by_source": source_affinity,
+                            "seed": proposal_seed,
+                            "strategy": f"placemoe_normalized_p{proposal_restart}_c{combination_index}",
+                            "calibrated_partition_refinement": False,
+                        }
+                    )
             structured = (
                 _structured_instance_node_candidates(
                     partition,
@@ -1515,7 +1563,10 @@ def _plan_layer(
                     source_demand,
                     ranks_per_node=args.ranks_per_node,
                 )
-                if args.include_legacy_structured_candidates and not args.communication_blind_proposals
+                if (
+                    not args.disable_structured_overlap_candidates or args.include_legacy_structured_candidates
+                )
+                and not args.communication_blind_proposals
                 else []
             )
             structured_route_statistics = (
@@ -1526,15 +1577,6 @@ def _plan_layer(
                 )
                 if structured
                 else None
-            )
-            candidate_jobs.append(
-                {
-                    "logical_instances": logical_instances,
-                    "demand_by_source": source_demand,
-                    "affinity_by_source": source_affinity,
-                    "seed": args.seed + 100_003 * layer + 997 * partition_index + 31 * combination_index,
-                    "strategy": f"placemoe_p{partition_index}_c{combination_index}",
-                }
             )
             proxy_rows: list[tuple[float, str, np.ndarray, np.ndarray]] = []
             for structured_strategy, structured_nodes in structured:

@@ -273,3 +273,109 @@ def optimize_mapping(
         changes=total_changes,
         peak_rank_load=float(rank_loads.max(initial=0.0)),
     )
+
+
+def optimize_mapping_normalized(
+    logical_instances: np.ndarray,
+    instance_ranks: np.ndarray,
+    initial_mapping: np.ndarray,
+    statistics: ProfileStatistics,
+    *,
+    ranks_per_node: int,
+    assignment_weight: float,
+    sweep_limit: int = 6,
+    node_weight: float = 1.0,
+    rank_weight: float = 0.15,
+) -> MappingResult:
+    """Generate a scale-normalized mapping proposal for exact-route selection.
+
+    This proposal is intentionally separate from the paper's calibrated
+    coordinate update. Normalizing affinity and demand protects the candidate
+    search from pairwise-affinity scale error; the exact route evaluator still
+    decides whether the resulting complete plan is useful.
+    """
+
+    if ranks_per_node <= 0:
+        raise ValueError("ranks_per_node must be positive.")
+    if sweep_limit < 0:
+        raise ValueError("Mapping sweep limit must be non-negative.")
+    if assignment_weight < 0 or node_weight < 0 or rank_weight < 0:
+        raise ValueError("Normalized mapping weights must be non-negative.")
+    logical_instances, instance_ranks, choices = _validate_layout(
+        logical_instances,
+        instance_ranks,
+        ep_size=statistics.ep_size,
+        num_experts=statistics.num_experts,
+    )
+    if statistics.ep_size % ranks_per_node:
+        raise ValueError("Profile EP size must be divisible by ranks_per_node.")
+    mapping = validate_instance_mapping(
+        initial_mapping,
+        logical_instances,
+        ep_size=statistics.ep_size,
+        num_experts=statistics.num_experts,
+    )
+    rank_loads = mapping_rank_loads(mapping, instance_ranks, statistics)
+    total_affinity = max(float(statistics.affinity.sum()), 1.0)
+    total_demand = max(float(statistics.demand.sum()), 1.0)
+    total_changes = 0
+    completed_sweeps = 0
+
+    for _ in range(sweep_limit):
+        sweep_changes = 0
+        for source in range(statistics.ep_size):
+            order = np.argsort(-statistics.demand[source], kind="stable")
+            selected_ranks = instance_ranks[mapping[source]].copy()
+            selected_nodes = selected_ranks // ranks_per_node
+            source_node = source // ranks_per_node
+            for expert in order.tolist():
+                if len(choices[expert]) <= 1:
+                    continue
+                current = int(mapping[source, expert])
+                current_rank = int(instance_ranks[current])
+                amount = float(statistics.demand[source, expert])
+                affinity_row = statistics.affinity[source, expert]
+                best: tuple[float, int, int] | None = None
+                for candidate in choices[expert].tolist():
+                    candidate_rank = int(instance_ranks[candidate])
+                    candidate_node = candidate_rank // ranks_per_node
+                    projected = rank_loads.copy()
+                    projected[current_rank] -= amount
+                    projected[candidate_rank] += amount
+                    node_reward = float(affinity_row[selected_nodes == candidate_node].sum())
+                    rank_reward = float(affinity_row[selected_ranks == candidate_rank].sum())
+                    if candidate_node == source_node:
+                        node_reward += amount
+                    if candidate_rank == source:
+                        rank_reward += amount
+                    score = (
+                        node_weight * node_reward / total_affinity
+                        + rank_weight * rank_reward / total_affinity
+                        - assignment_weight * float(projected.max(initial=0.0)) / total_demand
+                    )
+                    key = (score, -candidate_rank, -candidate)
+                    if best is None or key > best:
+                        best = key
+                if best is None:
+                    raise RuntimeError(f"Logical expert {expert} has no mapping candidate.")
+                selected = -best[2]
+                if selected == current:
+                    continue
+                selected_rank = int(instance_ranks[selected])
+                rank_loads[current_rank] -= amount
+                rank_loads[selected_rank] += amount
+                mapping[source, expert] = selected
+                selected_ranks[expert] = selected_rank
+                selected_nodes[expert] = selected_rank // ranks_per_node
+                sweep_changes += 1
+        completed_sweeps += 1
+        total_changes += sweep_changes
+        if sweep_changes == 0:
+            break
+
+    return MappingResult(
+        mapping=mapping,
+        sweeps=completed_sweeps,
+        changes=total_changes,
+        peak_rank_load=float(rank_loads.max(initial=0.0)),
+    )

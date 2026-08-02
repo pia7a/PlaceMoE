@@ -21,7 +21,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .mapping import MappingConfig, initialize_mapping, optimize_mapping
+from .mapping import MappingConfig, initialize_mapping, optimize_mapping, optimize_mapping_normalized
 from .materialize import materialize_plan
 from .placement import PlacementConfig, place_instances
 from .statistics import project_statistics_to_copies, uniform_copy_statistics
@@ -45,6 +45,10 @@ class OptimizerConfig:
     prefer_node_local: bool = True
     seed: int = 0
     seed_load_weights: tuple[float, ...] = (8.0, 32.0, 128.0)
+    normalized_mapping_weights: tuple[float, ...] = ()
+    calibrated_mapping_refinement: bool = True
+    carry_mapping_across_rounds: bool = True
+    calibrated_partition_refinement: bool = True
 
     def __post_init__(self) -> None:
         if self.primary_slots_per_rank <= 0 or self.primary_slots_per_rank > self.topology.slots_per_rank:
@@ -55,6 +59,8 @@ class OptimizerConfig:
             raise ValueError("Layout--mapping rounds must be positive.")
         if not self.seed_load_weights or any(weight < 0 for weight in self.seed_load_weights):
             raise ValueError("At least one non-negative seed load weight is required.")
+        if any(weight < 0 for weight in self.normalized_mapping_weights):
+            raise ValueError("Normalized mapping weights must be non-negative.")
 
 
 @dataclass(frozen=True)
@@ -136,6 +142,7 @@ def optimize_replica_allocation(
                     rank_exchange_limit=config.rank_exchange_limit,
                     seed=config.seed + 1009 * round_index,
                     seed_load_weight=config.seed_load_weights[round_index % len(config.seed_load_weights)],
+                    calibrated_partition_refinement=config.calibrated_partition_refinement,
                 ),
             )
         except RuntimeError:
@@ -143,80 +150,129 @@ def optimize_replica_allocation(
                 break
             raise
 
-        if previous_mapping is None:
-            initial_mapping = initialize_mapping(
+        fresh_mapping = initialize_mapping(
+            logical_instances,
+            placement.instance_ranks,
+            statistics.demand,
+            ranks_per_node=topology.ranks_per_node,
+            prefer_node_local=config.prefer_node_local,
+        )
+        mapping_seeds = [fresh_mapping]
+        if (
+            config.carry_mapping_across_rounds
+            and previous_mapping is not None
+            and not np.array_equal(previous_mapping, fresh_mapping)
+        ):
+            # The paper update follows movable copies when L changes. Retain
+            # that candidate, but also restart M for the new layout: a carried
+            # mapping can be a poor coordinate-descent seed after relocation.
+            mapping_seeds.insert(0, previous_mapping)
+
+        seen_round_mappings: set[bytes] = set()
+        for initial_mapping in mapping_seeds:
+            initial_key = initial_mapping.tobytes()
+            if initial_key in seen_round_mappings:
+                continue
+            seen_round_mappings.add(initial_key)
+            initial_plan = materialize_plan(
                 logical_instances,
                 placement.instance_ranks,
+                initial_mapping,
                 statistics.demand,
-                ranks_per_node=topology.ranks_per_node,
-                prefer_node_local=config.prefer_node_local,
+                topology,
+                primary_slots_per_rank=config.primary_slots_per_rank,
             )
-        else:
-            # Mapping entries identify movable physical copies, so they remain
-            # valid when a layout update relocates those copies to new ranks.
-            initial_mapping = previous_mapping
-        initial_plan = materialize_plan(
-            logical_instances,
-            placement.instance_ranks,
-            initial_mapping,
-            statistics.demand,
-            topology,
-            primary_slots_per_rank=config.primary_slots_per_rank,
-        )
-        initial_cost = float(evaluate(initial_plan))
-        initial_candidate = OptimizerCandidate(
-            plan=initial_plan,
-            logical_instances=logical_instances,
-            instance_ranks=placement.instance_ranks,
-            instance_mapping=initial_mapping,
-            cost=initial_cost,
-            round_index=round_index,
-            placement_repaired=placement.repaired,
-            mapping_sweeps=0,
-            mapping_changes=0,
-        )
-        candidates.append(initial_candidate)
+            initial_candidate = OptimizerCandidate(
+                plan=initial_plan,
+                logical_instances=logical_instances,
+                instance_ranks=placement.instance_ranks,
+                instance_mapping=initial_mapping,
+                cost=float(evaluate(initial_plan)),
+                round_index=round_index,
+                placement_repaired=placement.repaired,
+                mapping_sweeps=0,
+                mapping_changes=0,
+            )
+            candidates.append(initial_candidate)
 
-        mapping = optimize_mapping(
-            logical_instances,
-            placement.instance_ranks,
-            initial_mapping,
-            statistics,
-            MappingConfig(
-                ranks_per_node=topology.ranks_per_node,
-                node_omega=config.node_omega,
-                rank_omega=config.rank_omega,
-                gamma=config.gamma,
-                sweep_limit=config.mapping_sweep_limit,
-            ),
-        )
-        plan = materialize_plan(
-            logical_instances,
-            placement.instance_ranks,
-            mapping.mapping,
-            statistics.demand,
-            topology,
-            primary_slots_per_rank=config.primary_slots_per_rank,
-        )
-        if not np.array_equal(mapping.mapping, initial_mapping):
-            cost = float(evaluate(plan))
-            candidates.append(
-                OptimizerCandidate(
-                    plan=plan,
-                    logical_instances=logical_instances,
-                    instance_ranks=placement.instance_ranks,
-                    instance_mapping=mapping.mapping,
-                    cost=cost,
-                    round_index=round_index,
-                    placement_repaired=placement.repaired,
-                    mapping_sweeps=mapping.sweeps,
-                    mapping_changes=mapping.changes,
+            if config.calibrated_mapping_refinement:
+                mapping = optimize_mapping(
+                    logical_instances,
+                    placement.instance_ranks,
+                    initial_mapping,
+                    statistics,
+                    MappingConfig(
+                        ranks_per_node=topology.ranks_per_node,
+                        node_omega=config.node_omega,
+                        rank_omega=config.rank_omega,
+                        gamma=config.gamma,
+                        sweep_limit=config.mapping_sweep_limit,
+                    ),
                 )
-            )
-            round_mapping = min((initial_candidate, candidates[-1]), key=lambda candidate: candidate.cost).instance_mapping
-        else:
-            round_mapping = initial_mapping
-        previous_mapping = round_mapping.copy()
+                mapping_key = mapping.mapping.tobytes()
+                if mapping_key not in seen_round_mappings:
+                    seen_round_mappings.add(mapping_key)
+                    plan = materialize_plan(
+                        logical_instances,
+                        placement.instance_ranks,
+                        mapping.mapping,
+                        statistics.demand,
+                        topology,
+                        primary_slots_per_rank=config.primary_slots_per_rank,
+                    )
+                    refined_candidate = OptimizerCandidate(
+                        plan=plan,
+                        logical_instances=logical_instances,
+                        instance_ranks=placement.instance_ranks,
+                        instance_mapping=mapping.mapping,
+                        cost=float(evaluate(plan)),
+                        round_index=round_index,
+                        placement_repaired=placement.repaired,
+                        mapping_sweeps=mapping.sweeps,
+                        mapping_changes=mapping.changes,
+                    )
+                    candidates.append(refined_candidate)
+
+            if np.array_equal(initial_mapping, fresh_mapping):
+                for assignment_weight in config.normalized_mapping_weights:
+                    normalized = optimize_mapping_normalized(
+                        logical_instances,
+                        placement.instance_ranks,
+                        initial_mapping,
+                        statistics,
+                        ranks_per_node=topology.ranks_per_node,
+                        assignment_weight=assignment_weight,
+                        sweep_limit=config.mapping_sweep_limit,
+                    )
+                    normalized_key = normalized.mapping.tobytes()
+                    if normalized_key in seen_round_mappings:
+                        continue
+                    seen_round_mappings.add(normalized_key)
+                    normalized_plan = materialize_plan(
+                        logical_instances,
+                        placement.instance_ranks,
+                        normalized.mapping,
+                        statistics.demand,
+                        topology,
+                        primary_slots_per_rank=config.primary_slots_per_rank,
+                    )
+                    normalized_candidate = OptimizerCandidate(
+                        plan=normalized_plan,
+                        logical_instances=logical_instances,
+                        instance_ranks=placement.instance_ranks,
+                        instance_mapping=normalized.mapping,
+                        cost=float(evaluate(normalized_plan)),
+                        round_index=round_index,
+                        placement_repaired=placement.repaired,
+                        mapping_sweeps=normalized.sweeps,
+                        mapping_changes=normalized.changes,
+                    )
+                    candidates.append(normalized_candidate)
+
+        # Keep the exact-cost incumbent monotonic across rounds. A newly
+        # generated layout may be worse than an earlier round; projecting its
+        # mapping would discard the state that produced the best candidate.
+        previous_mapping = min(candidates, key=lambda candidate: candidate.cost).instance_mapping.copy()
         instance_demand, instance_affinity = project_statistics_to_copies(
             statistics,
             logical_instances,

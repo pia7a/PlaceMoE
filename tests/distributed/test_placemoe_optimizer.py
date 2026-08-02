@@ -32,6 +32,7 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     materialize_plan,
     mirrored_r2_plan,
     optimize_mapping,
+    optimize_mapping_normalized,
     optimize_replica_allocation,
     partition_items,
     partition_objective,
@@ -191,6 +192,38 @@ def test_calibrated_compute_cost_changes_the_preferred_partition():
     assert compute_result.peak_assignments_per_rank == 11
 
 
+def test_normalized_seed_can_be_retained_as_an_exact_cost_candidate():
+    affinity = np.array(
+        [
+            [0, 20, 0, 0],
+            [20, 0, 0, 0],
+            [0, 0, 0, 20],
+            [0, 0, 20, 0],
+        ],
+        dtype=np.float64,
+    )
+    demand = np.array([10, 10, 1, 1], dtype=np.float64)
+    common = dict(
+        capacities=(2, 2),
+        ranks_per_group=(1, 1),
+        omega=1.0,
+        gamma=5.0,
+        restarts=1,
+        seed=17,
+        seed_load_weight=0.0,
+    )
+    calibrated = partition_items(affinity, demand, PartitionConfig(**common))[0]
+    normalized = partition_items(
+        affinity,
+        demand,
+        PartitionConfig(**common, calibrated_refinement=False),
+    )[0]
+
+    assert calibrated.peak_assignments_per_rank == 11
+    assert normalized.within_affinity == 40
+    assert normalized.peak_assignments_per_rank == 20
+
+
 def test_locality_matching_maps_abstract_groups_to_source_demand():
     labels = np.array([0, 0, 1, 1])
     demand_by_source = np.array(
@@ -255,6 +288,45 @@ def test_calibrated_mapping_score_balances_affinity_reuse_and_compute_load():
         statistics,
         MappingConfig(ranks_per_node=1, node_omega=1.0, rank_omega=0.0, gamma=3.0),
     )
+    assert communication_only.mapping[0, 0] == 1
+    assert compute_aware.mapping[0, 0] == 0
+    assert communication_only.peak_rank_load == 21
+    assert compute_aware.peak_rank_load == 11
+
+
+def test_normalized_mapping_proposals_span_communication_and_compute_tradeoffs():
+    affinity = np.zeros((2, 2, 2), dtype=np.float64)
+    affinity[0, 0, 1] = affinity[0, 1, 0] = 30
+    statistics = ProfileStatistics(
+        demand=np.array([[10, 1], [0, 10]], dtype=np.float64),
+        affinity=affinity,
+    )
+    logical_instances = np.array([0, 0, 1])
+    instance_ranks = np.array([0, 1, 1])
+    initial = initialize_mapping(
+        logical_instances,
+        instance_ranks,
+        statistics.demand,
+        ranks_per_node=1,
+    )
+
+    communication_only = optimize_mapping_normalized(
+        logical_instances,
+        instance_ranks,
+        initial,
+        statistics,
+        ranks_per_node=1,
+        assignment_weight=0.0,
+    )
+    compute_aware = optimize_mapping_normalized(
+        logical_instances,
+        instance_ranks,
+        initial,
+        statistics,
+        ranks_per_node=1,
+        assignment_weight=100.0,
+    )
+
     assert communication_only.mapping[0, 0] == 1
     assert compute_aware.mapping[0, 0] == 0
     assert communication_only.peak_rank_load == 21

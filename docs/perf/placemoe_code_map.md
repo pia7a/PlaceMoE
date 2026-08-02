@@ -36,19 +36,29 @@ The canonical CLI is `scripts/profile/plan_placemoe.py`. The older
 `build_hiermoe_recursive_classifier_layout.py` name remains only as its
 compatibility implementation while downstream imports migrate.
 
-By default, the CLI evaluates only PlaceMoE candidates. The historical
-four-node structured-degree2 and token-KMeans hyperedge candidates remain
-available through `--include-legacy-structured-candidates` and
-`--include-legacy-hyperedge-candidates`; they are not part of the paper path.
-All successful runs emit the same preloaded schema-v2 artifact for both
-static startup and hot updates.
+The CLI retains the paper's calibrated partition candidate and also evaluates
+two proposal families that protect exact-route search from pairwise-surrogate
+error: a scale-normalized partition candidate on every topology and a
+structured-overlap candidate for the four-node, two-copy case. The latter can
+be disabled with `--disable-structured-overlap-candidates`. The historical
+token-KMeans hyperedge candidate remains available only through
+`--include-legacy-hyperedge-candidates`. All successful runs emit the same
+preloaded schema-v2 artifact for both static startup and hot updates.
 
-Partition restarts use scale-independent load weights only to diversify their
-spectral seeds. The calibrated partition objective refines those seeds, and
-complete token-route replay remains the sole selector of the final `L,M`
-pair. When the budget is exactly one extra copy per expert, the default-order
-uniform plan is retained as a feasible safety seed and wins only when its
-profiled joint cost is lower.
+Partition restarts use scale-independent load weights to diversify spectral
+seeds. Because pairwise affinity cannot recover a top-k destination-group
+union, the calibrated paper path and the scale-normalized compatibility path
+are retained as separate proposal branches. The paper branch evaluates both
+the mapping carried by movable copies and a fresh demand-ordered mapping, then
+applies the calibrated coordinate update. The compatibility branch starts
+from the normalized placement using the paper-era deterministic exchange
+order and a fresh mapping, evaluates fixed normalized mapping tradeoffs, and
+propagates its exact-cost incumbent between rounds.
+Complete token-route replay remains the sole selector across the resulting
+`L,M` pairs.
+When the budget is exactly one extra copy per expert, the default-order uniform
+plan is retained as a feasible safety seed and wins only when its profiled
+joint cost is lower.
 
 ## Runtime modules retained by PlaceMoE
 

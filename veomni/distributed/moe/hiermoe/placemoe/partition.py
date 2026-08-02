@@ -29,7 +29,8 @@ class PartitionConfig:
 
     ``omega`` and ``gamma`` express communication reuse and expert-compute
     load in the same time unit. ``ranks_per_group`` implements the per-rank
-    normalization in the paper's partition objective.
+    normalization in the paper's partition objective. The normalized seed can
+    also be retained as a proposal before calibrated refinement.
     """
 
     capacities: tuple[int, ...]
@@ -42,6 +43,7 @@ class PartitionConfig:
     seed: int = 0
     improvement_tolerance: float = 1e-12
     seed_load_weight: float | None = None
+    calibrated_refinement: bool = True
 
     def __post_init__(self) -> None:
         if not self.capacities or any(capacity <= 0 for capacity in self.capacities):
@@ -270,8 +272,77 @@ def _refine_normalized_seed(
     return labels
 
 
+def _refine_normalized_compatibility(
+    affinity: np.ndarray,
+    demand: np.ndarray,
+    initial_labels: np.ndarray,
+    config: PartitionConfig,
+) -> np.ndarray:
+    """Reproduce the paper-era normalized refinement deterministically.
+
+    This intentionally retains the scalar pair order and recomputes the
+    affinity-to-group matrix after each exchange. The vectorized refinement
+    above is mathematically equivalent, but floating-point accumulation and
+    tie-breaking can change a few placements and remove a historical low-A2A
+    proposal after later layout--mapping rounds.
+    """
+
+    if config.seed_load_weight is None or config.exchange_limit == 0:
+        return np.asarray(initial_labels, dtype=np.int64).copy()
+    labels = np.asarray(initial_labels, dtype=np.int64).copy()
+    parts = len(config.capacities)
+    total_affinity = max(float(affinity.sum()) / 2.0, 1.0)
+    total_demand = max(float(demand.sum()), 1.0)
+    loads = np.asarray([demand[labels == part].sum() for part in range(parts)])
+
+    for _ in range(config.exchange_limit):
+        membership = np.eye(parts, dtype=np.float64)[labels]
+        affinity_to_part = affinity @ membership
+        best: tuple[float, int, int] | None = None
+        for lhs in range(len(labels)):
+            lhs_part = int(labels[lhs])
+            for rhs in range(lhs + 1, len(labels)):
+                rhs_part = int(labels[rhs])
+                if lhs_part == rhs_part:
+                    continue
+                old_affinity = affinity_to_part[lhs, lhs_part] + affinity_to_part[rhs, rhs_part]
+                new_affinity = (
+                    affinity_to_part[lhs, rhs_part]
+                    + affinity_to_part[rhs, lhs_part]
+                    - 2.0 * affinity[lhs, rhs]
+                )
+                affinity_delta = float(new_affinity - old_affinity) / total_affinity
+
+                lhs_fraction = loads[lhs_part] / total_demand
+                rhs_fraction = loads[rhs_part] / total_demand
+                load_delta = float(demand[rhs] - demand[lhs])
+                new_lhs_fraction = (loads[lhs_part] + load_delta) / total_demand
+                new_rhs_fraction = (loads[rhs_part] - load_delta) / total_demand
+                imbalance_delta = (
+                    (new_lhs_fraction - 1.0 / parts) ** 2
+                    + (new_rhs_fraction - 1.0 / parts) ** 2
+                    - (lhs_fraction - 1.0 / parts) ** 2
+                    - (rhs_fraction - 1.0 / parts) ** 2
+                )
+                score_delta = affinity_delta - float(config.seed_load_weight) * imbalance_delta
+                if score_delta > float(config.improvement_tolerance) and (
+                    best is None or score_delta > best[0]
+                ):
+                    best = (score_delta, lhs, rhs)
+        if best is None:
+            break
+        _, lhs, rhs = best
+        lhs_part = int(labels[lhs])
+        rhs_part = int(labels[rhs])
+        load_delta = float(demand[rhs] - demand[lhs])
+        loads[lhs_part] += load_delta
+        loads[rhs_part] -= load_delta
+        labels[lhs], labels[rhs] = labels[rhs], labels[lhs]
+    return labels
+
+
 def partition_items(affinity: np.ndarray, demand: np.ndarray, config: PartitionConfig) -> tuple[PartitionResult, ...]:
-    """Generate unique calibrated partition candidates from spectral restarts."""
+    """Generate unique partition candidates from spectral restarts."""
 
     affinity, demand = _validate_inputs(affinity, demand, config)
     embedding = _spectral_embedding(affinity, len(config.capacities))
@@ -279,8 +350,12 @@ def partition_items(affinity: np.ndarray, demand: np.ndarray, config: PartitionC
     seen: set[tuple[tuple[int, int, tuple[int, ...]], ...]] = set()
     for restart in range(config.restarts):
         initial = _capacity_assignment(embedding, config, seed=config.seed + 7919 * restart)
-        diversified = _refine_normalized_seed(affinity, demand, initial, config)
-        labels, exchanges = _refine_partition(affinity, demand, diversified, config)
+        if config.calibrated_refinement:
+            diversified = _refine_normalized_seed(affinity, demand, initial, config)
+            labels, exchanges = _refine_partition(affinity, demand, diversified, config)
+        else:
+            labels = _refine_normalized_compatibility(affinity, demand, initial, config)
+            exchanges = ()
         groups = tuple(
             sorted(
                 (

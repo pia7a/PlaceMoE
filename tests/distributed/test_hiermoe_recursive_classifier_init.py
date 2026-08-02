@@ -471,6 +471,27 @@ def test_four_node_structured_seed_is_not_used_for_other_topologies(ep_size: int
     )
 
 
+def test_four_node_structured_seed_separates_two_copies_and_preserves_capacity() -> None:
+    num_experts = 16
+    labels = np.arange(num_experts, dtype=np.int64) % 4
+    logical_instances = np.tile(np.arange(num_experts, dtype=np.int64), 2)
+    demand = np.ones((32, num_experts), dtype=np.float64)
+
+    candidates = _structured_instance_node_candidates(
+        labels,
+        logical_instances,
+        demand,
+        ranks_per_node=8,
+    )
+
+    assert candidates
+    for _, instance_nodes in candidates:
+        np.testing.assert_array_equal(np.bincount(instance_nodes, minlength=4), [8, 8, 8, 8])
+        for expert in range(num_experts):
+            copies = np.flatnonzero(logical_instances == expert)
+            assert len(np.unique(instance_nodes[copies])) == 2
+
+
 @pytest.mark.parametrize("ep_size", (16, 64))
 def test_generic_classifier_places_full_r2_on_two_and_eight_nodes(ep_size: int) -> None:
     num_experts = 128

@@ -22,6 +22,7 @@ from .mapping import (
     initialize_mapping,
     mapping_rank_loads,
     optimize_mapping,
+    optimize_mapping_normalized,
     validate_instance_mapping,
 )
 from .materialize import materialize_plan
@@ -63,6 +64,7 @@ __all__ = [
     "mirrored_r2_plan",
     "mapping_rank_loads",
     "optimize_mapping",
+    "optimize_mapping_normalized",
     "optimize_replica_allocation",
     "partition_items",
     "partition_objective",
