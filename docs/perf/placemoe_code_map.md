@@ -25,8 +25,8 @@ The reusable implementation now lives in
 | `statistics.py` | Source-conditioned demand and co-selection affinity. |
 | `allocation.py` | Exact-budget bounded replica-allocation shortlist. |
 | `partition.py` | Calibrated capacity-constrained affinity partitioning. |
-| `placement.py` | Node-to-rank placement, locality matching, and rank repair. |
-| `mapping.py` | Demand-ordered initialization and calibrated mapping update. |
+| `placement.py` | Generic node-to-rank placement, community-coherent node proposals, locality matching, and rank repair. |
+| `mapping.py` | Demand-ordered initialization, calibrated entry updates, and source-community block mapping. |
 | `optimizer.py` | Bounded layout--mapping alternation and exact-cost callback. |
 | `materialize.py` | Physical-slot assignment and mapping relocation. |
 | `artifacts.py` | Validated schema-v2 runtime artifacts. |
@@ -38,10 +38,15 @@ compatibility implementation while downstream imports migrate.
 
 The CLI retains the paper's calibrated partition candidate and also evaluates
 two proposal families that protect exact-route search from pairwise-surrogate
-error: a scale-normalized partition candidate on every topology and a
-structured-overlap candidate for the four-node, two-copy case. The latter can
-be disabled with `--disable-structured-overlap-candidates`. The historical
-token-KMeans hyperedge candidate remains available only through
+error. A scale-normalized partition candidate provides a robust generic
+fallback. The default community proposal coarsens experts by affinity, places
+whole communities through balanced topology-general copy permutations, and
+jointly maps each source-node/community block using exact token destination
+unions. It supports partial replica budgets when an allocation preserves
+whole communities and otherwise falls back to generic placement. The old
+four-node `structured_degree2` library is available only through
+`--include-legacy-structured-candidates`; the historical token-KMeans
+hyperedge candidate remains available through
 `--include-legacy-hyperedge-candidates`. All successful runs emit the same
 preloaded schema-v2 artifact for both static startup and hot updates.
 

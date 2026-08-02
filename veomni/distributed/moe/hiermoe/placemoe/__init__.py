@@ -17,10 +17,14 @@
 from .allocation import bounded_group_shortlist, build_replica_allocations
 from .artifacts import PLACEMOE_ARTIFACT_SCHEMA_VERSION, build_placemoe_artifact, validate_placemoe_artifact
 from .mapping import (
+    CommunityMappingConfig,
+    CommunityMappingResult,
     MappingConfig,
     MappingResult,
+    community_intersection_hits,
     initialize_mapping,
     mapping_rank_loads,
+    optimize_community_mapping,
     optimize_mapping,
     optimize_mapping_normalized,
     validate_instance_mapping,
@@ -31,6 +35,7 @@ from .partition import PartitionConfig, PartitionResult, map_groups_to_locations
 from .placement import (
     PlacementConfig,
     PlacementResult,
+    community_node_placements,
     place_instances,
     rank_placement_is_unique,
     repair_rank_placement,
@@ -43,6 +48,8 @@ from .types import EMPTY_EXPERT, LayerPlan, PlaceMoETopology, ProfileStatistics
 __all__ = [
     "EMPTY_EXPERT",
     "LayerPlan",
+    "CommunityMappingConfig",
+    "CommunityMappingResult",
     "MappingConfig",
     "MappingResult",
     "OptimizationResult",
@@ -58,11 +65,14 @@ __all__ = [
     "bounded_group_shortlist",
     "build_replica_allocations",
     "build_placemoe_artifact",
+    "community_intersection_hits",
+    "community_node_placements",
     "initialize_mapping",
     "map_groups_to_locations",
     "materialize_plan",
     "mirrored_r2_plan",
     "mapping_rank_loads",
+    "optimize_community_mapping",
     "optimize_mapping",
     "optimize_mapping_normalized",
     "optimize_replica_allocation",

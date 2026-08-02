@@ -16,9 +16,11 @@
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from .partition import PartitionConfig, map_groups_to_locations, partition_items
 
@@ -74,6 +76,162 @@ class PlacementResult:
         instance_ranks = np.asarray(self.instance_ranks, dtype=np.int64).copy()
         instance_ranks.setflags(write=False)
         object.__setattr__(self, "instance_ranks", instance_ranks)
+
+
+def community_node_placements(
+    logical_instances: np.ndarray,
+    logical_communities: np.ndarray,
+    demand_by_source: np.ndarray,
+    config: PlacementConfig,
+    *,
+    candidate_limit: int,
+) -> tuple[np.ndarray, ...]:
+    """Generate balanced community-coherent node placements.
+
+    Every copy round maps the affinity communities to nodes through a
+    different balanced permutation. This gives all experts in a community a
+    shared node footprint without assuming a particular node count. Empty
+    instances fill the residual physical capacity. Allocations that split a
+    community fall back to the generic instance partitioner rather than
+    weakening copy coherence inside this proposal family.
+    """
+
+    logical_instances = np.asarray(logical_instances, dtype=np.int64)
+    logical_communities = np.asarray(logical_communities, dtype=np.int64)
+    demand_by_source = np.asarray(demand_by_source, dtype=np.float64)
+    if candidate_limit <= 0:
+        raise ValueError("candidate_limit must be positive.")
+    if logical_instances.shape != (config.total_slots,):
+        raise ValueError("Logical instances must fill the physical capacity.")
+    if logical_communities.ndim != 1 or bool((logical_communities < 0).any()):
+        raise ValueError("Logical communities must contain one label per expert.")
+    num_experts = len(logical_communities)
+    if demand_by_source.shape != (config.ep_size, num_experts):
+        raise ValueError("Source demand must have shape [source_rank, expert].")
+    if bool((logical_instances < -1).any()) or bool((logical_instances >= num_experts).any()):
+        raise ValueError("Logical instances contain an invalid expert ID.")
+    if not np.array_equal(np.unique(logical_communities), np.arange(config.num_nodes)):
+        return ()
+    community_sizes = np.bincount(logical_communities, minlength=config.num_nodes)
+    if not bool((community_sizes == community_sizes[0]).all()):
+        return ()
+    copy_counts = np.bincount(logical_instances[logical_instances >= 0], minlength=num_experts)
+    if bool((copy_counts < 1).any()):
+        return ()
+    community_copy_counts = np.zeros((config.num_nodes,), dtype=np.int64)
+    for community in range(config.num_nodes):
+        members = np.flatnonzero(logical_communities == community)
+        member_copy_counts = copy_counts[members]
+        if not bool((member_copy_counts == member_copy_counts[0]).all()):
+            return ()
+        community_copy_counts[community] = int(member_copy_counts[0])
+    max_copies = int(community_copy_counts.max(initial=0))
+    if max_copies > config.num_nodes:
+        return ()
+    node_capacity = config.ranks_per_node * config.slots_per_rank
+
+    instances_by_expert = [
+        np.flatnonzero(logical_instances == expert).tolist() for expert in range(num_experts)
+    ]
+    empty_instances = np.flatnonzero(logical_instances < 0).tolist()
+    if len(empty_instances) != config.total_slots - int(copy_counts.sum()):
+        return ()
+    source_nodes = demand_by_source.reshape(
+        config.num_nodes,
+        config.ranks_per_node,
+        num_experts,
+    ).sum(axis=1)
+
+    identity = np.arange(config.num_nodes, dtype=np.int64)
+    copy_node_tables: list[np.ndarray] = []
+    if max_copies == 1:
+        copy_node_tables.append(identity[None, :])
+    elif max_copies == 2:
+        if config.num_nodes <= 6:
+            permutations = (
+                np.asarray(row, dtype=np.int64)
+                for row in itertools.permutations(range(config.num_nodes))
+            )
+        else:
+            rows = [np.roll(identity, -shift) for shift in range(1, config.num_nodes)]
+            rng = np.random.default_rng(config.seed)
+            pool_limit = max(64, 16 * candidate_limit)
+            attempts = 0
+            while len(rows) < pool_limit and attempts < 32 * pool_limit:
+                attempts += 1
+                row = rng.permutation(config.num_nodes)
+                if bool((row == identity).any()):
+                    continue
+                rows.append(row)
+            permutations = iter(rows)
+        for permutation in permutations:
+            if bool((permutation == identity).any()):
+                continue
+            copy_node_tables.append(np.stack((identity, permutation)))
+    else:
+        for additional in itertools.combinations(
+            range(1, config.num_nodes),
+            max_copies - 1,
+        ):
+            shifts = (0, *additional)
+            copy_node_tables.append(
+                np.stack([np.roll(identity, -shift) for shift in shifts])
+            )
+    rows: list[tuple[float, bytes, np.ndarray]] = []
+    seen_abstract: set[bytes] = set()
+    for copy_nodes in copy_node_tables:
+        abstract_nodes = np.full((config.total_slots,), -1, dtype=np.int64)
+        for expert in range(num_experts):
+            community = int(logical_communities[expert])
+            for copy_index, instance in enumerate(instances_by_expert[expert]):
+                abstract_nodes[instance] = int(copy_nodes[copy_index, community])
+        active_counts = np.bincount(
+            abstract_nodes[abstract_nodes >= 0],
+            minlength=config.num_nodes,
+        )
+        if bool((active_counts > node_capacity).any()):
+            continue
+        empty_per_node = node_capacity - active_counts
+        if int(empty_per_node.sum()) != len(empty_instances):
+            raise RuntimeError("Community placement has inconsistent empty capacity.")
+        empty_offset = 0
+        for node in range(config.num_nodes):
+            for _ in range(int(empty_per_node[node])):
+                abstract_nodes[empty_instances[empty_offset]] = node
+                empty_offset += 1
+        if not np.array_equal(
+            np.bincount(abstract_nodes, minlength=config.num_nodes),
+            np.full((config.num_nodes,), node_capacity),
+        ):
+            raise RuntimeError("Community placement violates abstract node capacity.")
+        abstract_key = abstract_nodes.tobytes()
+        if abstract_key in seen_abstract:
+            continue
+        seen_abstract.add(abstract_key)
+
+        locality = np.zeros((config.num_nodes, config.num_nodes), dtype=np.float64)
+        for abstract_node in range(config.num_nodes):
+            active = logical_instances[abstract_nodes == abstract_node]
+            experts = np.unique(active[active >= 0])
+            locality[abstract_node] = source_nodes[:, experts].sum(axis=1)
+        abstract_rows, physical_nodes = linear_sum_assignment(-locality)
+        abstract_to_physical = np.full((config.num_nodes,), -1, dtype=np.int64)
+        abstract_to_physical[abstract_rows] = physical_nodes
+        instance_nodes = abstract_to_physical[abstract_nodes]
+        locality_score = float(locality[abstract_rows, physical_nodes].sum())
+        rows.append((-locality_score, instance_nodes.tobytes(), instance_nodes))
+
+    rows.sort(key=lambda row: (row[0], row[1]))
+    unique: list[np.ndarray] = []
+    seen: set[bytes] = set()
+    for _, key, instance_nodes in rows:
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(instance_nodes.copy())
+        if len(unique) == candidate_limit:
+            break
+    return tuple(unique)
 
 
 def rank_placement_is_unique(instance_ranks: np.ndarray, logical_instances: np.ndarray, *, ep_size: int) -> bool:

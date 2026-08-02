@@ -33,6 +33,7 @@ from scripts.profile.build_hiermoe_hierarchical_init_layout import (
     _load_routes,
 )
 from veomni.distributed.moe.hiermoe.placemoe import (
+    CommunityMappingConfig,
     LayerPlan,
     MappingConfig,
     OptimizerConfig,
@@ -42,10 +43,13 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     ProfileStatistics,
     build_placemoe_artifact,
     build_replica_allocations,
+    community_intersection_hits,
+    community_node_placements,
     initialize_mapping,
     map_groups_to_locations,
     materialize_plan,
     mirrored_r2_plan,
+    optimize_community_mapping,
     optimize_mapping,
     optimize_replica_allocation,
     partition_items,
@@ -206,10 +210,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--partition-iterations", type=int, default=24)
     parser.add_argument("--hyperedge-token-sample", type=int, default=16384)
     parser.add_argument("--structured-shortlist", type=int, default=2)
+    parser.add_argument("--community-shortlist", type=int, default=2)
+    parser.add_argument("--community-sweeps", type=int, default=4)
+    parser.add_argument(
+        "--include-community-block-candidates",
+        action="store_true",
+        help=(
+            "Deprecated compatibility flag; topology-general affinity-community "
+            "proposals are enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--disable-community-block-candidates",
+        action="store_true",
+        help="Disable affinity-community placement and source-node block-mapping proposals.",
+    )
     parser.add_argument(
         "--include-legacy-structured-candidates",
         action="store_true",
-        help="Deprecated alias that keeps four-node structured-overlap proposals enabled.",
+        help="Also evaluate the historical four-node structured-overlap proposals.",
     )
     parser.add_argument(
         "--disable-structured-overlap-candidates",
@@ -1234,6 +1253,7 @@ def _build_candidate(
     initial_instance_statistics: tuple[np.ndarray, np.ndarray] | None = None,
     cost_cache: dict[bytes, HybridCost] | None = None,
     calibrated_partition_refinement: bool = True,
+    refine_fixed_initial_lut: bool = False,
 ) -> _Candidate | None:
     started = time.perf_counter()
     if fixed_instance_nodes is None:
@@ -1295,7 +1315,7 @@ def _build_candidate(
         else:
             initial_lut = fixed_initial_lut
         lut_variants = [initial_lut]
-        if fixed_initial_lut is None:
+        if fixed_initial_lut is None or refine_fixed_initial_lut:
             lut_variants.append(
                 _optimize_lut_instances(
                     logical_instances,
@@ -1369,6 +1389,8 @@ def _validate_configuration(args: argparse.Namespace) -> _CapacityPlan:
         raise ValueError("EP size must be divisible by ranks per node.")
     if args.num_experts <= 0 or args.ep_size <= 0:
         raise ValueError("Expert and EP sizes must be positive.")
+    if args.community_shortlist <= 0 or args.community_sweeps < 0:
+        raise ValueError("Community shortlist must be positive and sweeps must be non-negative.")
     if args.num_experts % args.ep_size:
         raise ValueError("This initializer requires logical experts to divide evenly across EP ranks.")
 
@@ -1556,6 +1578,87 @@ def _plan_layer(
                             "calibrated_partition_refinement": False,
                         }
                     )
+            community_enabled = (
+                not args.disable_community_block_candidates or args.include_community_block_candidates
+            )
+            if community_enabled and not args.communication_blind_proposals:
+                community_nodes = community_node_placements(
+                    logical_instances,
+                    partition,
+                    source_demand,
+                    PlacementConfig(
+                        ep_size=args.ep_size,
+                        ranks_per_node=args.ranks_per_node,
+                        slots_per_rank=args.slots_per_rank,
+                        node_omega=node_omega,
+                        rank_omega=0.0,
+                        gamma=gamma,
+                    ),
+                    candidate_limit=max(args.community_shortlist, 8 * args.community_shortlist),
+                )
+                if community_nodes:
+                    assignments_by_community, community_mask_histogram = _group_route_statistics(
+                        optimize_samples,
+                        partition,
+                        ranks_per_node=args.ranks_per_node,
+                    )
+                    intersection_hits = community_intersection_hits(community_mask_histogram)
+                    community_rows: list[tuple[float, int, np.ndarray, np.ndarray]] = []
+                    for community_index, instance_nodes in enumerate(community_nodes):
+                        community_mapping = optimize_community_mapping(
+                            logical_instances,
+                            instance_nodes,
+                            partition,
+                            assignments_by_community,
+                            community_mask_histogram,
+                            CommunityMappingConfig(
+                                ranks_per_node=args.ranks_per_node,
+                                communication_ms_per_token=(
+                                    args.communication_phase_multiplier
+                                    * args.hidden_size
+                                    * args.bytes_per_element
+                                    * args.inter_ms_per_byte
+                                ),
+                                assignment_ms_per_assignment=(
+                                    args.compute_phase_multiplier * args.compute_ms_per_assignment
+                                    + args.communication_phase_multiplier * args.route_ms_per_assignment
+                                ),
+                                sweep_limit=args.community_sweeps,
+                            ),
+                            intersection_hits=intersection_hits,
+                        )
+                        community_rows.append(
+                            (
+                                community_mapping.proxy_cost,
+                                community_index,
+                                instance_nodes,
+                                community_mapping.mapping,
+                            )
+                        )
+                    for _, community_index, instance_nodes, community_mapping in sorted(
+                        community_rows,
+                        key=lambda row: (row[0], row[1]),
+                    )[: args.community_shortlist]:
+                        candidate_jobs.append(
+                            {
+                                "logical_instances": logical_instances,
+                                "demand_by_source": source_demand,
+                                "affinity_by_source": source_affinity,
+                                "seed": (
+                                    args.seed
+                                    + 100_003 * layer
+                                    + 997 * partition_index
+                                    + 31 * combination_index
+                                    + 17 * community_index
+                                ),
+                                "strategy": (
+                                    f"community_block_{community_index}_p{partition_index}_c{combination_index}"
+                                ),
+                                "fixed_instance_nodes": instance_nodes,
+                                "fixed_initial_lut": community_mapping,
+                                "refine_fixed_initial_lut": True,
+                            }
+                        )
             structured = (
                 _structured_instance_node_candidates(
                     partition,
@@ -1564,7 +1667,8 @@ def _plan_layer(
                     ranks_per_node=args.ranks_per_node,
                 )
                 if (
-                    not args.disable_structured_overlap_candidates or args.include_legacy_structured_candidates
+                    args.include_legacy_structured_candidates
+                    and not args.disable_structured_overlap_candidates
                 )
                 and not args.communication_blind_proposals
                 else []

@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from veomni.distributed.moe.hiermoe.placemoe import (
+    CommunityMappingConfig,
     LayerPlan,
     MappingConfig,
     OptimizerConfig,
@@ -27,10 +28,13 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     bounded_group_shortlist,
     build_placemoe_artifact,
     build_replica_allocations,
+    community_intersection_hits,
+    community_node_placements,
     initialize_mapping,
     map_groups_to_locations,
     materialize_plan,
     mirrored_r2_plan,
+    optimize_community_mapping,
     optimize_mapping,
     optimize_mapping_normalized,
     optimize_replica_allocation,
@@ -257,6 +261,134 @@ def test_mapping_initialization_prefers_local_copies_and_balances_rank_loads():
         ranks_per_node=1,
     )
     np.testing.assert_array_equal(mapping, [[0, 1], [2, 3]])
+
+
+@pytest.mark.parametrize("num_nodes", [4, 8])
+def test_community_node_placements_are_balanced_and_topology_general(num_nodes):
+    num_experts = 2 * num_nodes
+    logical_instances = np.tile(np.arange(num_experts, dtype=np.int64), 2)
+    communities = np.repeat(np.arange(num_nodes, dtype=np.int64), 2)
+    config = PlacementConfig(
+        ep_size=2 * num_nodes,
+        ranks_per_node=2,
+        slots_per_rank=2,
+        node_omega=1.0,
+        rank_omega=0.1,
+        gamma=1.0,
+    )
+    demand = np.ones((config.ep_size, num_experts), dtype=np.float64)
+    candidates = community_node_placements(
+        logical_instances,
+        communities,
+        demand,
+        config,
+        candidate_limit=2,
+    )
+    assert candidates
+    for instance_nodes in candidates:
+        np.testing.assert_array_equal(
+            np.bincount(instance_nodes, minlength=num_nodes),
+            np.full((num_nodes,), 4),
+        )
+        for expert in range(num_experts):
+            expert_nodes = instance_nodes[logical_instances == expert]
+            assert len(expert_nodes) == len(np.unique(expert_nodes))
+        for community in range(num_nodes):
+            experts = np.flatnonzero(communities == community)
+            footprints = [set(instance_nodes[logical_instances == expert].tolist()) for expert in experts]
+            assert all(footprint == footprints[0] for footprint in footprints[1:])
+
+
+def test_community_node_placements_support_partial_replica_budgets():
+    logical_instances = np.concatenate(
+        (
+            np.arange(8, dtype=np.int64),
+            np.arange(4, dtype=np.int64),
+            np.full((4,), -1, dtype=np.int64),
+        )
+    )
+    communities = np.repeat(np.arange(4, dtype=np.int64), 2)
+    config = PlacementConfig(
+        ep_size=8,
+        ranks_per_node=2,
+        slots_per_rank=2,
+        node_omega=1.0,
+        rank_omega=0.1,
+        gamma=1.0,
+    )
+    candidates = community_node_placements(
+        logical_instances,
+        communities,
+        np.ones((config.ep_size, 8), dtype=np.float64),
+        config,
+        candidate_limit=2,
+    )
+    assert candidates
+    for instance_nodes in candidates:
+        np.testing.assert_array_equal(np.bincount(instance_nodes, minlength=4), np.full((4,), 4))
+        for expert in range(4):
+            expert_nodes = instance_nodes[logical_instances == expert]
+            assert len(expert_nodes) == len(np.unique(expert_nodes))
+
+
+def test_community_mapping_moves_co_selected_experts_as_one_block():
+    logical_instances = np.array([0, 0, 1, 1, 2, 2, 3, 3])
+    instance_nodes = np.array([0, 1, 0, 1, 1, 2, 1, 2])
+    communities = np.array([0, 0, 1, 1])
+    assignments = np.zeros((4, 2), dtype=np.float64)
+    assignments[3] = [20, 20]
+    masks = np.zeros((4, 4), dtype=np.int64)
+    masks[3, 3] = 10
+    result = optimize_community_mapping(
+        logical_instances,
+        instance_nodes,
+        communities,
+        assignments,
+        masks,
+        CommunityMappingConfig(
+            ranks_per_node=1,
+            communication_ms_per_token=1.0,
+            assignment_ms_per_assignment=0.0,
+        ),
+    )
+    np.testing.assert_array_equal(result.destination_nodes[3], [1, 1])
+    mapped_nodes = instance_nodes[result.mapping[3]]
+    np.testing.assert_array_equal(mapped_nodes, [1, 1, 1, 1])
+    assert result.proxy_cost == 10
+
+
+def test_community_intersection_hits_matches_mask_unions():
+    histogram = np.array([[0, 2, 3, 5]], dtype=np.int64)
+    np.testing.assert_array_equal(
+        community_intersection_hits(histogram),
+        [[0, 7, 8, 10]],
+    )
+
+
+def test_community_mapping_bounds_large_source_row_search():
+    num_communities = 13
+    logical_instances = np.repeat(np.arange(num_communities, dtype=np.int64), 2)
+    instance_nodes = np.tile(np.arange(2, dtype=np.int64), num_communities)
+    communities = np.arange(num_communities, dtype=np.int64)
+    assignments = np.ones((2, num_communities), dtype=np.float64)
+    masks = np.zeros((2, 1 << num_communities), dtype=np.int64)
+    masks[:, -1] = 1
+    result = optimize_community_mapping(
+        logical_instances,
+        instance_nodes,
+        communities,
+        assignments,
+        masks,
+        CommunityMappingConfig(
+            ranks_per_node=1,
+            communication_ms_per_token=1.0,
+            assignment_ms_per_assignment=0.0,
+            row_candidate_limit=4,
+            beam_width=4,
+        ),
+    )
+    assert result.mapping.shape == (2, num_communities)
+    assert result.destination_nodes.shape == (2, num_communities)
 
 
 def test_calibrated_mapping_score_balances_affinity_reuse_and_compute_load():

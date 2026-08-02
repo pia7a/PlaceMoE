@@ -112,6 +112,54 @@ after each exchange. A staged layer-0 comparison then matches all 3 rounds
 bitwise, including placement, initial mapping, normalized mapping proposals,
 and projected copy statistics.
 
+## Topology-general community proposal
+
+The four-node structured result exposed a useful optimization granularity, not
+a four-node requirement. The new default proposal applies the same principle
+without a degree-2 template:
+
+1. use an affinity partition to define balanced expert communities;
+2. place successive copies of each community through balanced node
+   permutations, then map abstract nodes to physical nodes by source locality;
+3. jointly choose the destination node of each source-node/community block
+   using exact token community-mask unions and calibrated projected compute;
+4. run generic rank placement and fine-grained mapping refinement; and
+5. retain the complete pair only when exact route replay selects it.
+
+Source rows and source-node combinations use bounded beams. Partial replica
+budgets are supported when an allocation preserves whole communities;
+allocations that split a community automatically use generic placement. The
+proposal therefore does not depend on four nodes, two copies, or a hard-coded
+overlap graph.
+
+On EP32 Qwen3-VL / ShareGPT4V, the community proposal wins all 48 layers:
+
+| Proposal set | Held-out A2A (ms) | Held-out compute (ms) | Held-out joint cost (ms) |
+| --- | ---: | ---: | ---: |
+| Generic calibrated/normalized proposals | 5534.331 | 814.831 | 6349.162 |
+| Legacy `structured_degree2` | 4686.501 | 869.506 | 5556.008 |
+| Topology-general community proposal | 4686.499 | 869.506 | 5556.006 |
+
+The community and legacy layouts are identical in 47 of 48 layers. Their
+compute cost and destination-rank metrics match in all layers; the remaining
+A2A difference is 0.001945 ms in favor of the community proposal. Its planner
+wall time is 814.5 s, compared with 1035.9 s for the legacy structured-enabled
+search and 701.0 s for generic-only search.
+
+On EP64 Qwen3-VL / Tulu-3, the community proposal wins 29 of 48 layers while
+the normalized generic proposal wins the other 19:
+
+| Proposal set | Held-out A2A (ms) | Held-out compute (ms) | Held-out joint cost (ms) |
+| --- | ---: | ---: | ---: |
+| Generic calibrated/normalized proposals | 8766.573 | 982.015 | 9748.589 |
+| Generic plus community proposals | 8328.225 | 1054.594 | 9382.819 |
+
+The community proposals reduce A2A by 5.00% and joint cost by 3.75%, while
+accepting 7.39% more compute cost. This is the intended calibrated
+communication--compute tradeoff rather than an A2A-only result. On held-out
+routes, 27 layers improve, 19 retain the generic winner exactly, and 2 show
+small per-layer regressions; the aggregate held-out result improves.
+
 ## Repair
 
 The canonical planner now keeps the paper path and broadens candidate
@@ -121,15 +169,16 @@ generation without changing final selection:
    branches for every configured restart;
 2. make generic placement restarts independent of deduplicated logical
    replica-allocation candidates;
-3. automatically include structured-overlap proposals when the four-node,
-   two-copy compatibility checks succeed;
+3. include topology-general community placement and block-mapping proposals
+   by default, with bounded search and generic fallback;
 4. in the calibrated paper branch, retain both the mapping carried by movable
    copies and a fresh demand-ordered mapping under every new layout;
 5. in the normalized compatibility branch, start from a fresh mapping and
    evaluate fixed normalized communication--compute tradeoffs using the
    historical deterministic pair-refinement order; and
 6. propagate each branch's exact-cost best-so-far mapping into its next
-   alternation round.
+   alternation round; and
+7. retain `structured_degree2` only as an explicit legacy diagnostic.
 
 Every complete candidate is still selected using exact replay of the profiled
 token routes. The historical token-KMeans hyperedge planner remains opt-in and
@@ -137,13 +186,14 @@ is not part of the canonical path.
 
 ## Verification
 
-- EP32 full-layer replay selects the structured proposal in all 48 layers and
-  matches the paper-era structured report in every per-layer cost.
+- EP32 full-layer replay selects the topology-general community proposal in
+  all 48 layers and matches the paper-era structured result to 0.001945 ms.
 - EP64 full-layer replay has zero per-layer metric or winner-restart
-  differences from the paper-era recursive report.
+  differences from the paper-era recursive report when community proposals
+  are disabled; enabling them reduces aggregate held-out joint cost by 3.75%.
 - Focused assertions cover normalized partition retention, normalized mapping
-  communication--compute tradeoffs, structured node capacity, and copy
-  separation.
+  communication--compute tradeoffs, 4- and 8-node community placement,
+  partial replica budgets, bounded source-row search, and copy separation.
 - All changed Python files pass bytecode compilation and `git diff --check`.
 
 The validation image does not include `pytest`, so the focused assertions were
@@ -162,3 +212,5 @@ artifacts. The principal report names are:
 - `diagnostic_ep64_tulu16_repaired_incumbent_l7_20260802_report.json`
 - `diagnostic_ep64_tulu16_repaired_branches_l7_20260802_report.json`
 - `diagnostic_ep64_tulu16_repaired_compat_full_20260802_report.json`
+- `diagnostic_ep32_community_block_full_20260802_report.json`
+- `diagnostic_ep64_community_block_full_20260802_report.json`
