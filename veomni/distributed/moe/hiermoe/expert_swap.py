@@ -62,7 +62,8 @@ from .forward_cover_planner import (
 from .greedy_planner import GreedyCommunicationPlanner, assign_tokens_to_copies_greedy
 from .online_lut_planner import propose_online_lut_move
 from .perf_model import HierMoEPerfModel
-from .placemoe.artifacts import validate_placemoe_artifact
+from .placemoe.artifacts import build_placemoe_artifact, validate_placemoe_artifact
+from .placemoe.types import LayerPlan, PlaceMoETopology
 from .planner import (
     CurrentRoutePlanner,
     PlacementAction,
@@ -97,6 +98,17 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
     except ValueError:
         logger.warning("Invalid %s=%r; using default %s.", name, raw, default)
         return default
+
+
+def _env_optional_nonnegative_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; ignoring the override.", name, raw)
+        return None
 
 
 def _env_candidate_shards(name: str) -> int:
@@ -220,6 +232,32 @@ _PERIODIC_FULL_REPLAN_TRAIN_CPU_IDS = os.environ.get(
     "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_TRAIN_CPU_IDS",
     "",
 ).strip()
+_PERIODIC_LAYOUT_REFRESH_INTERVAL = _env_optional_nonnegative_int("VEOMNI_HIERMOE_LAYOUT_REFRESH_INTERVAL")
+_PERIODIC_MAPPING_REFRESH_INTERVAL = _env_optional_nonnegative_int("VEOMNI_HIERMOE_MAPPING_REFRESH_INTERVAL")
+_PERIODIC_REPLAN_INTER_MS_PER_BYTE = _env_float(
+    "VEOMNI_HIERMOE_PLACEMOE_INTER_MS_PER_BYTE",
+    6.765449326279194e-08,
+)
+_PERIODIC_REPLAN_INTRA_MS_PER_BYTE = _env_float(
+    "VEOMNI_HIERMOE_PLACEMOE_INTRA_MS_PER_BYTE",
+    5.02482606728045e-09,
+)
+_PERIODIC_REPLAN_ROUTE_MS_PER_ASSIGNMENT = _env_float(
+    "VEOMNI_HIERMOE_PLACEMOE_ROUTE_MS_PER_ASSIGNMENT",
+    8.746548178958447e-05,
+)
+_PERIODIC_REPLAN_COMMUNICATION_MULTIPLIER = _env_float(
+    "VEOMNI_HIERMOE_PLACEMOE_COMMUNICATION_MULTIPLIER",
+    3.1,
+)
+_PERIODIC_REPLAN_COMPUTE_MS_PER_ASSIGNMENT = _env_float(
+    "VEOMNI_HIERMOE_PLACEMOE_COMPUTE_MS_PER_ASSIGNMENT",
+    2.82807e-05,
+)
+_PERIODIC_REPLAN_COMPUTE_MULTIPLIER = _env_float(
+    "VEOMNI_HIERMOE_PLACEMOE_COMPUTE_MULTIPLIER",
+    4.19,
+)
 
 
 def _expert_swap_diag_phase(phase: str) -> None:
@@ -230,6 +268,8 @@ def _expert_swap_diag_phase(phase: str) -> None:
         f"HIERMOE_EXPERT_SWAP_DIAG rank={rank} phase={phase} monotonic={time.monotonic():.6f}",
         flush=True,
     )
+
+
 _ONLINE_FREEZE_COST_MODE = os.environ.get("VEOMNI_HIERMOE_ONLINE_FREEZE_COST_MODE", "off").strip().lower()
 _ONLINE_FREEZE_CALIBRATION_STEP = _env_int(
     "VEOMNI_HIERMOE_ONLINE_FREEZE_CALIBRATION_STEP",
@@ -313,17 +353,13 @@ _FORWARD_REUSE_COVER_CONFIRM_SAMPLES = _env_int(
     1,
     minimum=1,
 )
-_FORWARD_REUSE_COVER_AGGREGATE_SERVICE_GROUP = _env_flag(
-    "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_AGGREGATE_SERVICE_GROUP"
-)
+_FORWARD_REUSE_COVER_AGGREGATE_SERVICE_GROUP = _env_flag("VEOMNI_HIERMOE_FORWARD_REUSE_COVER_AGGREGATE_SERVICE_GROUP")
 _FORWARD_REUSE_COVER_PROPOSAL_TOPK = _env_int(
     "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_PROPOSAL_TOPK",
     1,
     minimum=1,
 )
-_FORWARD_REUSE_COVER_EMPTY_SEEDING = _env_flag(
-    "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_EMPTY_SEEDING"
-)
+_FORWARD_REUSE_COVER_EMPTY_SEEDING = _env_flag("VEOMNI_HIERMOE_FORWARD_REUSE_COVER_EMPTY_SEEDING")
 
 
 def _full_timing_range(section: str):
@@ -765,6 +801,7 @@ class _CPUBatchedPlanState:
 
 @dataclass
 class _PeriodicFullReplanState:
+    update_mode: str
     source_step: int
     placement_versions: tuple[int, ...]
     submitted_at: float
@@ -3063,8 +3100,20 @@ class ExpertSwapManager:
         self._forward_reuse_cover_empty_seeding = _FORWARD_REUSE_COVER_EMPTY_SEEDING
         self._forward_reuse_cover_pending: dict[str, tuple[PlacementAction, int]] = {}
         self._periodic_full_replan = _PERIODIC_FULL_REPLAN
+        self._periodic_layout_refresh_interval = (
+            self.expert_swap_interval
+            if _PERIODIC_LAYOUT_REFRESH_INTERVAL is None
+            else _PERIODIC_LAYOUT_REFRESH_INTERVAL
+        )
+        self._periodic_mapping_refresh_interval = (
+            0 if _PERIODIC_MAPPING_REFRESH_INTERVAL is None else _PERIODIC_MAPPING_REFRESH_INTERVAL
+        )
         self._periodic_full_replan_state: _PeriodicFullReplanState | None = None
+        self._periodic_pending_layout = False
+        self._periodic_pending_mapping = False
         self._periodic_full_replan_updates = 0
+        self._periodic_layout_updates = 0
+        self._periodic_mapping_updates = 0
         self._periodic_full_replan_last_source_step = -1
         self._periodic_full_replan_last_apply_step = -1
         self._periodic_full_replan_last_staleness_steps = -1
@@ -3241,18 +3290,13 @@ class ExpertSwapManager:
             layer = str(raw_layer)
             if not isinstance(raw_layer_payload, dict):
                 raise ValueError(f"HierMoE ablation layer {layer!r} is not a mapping.")
-            expected_layouts[layer] = tuple(
-                int(value) for value in raw_layer_payload["slot_to_logical"]
-            )
+            expected_layouts[layer] = tuple(int(value) for value in raw_layer_payload["slot_to_logical"])
             raw_owners = raw_layer_payload.get("owner_slots")
             if raw_owners is not None:
                 expected_owner_slots[layer] = tuple(int(value) for value in raw_owners)
             raw_source_lut = raw_layer_payload.get("source_logical_to_physical")
             if raw_source_lut is not None:
-                expected_source_luts[layer] = tuple(
-                    tuple(int(value) for value in row)
-                    for row in raw_source_lut
-                )
+                expected_source_luts[layer] = tuple(tuple(int(value) for value in row) for row in raw_source_lut)
         self._ablation_expected_layouts = expected_layouts
         self._ablation_expected_owner_slots = expected_owner_slots
         self._ablation_expected_source_luts = expected_source_luts
@@ -3290,9 +3334,7 @@ class ExpertSwapManager:
             for replay_key, value in values.items():
                 model_key = key_mapping[replay_key]
                 if model_key in remapped:
-                    raise RuntimeError(
-                        f"Multiple HierMoE replay layers resolve to model layer {model_key!r}."
-                    )
+                    raise RuntimeError(f"Multiple HierMoE replay layers resolve to model layer {model_key!r}.")
                 remapped[model_key] = value
             return remapped
 
@@ -3300,8 +3342,7 @@ class ExpertSwapManager:
         self._ablation_expected_owner_slots = remap_values(self._ablation_expected_owner_slots)
         self._ablation_expected_source_luts = remap_values(self._ablation_expected_source_luts)
         self._ablation_actions_by_step = {
-            step: remap_values(layers_by_step)
-            for step, layers_by_step in self._ablation_actions_by_step.items()
+            step: remap_values(layers_by_step) for step, layers_by_step in self._ablation_actions_by_step.items()
         }
 
     @staticmethod
@@ -3401,16 +3442,13 @@ class ExpertSwapManager:
             if expected_owners is not None:
                 actual_owners = tuple(int(value) for value in layer.logical_to_physical.tolist())
                 if actual_owners != expected_owners:
-                    raise RuntimeError(
-                        f"HierMoE ablation owner mapping does not match replay output for {layer_key}."
-                    )
+                    raise RuntimeError(f"HierMoE ablation owner mapping does not match replay output for {layer_key}.")
             expected_source_lut = self._ablation_expected_source_luts.get(layer_key)
             if expected_source_lut is not None:
                 if layer.source_logical_to_physical is None:
                     raise RuntimeError(f"HierMoE ablation source route LUT is missing for {layer_key}.")
                 actual_source_lut = tuple(
-                    tuple(int(value) for value in row)
-                    for row in layer.source_logical_to_physical.tolist()
+                    tuple(int(value) for value in row) for row in layer.source_logical_to_physical.tolist()
                 )
                 if actual_source_lut != expected_source_lut:
                     raise RuntimeError(
@@ -3433,16 +3471,12 @@ class ExpertSwapManager:
                     f"{tuple(source_lut.shape)}, expected {expected_shape}."
                 )
             if bool(((source_lut < 0) | (source_lut >= layer.num_physical_slots)).any().item()):
-                raise RuntimeError(
-                    f"HierMoE ablation source route LUT references an invalid slot for {layer_key}."
-                )
+                raise RuntimeError(f"HierMoE ablation source route LUT references an invalid slot for {layer_key}.")
             layout = self._layer_layout(layer)
             logical = torch.arange(layer.num_experts, dtype=torch.long).view(1, -1)
             routed_logical = layout.index_select(0, source_lut.reshape(-1)).view_as(source_lut)
             if not torch.equal(routed_logical, logical.expand_as(routed_logical)):
-                raise RuntimeError(
-                    f"HierMoE ablation source route LUT references the wrong expert for {layer_key}."
-                )
+                raise RuntimeError(f"HierMoE ablation source route LUT references the wrong expert for {layer_key}.")
             layer.source_logical_to_physical = source_lut
             layer._device_source_mapping_cache.clear()
 
@@ -3487,7 +3521,9 @@ class ExpertSwapManager:
                     self.ep_size,
                 )
                 if not torch.equal(self._layer_layout(layer), expected):
-                    raise RuntimeError(f"Canonical-empty static replay has a non-canonical initial {layer.key} layout.")
+                    raise RuntimeError(
+                        f"Canonical-empty static replay has a non-canonical initial {layer.key} layout."
+                    )
         elif not _FIXED_R2_LAYOUT:
             raise RuntimeError("Static HierMoE ablation replay requires VEOMNI_HIERMOE_FIXED_R2_LAYOUT=1.")
         # A static replay already knows the final layout before training
@@ -3499,9 +3535,7 @@ class ExpertSwapManager:
         # materialize that layer with one sparse transfer plan.  The final
         # owner/source-LUT metadata is installed below, so static replay does
         # not need the online Cover path's incremental LUT patches.
-        specs_by_layer: dict[str, list[tuple[str, str]]] = {
-            layer_key: [] for layer_key in self.layers
-        }
+        specs_by_layer: dict[str, list[tuple[str, str]]] = {layer_key: [] for layer_key in self.layers}
         for step in sorted(self._ablation_actions_by_step):
             by_layer = self._ablation_actions_by_step[step]
             unexpected = set(by_layer) - set(self.layers)
@@ -3650,13 +3684,15 @@ class ExpertSwapManager:
             "hiermoe/online_lut_start_step": self._online_lut_start_step,
             "hiermoe/online_lut_min_gain": self._online_lut_min_gain,
             "hiermoe/periodic_full_replan": int(self._periodic_full_replan),
+            "hiermoe/periodic_layout_refresh_interval": self._periodic_layout_refresh_interval,
+            "hiermoe/periodic_mapping_refresh_interval": self._periodic_mapping_refresh_interval,
             "hiermoe/periodic_full_replan_running": int(self._periodic_full_replan_state is not None),
             "hiermoe/periodic_full_replan_updates": self._periodic_full_replan_updates,
+            "hiermoe/periodic_layout_updates": self._periodic_layout_updates,
+            "hiermoe/periodic_mapping_updates": self._periodic_mapping_updates,
             "hiermoe/periodic_full_replan_last_source_step": self._periodic_full_replan_last_source_step,
             "hiermoe/periodic_full_replan_last_apply_step": self._periodic_full_replan_last_apply_step,
-            "hiermoe/periodic_full_replan_last_staleness_steps": (
-                self._periodic_full_replan_last_staleness_steps
-            ),
+            "hiermoe/periodic_full_replan_last_staleness_steps": (self._periodic_full_replan_last_staleness_steps),
             "hiermoe/periodic_full_replan_last_snapshot_ms": self._periodic_full_replan_last_snapshot_ms,
             "hiermoe/periodic_full_replan_last_planner_ms": self._periodic_full_replan_last_planner_ms,
             "hiermoe/periodic_full_replan_last_migration_ms": self._periodic_full_replan_last_migration_ms,
@@ -5405,6 +5441,7 @@ class ExpertSwapManager:
                 periodic_state.process.wait()
             self._periodic_full_replan_event(
                 "terminated_on_shutdown",
+                update_mode=periodic_state.update_mode,
                 source_step=periodic_state.source_step,
             )
         self._periodic_full_replan_state = None
@@ -5765,19 +5802,14 @@ class ExpertSwapManager:
             is_identity=bool(is_identity),
         )
         if self._forward_reuse_cover_patch_remap and slot_layout_enabled:
-            if (
-                previous_source_lut is not None
-                and tuple(previous_source_lut.shape) == (self.ep_size, num_experts)
-            ):
+            if previous_source_lut is not None and tuple(previous_source_lut.shape) == (self.ep_size, num_experts):
                 registered_layer.source_logical_to_physical = previous_source_lut.detach().cpu().clone()
             else:
                 # The initial no-replica layout routes every source rank to
                 # the canonical owner.  Seed the LUT before the first empty
                 # Cover so its winner can be patched without rebuilding any
                 # token routes or requiring a preinstalled R2 layout.
-                registered_layer.source_logical_to_physical = (
-                    mapping.view(1, -1).expand(self.ep_size, -1).clone()
-                )
+                registered_layer.source_logical_to_physical = mapping.view(1, -1).expand(self.ep_size, -1).clone()
         self.layers[key] = registered_layer
         self.module_id_to_key[id(module)] = key
         self.param_id_to_key[id(gate_up_proj)] = key
@@ -6156,8 +6188,7 @@ class ExpertSwapManager:
             self._cost_model_verify
             and int(self._online_freeze_calibration_step)
             <= int(step)
-            <= int(self._online_freeze_calibration_step)
-            + int(self._cost_model_validation_steps)
+            <= int(self._online_freeze_calibration_step) + int(self._cost_model_validation_steps)
         ) or (self._online_freeze_cost_mode != "off" and int(step) == int(self._online_freeze_calibration_step))
         if capture_cost_model_sample:
             physical_routes = layer.latest_physical_routes
@@ -6939,6 +6970,7 @@ class ExpertSwapManager:
             )
             for peer_rank, (numel, dtype, device) in recv_specs.items()
         }
+
         def _run_peer(peer_rank: int) -> None:
             peer_global_rank = _ep_global_rank(process_group, peer_rank)
             ops: list[dist.P2POp] = []
@@ -6999,15 +7031,10 @@ class ExpertSwapManager:
             return {}
 
         split_sizes = [
-            0 if rank not in send_buffers else int(send_buffers[rank].numel())
-            for rank in range(int(self.ep_size))
+            0 if rank not in send_buffers else int(send_buffers[rank].numel()) for rank in range(int(self.ep_size))
         ]
         parts = [send_buffers[rank] for rank in range(int(self.ep_size)) if split_sizes[rank] > 0]
-        send_buffer = (
-            torch.cat(parts, dim=0)
-            if parts
-            else torch.empty((0,), dtype=dtype, device=device)
-        )
+        send_buffer = torch.cat(parts, dim=0) if parts else torch.empty((0,), dtype=dtype, device=device)
         recv_buffer = torch.empty_like(send_buffer)
         dist.all_to_all_single(
             recv_buffer,
@@ -7972,10 +7999,7 @@ class ExpertSwapManager:
         if actual_raw_a2a and "network_joint" in self._cost_model_verify_feature_coefficients:
             target_rows["network_joint"] = (
                 joint_model_rows,
-                [
-                    raw_a2a + compute
-                    for raw_a2a, compute in zip(actual_raw_a2a, actual_compute, strict=True)
-                ],
+                [raw_a2a + compute for raw_a2a, compute in zip(actual_raw_a2a, actual_compute, strict=True)],
             )
         for target_name, (rows_by_model, targets) in target_rows.items():
             target_report: dict[str, Any] = {}
@@ -8033,39 +8057,25 @@ class ExpertSwapManager:
             "elapsed_ms": (time.perf_counter() - started) * 1000.0,
         }
         if _EXPORT_COST_MODEL_SAMPLES:
-            paired_assignments = [
-                float(value) for value in observations["paired_assignments"]
-            ]
-            paired_compute = [
-                float(value) for value in observations["paired_compute_ms"]
-            ]
+            paired_assignments = [float(value) for value in observations["paired_assignments"]]
+            paired_compute = [float(value) for value in observations["paired_compute_ms"]]
             sample_model = "stage_payload_inter_intra"
             report["sample_data"] = {
                 "feature_values": {
-                    **{
-                        name: [float(value) for value in values]
-                        for name, values in traffic_features.items()
-                    },
-                    "peak_assignments": [
-                        float(value) for value in peak_assignments
-                    ],
+                    **{name: [float(value) for value in values] for name, values in traffic_features.items()},
+                    "peak_assignments": [float(value) for value in peak_assignments],
                 },
                 "compute": {
                     "assignments": paired_assignments,
                     "measured_ms": paired_compute,
-                    "predicted_ms": [
-                        compute_slope * value + compute_constant
-                        for value in paired_assignments
-                    ],
+                    "predicted_ms": [compute_slope * value + compute_constant for value in paired_assignments],
                 },
                 "communication_region": {
                     "feature_model": sample_model,
                     "measured_ms": [float(value) for value in actual_communication],
                     "predicted_ms": self._predict_linear_model(
                         model_rows[sample_model],
-                        *self._cost_model_verify_feature_coefficients[
-                            "communication"
-                        ][sample_model],
+                        *self._cost_model_verify_feature_coefficients["communication"][sample_model],
                     ),
                 },
                 "joint_moe_region": {
@@ -8073,16 +8083,11 @@ class ExpertSwapManager:
                     "measured_ms": [float(value) for value in actual_joint],
                     "predicted_ms": self._predict_linear_model(
                         joint_model_rows[sample_model],
-                        *self._cost_model_verify_feature_coefficients[
-                            "joint"
-                        ][sample_model],
+                        *self._cost_model_verify_feature_coefficients["joint"][sample_model],
                     ),
                 },
             }
-            if (
-                actual_raw_a2a
-                and "network_joint" in self._cost_model_verify_feature_coefficients
-            ):
+            if actual_raw_a2a and "network_joint" in self._cost_model_verify_feature_coefficients:
                 report["sample_data"]["network_joint"] = {
                     "feature_model": sample_model,
                     "measured_ms": [
@@ -8095,9 +8100,7 @@ class ExpertSwapManager:
                     ],
                     "predicted_ms": self._predict_linear_model(
                         joint_model_rows[sample_model],
-                        *self._cost_model_verify_feature_coefficients[
-                            "network_joint"
-                        ][sample_model],
+                        *self._cost_model_verify_feature_coefficients["network_joint"][sample_model],
                     ),
                 }
         if actual_raw_a2a:
@@ -9655,14 +9658,7 @@ class ExpertSwapManager:
                 for rank in range(self.ep_size)
                 if (
                     self._forward_reuse_cover_empty_seeding
-                    and bool(
-                        (
-                            layout[
-                                rank * layer.num_local_experts : (rank + 1) * layer.num_local_experts
-                            ]
-                            < 0
-                        ).any()
-                    )
+                    and bool((layout[rank * layer.num_local_experts : (rank + 1) * layer.num_local_experts] < 0).any())
                 )
                 or any(
                     int(layout[slot].item()) >= 0 and int(copy_counts[int(layout[slot].item())].item()) > 1
@@ -9701,12 +9697,10 @@ class ExpertSwapManager:
                 if layer.latest_selected_experts is not None
             }
             entry_weights = [
-                self._forward_cover_level_weights(layer)
-                for _layer_index, layer, _owner_rank in aggregate_entries
+                self._forward_cover_level_weights(layer) for _layer_index, layer, _owner_rank in aggregate_entries
             ]
-            can_batch_service_statistics = (
-                len(entry_shapes) == 1
-                and all(weights == entry_weights[0] for weights in entry_weights[1:])
+            can_batch_service_statistics = len(entry_shapes) == 1 and all(
+                weights == entry_weights[0] for weights in entry_weights[1:]
             )
             if can_batch_service_statistics:
                 selected_batch = torch.stack(
@@ -9790,9 +9784,7 @@ class ExpertSwapManager:
             if self.ep_group is not None and self.ep_size > 1:
                 dist.all_reduce(aggregate_rows, op=dist.ReduceOp.SUM, group=self.ep_group)
             synchronize()
-            service_statistics_collective_ms = (
-                time.perf_counter() - service_statistics_collective_started
-            ) * 1000.0
+            service_statistics_collective_ms = (time.perf_counter() - service_statistics_collective_started) * 1000.0
 
         owned_layers = 0
         ready_owned_layers = 0
@@ -10282,9 +10274,7 @@ class ExpertSwapManager:
         compute_gain_rows = baseline_compute - candidate_compute
         assignment_gain_rows = baseline_peak_assignments - candidate_peak_assignments
         global_gain_rows = communication_gain_rows + compute_gain_rows
-        accepted_mask = (
-            torch.isfinite(global_gain_rows) & (global_gain_rows > self._forward_reuse_cover_min_gain)
-        )
+        accepted_mask = torch.isfinite(global_gain_rows) & (global_gain_rows > self._forward_reuse_cover_min_gain)
         validation_summary = (
             torch.stack(
                 (
@@ -10298,8 +10288,7 @@ class ExpertSwapManager:
                     candidate_peak_assignments,
                 ),
                 dim=1,
-            )
-            [: len(proposals)]
+            )[: len(proposals)]
             .detach()
             .to(device="cpu")
         )
@@ -10316,9 +10305,7 @@ class ExpertSwapManager:
         assignment_delta = 0.0
         for layer_index, candidates in proposal_groups.items():
             accepted_candidates = [
-                (proposed, summary)
-                for proposed, summary in candidates
-                if int(summary[0].item()) > 0
+                (proposed, summary) for proposed, summary in candidates if int(summary[0].item()) > 0
             ]
             if not accepted_candidates:
                 if layer_index in pending_layer_indices:
@@ -10545,6 +10532,34 @@ class ExpertSwapManager:
         repository_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
         return os.path.join(repository_root, "scripts", "profile", "plan_placemoe.py")
 
+    def _write_periodic_current_layout(
+        self,
+        layers: Sequence[ExpertLayerState],
+        path: str,
+    ) -> None:
+        plans: dict[str, LayerPlan] = {}
+        for layer in layers:
+            if layer.source_logical_to_physical is None:
+                raise RuntimeError(f"Periodic mapping refresh requires a source LUT for {layer.key}.")
+            plans[layer.key] = LayerPlan(
+                slot_to_logical=self._layer_layout(layer).tolist(),
+                owner_slots=layer.logical_to_physical.detach().cpu().tolist(),
+                source_logical_to_physical=layer.source_logical_to_physical.detach().cpu().tolist(),
+            )
+        payload = build_placemoe_artifact(
+            plans,
+            PlaceMoETopology(
+                ep_size=self.ep_size,
+                ranks_per_node=min(self.ep_size, self.hierarchy.local_world_size),
+                num_experts=layers[0].num_experts,
+                slots_per_rank=layers[0].num_local_experts,
+            ),
+            source={"algorithm": "placemoe-v1", "update_mode": "mapping"},
+        )
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+
     @torch.no_grad()
     def _capture_periodic_full_routes(self, placement_step: int, training_step: int, job_dir: str) -> float:
         layers = [self.layers[layer_key] for layer_key in sorted(self.layers)]
@@ -10619,14 +10634,18 @@ class ExpertSwapManager:
         *,
         placement_step: int,
         training_step: int,
+        update_mode: str,
     ) -> None:
+        if update_mode not in {"full", "mapping"}:
+            raise ValueError(f"Unsupported periodic PlaceMoE update mode {update_mode!r}.")
         layers = [self.layers[layer_key] for layer_key in sorted(self.layers)]
         job_dir = os.path.join(
             os.path.abspath(_PERIODIC_FULL_REPLAN_WORK_ROOT),
-            f"source_step_{int(training_step):06d}",
+            f"source_step_{int(training_step):06d}_{update_mode}",
         )
         snapshot_ms = self._capture_periodic_full_routes(placement_step, training_step, job_dir)
         layout_path = os.path.join(job_dir, "layout.json")
+        input_layout_path = os.path.join(job_dir, "current_layout.json")
         report_path = os.path.join(job_dir, "report.json")
         planner_log_path = os.path.join(job_dir, "planner.log")
         submitted_at = time.perf_counter()
@@ -10637,6 +10656,8 @@ class ExpertSwapManager:
                 raise RuntimeError(f"Periodic full-replan builder does not exist: {builder}.")
             primary_slots = layers[0].num_experts // self.ep_size
             redundant_slots = layers[0].num_local_experts - primary_slots
+            if update_mode == "mapping":
+                self._write_periodic_current_layout(layers, input_layout_path)
             command = [
                 sys.executable,
                 builder,
@@ -10646,6 +10667,8 @@ class ExpertSwapManager:
                 "0",
                 "--validation-steps",
                 "0",
+                "--update-mode",
+                update_mode,
                 "--layers",
                 str(len(layers)),
                 "--layer-keys",
@@ -10676,6 +10699,18 @@ class ExpertSwapManager:
                 str(layers[0].latest_hidden_size),
                 "--bytes-per-element",
                 str(layers[0].latest_bytes_per_element),
+                "--inter-ms-per-byte",
+                str(_PERIODIC_REPLAN_INTER_MS_PER_BYTE),
+                "--intra-ms-per-byte",
+                str(_PERIODIC_REPLAN_INTRA_MS_PER_BYTE),
+                "--route-ms-per-assignment",
+                str(_PERIODIC_REPLAN_ROUTE_MS_PER_ASSIGNMENT),
+                "--communication-phase-multiplier",
+                str(_PERIODIC_REPLAN_COMMUNICATION_MULTIPLIER),
+                "--compute-ms-per-assignment",
+                str(_PERIODIC_REPLAN_COMPUTE_MS_PER_ASSIGNMENT),
+                "--compute-phase-multiplier",
+                str(_PERIODIC_REPLAN_COMPUTE_MULTIPLIER),
                 "--comparison-layout",
                 "none",
                 "--output-layout",
@@ -10683,6 +10718,8 @@ class ExpertSwapManager:
                 "--output-report",
                 report_path,
             ]
+            if update_mode == "mapping":
+                command.extend(("--input-layout", input_layout_path))
             if _PERIODIC_FULL_REPLAN_CPU_IDS:
                 planner_cpu_ids = self._parse_cpu_ids(_PERIODIC_FULL_REPLAN_CPU_IDS)
                 if not planner_cpu_ids:
@@ -10702,6 +10739,7 @@ class ExpertSwapManager:
             with open(planner_log_path, "wb") as planner_log:
                 process = subprocess.Popen(command, stdout=planner_log, stderr=subprocess.STDOUT, env=environment)
         self._periodic_full_replan_state = _PeriodicFullReplanState(
+            update_mode=update_mode,
             source_step=int(training_step),
             placement_versions=tuple(int(layer.placement_version) for layer in layers),
             submitted_at=submitted_at,
@@ -10716,6 +10754,7 @@ class ExpertSwapManager:
         self._periodic_full_replan_last_snapshot_ms = snapshot_ms
         self._periodic_full_replan_event(
             "submitted",
+            update_mode=update_mode,
             source_step=int(training_step),
             snapshot_ms=snapshot_ms,
             job_dir=job_dir,
@@ -10777,10 +10816,14 @@ class ExpertSwapManager:
         )
         if owners is None:
             raise RuntimeError(f"Periodic full layout for {layer.key} has no owner mapping.")
-        source_lut = torch.as_tensor(
-            raw_layer.get("source_logical_to_physical", ()),
-            dtype=torch.long,
-        ).detach().cpu()
+        source_lut = (
+            torch.as_tensor(
+                raw_layer.get("source_logical_to_physical", ()),
+                dtype=torch.long,
+            )
+            .detach()
+            .cpu()
+        )
         expected_lut_shape = (self.ep_size, layer.num_experts)
         if tuple(source_lut.shape) != expected_lut_shape:
             raise RuntimeError(
@@ -10790,7 +10833,9 @@ class ExpertSwapManager:
         if bool(((source_lut < 0) | (source_lut >= layer.num_physical_slots)).any().item()):
             raise RuntimeError(f"Periodic full layout source LUT for {layer.key} references an invalid slot.")
         logical = torch.arange(layer.num_experts, dtype=torch.long).view(1, -1)
-        if not torch.equal(target.index_select(0, source_lut.reshape(-1)).view_as(source_lut), logical.expand_as(source_lut)):
+        if not torch.equal(
+            target.index_select(0, source_lut.reshape(-1)).view_as(source_lut), logical.expand_as(source_lut)
+        ):
             raise RuntimeError(f"Periodic full layout source LUT for {layer.key} references the wrong expert.")
 
         current = self._layer_layout(layer)
@@ -10861,6 +10906,61 @@ class ExpertSwapManager:
         return len(changed_slots)
 
     @torch.no_grad()
+    def _install_periodic_mapping(
+        self,
+        layer: ExpertLayerState,
+        raw_layer: dict[str, Any],
+    ) -> int:
+        target, owners = self._validate_placement_layout(
+            layer,
+            raw_layer.get("slot_to_logical", ()),
+            raw_layer.get("owner_slots"),
+        )
+        current = self._layer_layout(layer)
+        if (
+            owners is None
+            or not torch.equal(target, current)
+            or not torch.equal(
+                owners,
+                layer.logical_to_physical.detach().cpu(),
+            )
+        ):
+            raise RuntimeError(f"Periodic mapping refresh attempted to change layout L for {layer.key}.")
+        source_lut = (
+            torch.as_tensor(
+                raw_layer.get("source_logical_to_physical", ()),
+                dtype=torch.long,
+            )
+            .detach()
+            .cpu()
+        )
+        expected_shape = (self.ep_size, layer.num_experts)
+        if tuple(source_lut.shape) != expected_shape:
+            raise RuntimeError(
+                f"Periodic mapping for {layer.key} has shape {tuple(source_lut.shape)}, expected {expected_shape}."
+            )
+        if bool(((source_lut < 0) | (source_lut >= layer.num_physical_slots)).any().item()):
+            raise RuntimeError(f"Periodic mapping for {layer.key} references an invalid slot.")
+        logical = torch.arange(layer.num_experts, dtype=torch.long).view(1, -1)
+        if not torch.equal(
+            current.index_select(0, source_lut.reshape(-1)).view_as(source_lut),
+            logical.expand_as(source_lut),
+        ):
+            raise RuntimeError(f"Periodic mapping for {layer.key} references the wrong expert.")
+        changed = layer.source_logical_to_physical is None or not torch.equal(
+            layer.source_logical_to_physical,
+            source_lut,
+        )
+        layer.pending_physical_routes = None
+        layer.pending_route_data_ptr = 0
+        layer.latest_physical_routes = None
+        layer.latest_forward_traffic_endpoint_statistics = None
+        layer.source_logical_to_physical = source_lut.clone()
+        layer._device_source_mapping_cache.clear()
+        layer.placement_version += int(changed)
+        return int(changed)
+
+    @torch.no_grad()
     def _apply_periodic_full_replan(self, state: _PeriodicFullReplanState, training_step: int) -> str:
         layers = [self.layers[layer_key] for layer_key in sorted(self.layers)]
         versions = tuple(int(layer.placement_version) for layer in layers)
@@ -10880,7 +10980,10 @@ class ExpertSwapManager:
             raw_layer = raw_layers[layer.key]
             if not isinstance(raw_layer, dict):
                 raise RuntimeError(f"Periodic full layout for {layer.key} is not a mapping.")
-            moved_slots += self._install_periodic_absolute_layer_layout(layer, raw_layer)
+            if state.update_mode == "full":
+                moved_slots += self._install_periodic_absolute_layer_layout(layer, raw_layer)
+            else:
+                self._install_periodic_mapping(layer, raw_layer)
         if self.ep_group is not None and self.ep_size > 1:
             dist.barrier(group=self.ep_group)
         migration_ms = (time.perf_counter() - migration_started) * 1000.0
@@ -10890,6 +10993,10 @@ class ExpertSwapManager:
                 report = json.load(handle)
             planner_ms = float(report.get("aggregate", {}).get("planner_wall_ms", planner_ms))
         self._periodic_full_replan_updates += 1
+        if state.update_mode == "full":
+            self._periodic_layout_updates += 1
+        else:
+            self._periodic_mapping_updates += 1
         self._periodic_full_replan_last_apply_step = int(training_step)
         self._periodic_full_replan_last_staleness_steps = int(training_step) - int(state.source_step)
         self._periodic_full_replan_last_planner_ms = planner_ms
@@ -10897,6 +11004,7 @@ class ExpertSwapManager:
         self._periodic_full_replan_last_moved_slots = moved_slots
         self._periodic_full_replan_event(
             "applied",
+            update_mode=state.update_mode,
             source_step=state.source_step,
             apply_step=int(training_step),
             staleness_steps=int(training_step) - int(state.source_step),
@@ -10905,21 +11013,38 @@ class ExpertSwapManager:
             migration_ms=migration_ms,
             moved_slots=moved_slots,
         )
-        return f"periodic_full_replan:{state.source_step}->{int(training_step)}:{moved_slots}"
+        return f"periodic_{state.update_mode}_replan:{state.source_step}->{int(training_step)}:{moved_slots}"
 
     @torch.no_grad()
     def _run_periodic_full_replan_step(self, placement_step: int) -> str:
         training_step = int(placement_step) + 1
+        within_update_window = 0 < training_step <= _PERIODIC_FULL_REPLAN_LAST_STEP
+        layout_due = bool(
+            within_update_window
+            and self._periodic_layout_refresh_interval > 0
+            and training_step % self._periodic_layout_refresh_interval == 0
+        )
+        mapping_due = bool(
+            within_update_window
+            and self._periodic_mapping_refresh_interval > 0
+            and training_step % self._periodic_mapping_refresh_interval == 0
+        )
+        if layout_due:
+            self._periodic_pending_layout = True
+            self._periodic_pending_mapping = False
+        elif mapping_due:
+            self._periodic_pending_mapping = True
         state = self._periodic_full_replan_state
         if state is not None:
             layers = [self.layers[layer_key] for layer_key in sorted(self.layers)]
             status = self._periodic_full_replan_status(state, self._pipeline_device(layers[0]))
             if status == 0:
-                self.latest_pair = "periodic_full_replan_running"
+                self.latest_pair = f"periodic_{state.update_mode}_replan_running"
                 return self.latest_pair
             if status == 2:
                 self._periodic_full_replan_event(
                     "failed",
+                    update_mode=state.update_mode,
                     source_step=state.source_step,
                     planner_log_path=state.planner_log_path,
                 )
@@ -10931,16 +11056,22 @@ class ExpertSwapManager:
             self._periodic_full_replan_state = None
             return self.latest_pair
 
-        if (
-            training_step <= 0
-            or self.expert_swap_interval <= 0
-            or training_step % self.expert_swap_interval != 0
-            or training_step > _PERIODIC_FULL_REPLAN_LAST_STEP
-        ):
+        if not self._periodic_pending_layout and not self._periodic_pending_mapping:
             self.latest_pair = "none"
             return self.latest_pair
-        self._launch_periodic_full_replan(placement_step=placement_step, training_step=training_step)
-        self.latest_pair = f"periodic_full_replan_submitted:{training_step}"
+        if self._periodic_pending_layout:
+            update_mode = "full"
+            self._periodic_pending_layout = False
+            self._periodic_pending_mapping = False
+        else:
+            update_mode = "mapping"
+            self._periodic_pending_mapping = False
+        self._launch_periodic_full_replan(
+            placement_step=placement_step,
+            training_step=training_step,
+            update_mode=update_mode,
+        )
+        self.latest_pair = f"periodic_{update_mode}_replan_submitted:{training_step}"
         return self.latest_pair
 
     @torch.no_grad()
@@ -10971,10 +11102,7 @@ class ExpertSwapManager:
         if self._forward_reuse_cover:
             if (
                 int(step) <= 0
-                or (
-                    self._forward_reuse_cover_only_step >= 0
-                    and int(step) != self._forward_reuse_cover_only_step
-                )
+                or (self._forward_reuse_cover_only_step >= 0 and int(step) != self._forward_reuse_cover_only_step)
                 or self.expert_swap_interval <= 0
                 or int(step) % self.expert_swap_interval != 0
             ):

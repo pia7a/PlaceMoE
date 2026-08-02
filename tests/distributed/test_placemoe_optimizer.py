@@ -35,6 +35,7 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     materialize_plan,
     mirrored_r2_plan,
     optimize_community_mapping,
+    optimize_fixed_layout_mapping,
     optimize_mapping,
     optimize_mapping_normalized,
     optimize_replica_allocation,
@@ -568,6 +569,42 @@ def test_optimizer_alternates_layout_and_mapping_with_exact_evaluation_callback(
     assert result.best.cost == min(candidate.cost for candidate in result.candidates)
     for candidate in result.candidates:
         candidate.plan.validate(topology, additional_copies=2)
+
+
+def test_fixed_layout_mapping_preserves_layout_and_keeps_exact_cost_incumbent():
+    topology = PlaceMoETopology(ep_size=2, ranks_per_node=1, num_experts=2, slots_per_rank=2)
+    statistics = ProfileStatistics(
+        demand=np.array([[8, 2], [2, 8]], dtype=np.float64),
+        affinity=np.zeros((2, 2, 2), dtype=np.float64),
+    )
+    current = LayerPlan(
+        slot_to_logical=[0, 1, 0, 1],
+        owner_slots=[0, 1],
+        source_logical_to_physical=[[2, 3], [0, 1]],
+    )
+
+    def evaluate(plan: LayerPlan) -> float:
+        destination_ranks = plan.source_logical_to_physical // topology.slots_per_rank
+        return float((destination_ranks != np.arange(topology.ep_size)[:, None]).sum())
+
+    result = optimize_fixed_layout_mapping(
+        statistics,
+        current,
+        OptimizerConfig(
+            topology=topology,
+            primary_slots_per_rank=1,
+            node_omega=1.0,
+            rank_omega=0.1,
+            gamma=1.0,
+            mapping_sweep_limit=2,
+        ),
+        evaluate,
+    )
+
+    assert result.best.cost <= evaluate(current)
+    np.testing.assert_array_equal(result.best.plan.slot_to_logical, current.slot_to_logical)
+    np.testing.assert_array_equal(result.best.plan.owner_slots, current.owner_slots)
+    result.best.plan.validate(topology, additional_copies=2)
 
 
 def test_mirrored_r2_seed_is_a_valid_default_order_plan():

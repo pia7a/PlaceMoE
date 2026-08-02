@@ -30,7 +30,13 @@ from .mapping import (
     validate_instance_mapping,
 )
 from .materialize import materialize_plan
-from .optimizer import OptimizationResult, OptimizerCandidate, OptimizerConfig, optimize_replica_allocation
+from .optimizer import (
+    OptimizationResult,
+    OptimizerCandidate,
+    OptimizerConfig,
+    optimize_fixed_layout_mapping,
+    optimize_replica_allocation,
+)
 from .partition import PartitionConfig, PartitionResult, map_groups_to_locations, partition_items, partition_objective
 from .placement import (
     PlacementConfig,
@@ -73,6 +79,7 @@ __all__ = [
     "mirrored_r2_plan",
     "mapping_rank_loads",
     "optimize_community_mapping",
+    "optimize_fixed_layout_mapping",
     "optimize_mapping",
     "optimize_mapping_normalized",
     "optimize_replica_allocation",

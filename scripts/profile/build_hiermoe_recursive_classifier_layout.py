@@ -50,6 +50,7 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     materialize_plan,
     mirrored_r2_plan,
     optimize_community_mapping,
+    optimize_fixed_layout_mapping,
     optimize_mapping,
     optimize_replica_allocation,
     partition_items,
@@ -59,6 +60,7 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     rank_placement_is_unique,
     repair_rank_placement,
     uniform_copy_statistics,
+    validate_placemoe_artifact,
 )
 
 
@@ -110,6 +112,18 @@ def _parse_str_list(value: str) -> tuple[str, ...]:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--route-root", type=Path, required=True)
+    parser.add_argument(
+        "--update-mode",
+        choices=("full", "mapping"),
+        default="full",
+        help="Optimize both L and M, or optimize only M under a fixed input layout.",
+    )
+    parser.add_argument(
+        "--input-layout",
+        type=Path,
+        default=None,
+        help="Current PlaceMoE artifact required by --update-mode mapping.",
+    )
     parser.add_argument("--optimize-steps", type=_parse_int_list, default=(1,))
     parser.add_argument("--validation-steps", type=_parse_int_list, default=(2,))
     parser.add_argument("--layer-start", type=int, default=0)
@@ -215,10 +229,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--include-community-block-candidates",
         action="store_true",
-        help=(
-            "Deprecated compatibility flag; topology-general affinity-community "
-            "proposals are enabled by default."
-        ),
+        help=("Deprecated compatibility flag; topology-general affinity-community proposals are enabled by default."),
     )
     parser.add_argument(
         "--disable-community-block-candidates",
@@ -1210,9 +1221,7 @@ def _build_placemoe_candidate(
                 mapping_sweep_limit=args.lut_iterations,
                 prefer_node_local=not communication_blind,
                 seed=seed,
-                normalized_mapping_weights=(
-                    () if calibrated_partition_refinement else (8.0, 32.0, 128.0)
-                ),
+                normalized_mapping_weights=(() if calibrated_partition_refinement else (8.0, 32.0, 128.0)),
                 calibrated_mapping_refinement=calibrated_partition_refinement,
                 carry_mapping_across_rounds=calibrated_partition_refinement,
                 calibrated_partition_refinement=calibrated_partition_refinement,
@@ -1463,7 +1472,109 @@ def _preloaded_replay_payload(
             "validation_steps": list(args.validation_steps),
             "layer_name_template": args.layer_name_template,
             "layer_keys": list(args.layer_keys),
+            "update_mode": getattr(args, "update_mode", "full"),
         },
+    )
+
+
+def _plan_fixed_mapping_layer(
+    layer: int,
+    *,
+    args: argparse.Namespace,
+    optimize_samples: list[list[torch.Tensor]],
+    validation_samples: list[list[torch.Tensor]],
+    source_demand: np.ndarray,
+    source_affinity: np.ndarray,
+    evaluator: _HybridEvaluator,
+    layer_started: float,
+) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
+    """Optimize the source mapping while preserving the input artifact's layout."""
+
+    layer_offset = layer - args.layer_start
+    layer_key = args.layer_keys[layer_offset] if args.layer_keys else args.layer_name_template.format(layer=layer)
+    current_plan = args.input_plans[layer_key]
+    topology = PlaceMoETopology(
+        ep_size=args.ep_size,
+        ranks_per_node=args.ranks_per_node,
+        num_experts=args.num_experts,
+        slots_per_rank=args.slots_per_rank,
+    )
+    node_omega, rank_omega, gamma = _partition_coefficients(args)
+    statistics = ProfileStatistics(demand=source_demand, affinity=source_affinity)
+    evaluated: dict[bytes, HybridCost] = {}
+
+    def evaluate(plan: LayerPlan) -> float:
+        key = plan.source_logical_to_physical.tobytes()
+        cost = evaluated.get(key)
+        if cost is None:
+            cost = evaluator.evaluate(optimize_samples, plan.source_logical_to_physical)
+            evaluated[key] = cost
+        return cost.total_ms
+
+    result = optimize_fixed_layout_mapping(
+        statistics,
+        current_plan,
+        OptimizerConfig(
+            topology=topology,
+            primary_slots_per_rank=args.primary_slots_per_rank,
+            node_omega=node_omega,
+            rank_omega=rank_omega,
+            gamma=gamma,
+            mapping_sweep_limit=args.lut_iterations,
+        ),
+        evaluate,
+    )
+    best = result.best
+    optimize_cost = evaluated[best.plan.source_logical_to_physical.tobytes()]
+    validation_cost = evaluator.evaluate(validation_samples, best.plan.source_logical_to_physical)
+    current_validation_cost = evaluator.evaluate(
+        validation_samples,
+        current_plan.source_logical_to_physical,
+    )
+    layer_ms = (time.perf_counter() - layer_started) * 1000.0
+    row: dict[str, object] = {
+        "layer": layer,
+        "strategy": "placemoe_fixed_layout_mapping",
+        "candidate_count": len(result.candidates),
+        "candidates": [
+            {
+                "strategy": (
+                    "current"
+                    if np.array_equal(
+                        candidate.plan.source_logical_to_physical,
+                        current_plan.source_logical_to_physical,
+                    )
+                    else "mapping_candidate"
+                ),
+                "mapping_sweeps": candidate.mapping_sweeps,
+                "mapping_changes": candidate.mapping_changes,
+                "optimize": asdict(evaluated[candidate.plan.source_logical_to_physical.tobytes()]),
+            }
+            for candidate in result.candidates
+        ],
+        "planner_ms": layer_ms,
+        "winner_planner_ms": layer_ms,
+        "exact_route_evaluations": len(evaluated),
+        "alternations": 0,
+        "mapping_sweeps": best.mapping_sweeps,
+        "mapping_changes": best.mapping_changes,
+        "copy_counts": [int(value) for value in best.plan.copy_counts[: args.num_experts].tolist()],
+        "optimize": asdict(optimize_cost),
+        "validation": asdict(validation_cost),
+        "comparison_validation": asdict(current_validation_cost),
+    }
+    print(
+        f"layer={layer:02d} strategy=placemoe_fixed_layout_mapping "
+        f"candidates={len(result.candidates)} optimize_ms={optimize_cost.total_ms:.3f} "
+        f"validation_ms={validation_cost.total_ms:.3f} planner_ms={layer_ms:.1f}",
+        flush=True,
+    )
+    return (
+        layer,
+        best.plan.slot_to_logical.copy(),
+        best.plan.owner_slots.copy(),
+        best.plan.source_logical_to_physical.copy(),
+        row,
     )
 
 
@@ -1498,6 +1609,17 @@ def _plan_layer(
         optimize_samples,
         num_experts=args.num_experts,
     )
+    if args.update_mode == "mapping":
+        return _plan_fixed_mapping_layer(
+            layer,
+            args=args,
+            optimize_samples=optimize_samples,
+            validation_samples=validation_samples,
+            source_demand=source_demand,
+            source_affinity=source_affinity,
+            evaluator=evaluator,
+            layer_started=layer_started,
+        )
     if args.communication_blind_proposals:
         source_affinity.fill(0.0)
     # These are exact identities, not approximations: source statistics retain
@@ -1553,12 +1675,7 @@ def _plan_layer(
                 # shared alternation state can silently remove the historical
                 # low-A2A candidate even when both refinements are invoked.
                 for proposal_restart in range(args.partition_restarts):
-                    proposal_seed = (
-                        args.seed
-                        + 100_003 * layer
-                        + 997 * proposal_restart
-                        + 31 * combination_index
-                    )
+                    proposal_seed = args.seed + 100_003 * layer + 997 * proposal_restart + 31 * combination_index
                     candidate_jobs.append(
                         {
                             "logical_instances": logical_instances,
@@ -1578,9 +1695,7 @@ def _plan_layer(
                             "calibrated_partition_refinement": False,
                         }
                     )
-            community_enabled = (
-                not args.disable_community_block_candidates or args.include_community_block_candidates
-            )
+            community_enabled = not args.disable_community_block_candidates or args.include_community_block_candidates
             if community_enabled and not args.communication_blind_proposals:
                 community_nodes = community_node_placements(
                     logical_instances,
@@ -1666,10 +1781,7 @@ def _plan_layer(
                     source_demand,
                     ranks_per_node=args.ranks_per_node,
                 )
-                if (
-                    args.include_legacy_structured_candidates
-                    and not args.disable_structured_overlap_candidates
-                )
+                if (args.include_legacy_structured_candidates and not args.disable_structured_overlap_candidates)
                 and not args.communication_blind_proposals
                 else []
             )
@@ -1845,6 +1957,44 @@ def main() -> None:
     if not args.layer_keys and "{layer}" not in args.layer_name_template:
         raise ValueError("--layer-name-template must contain the '{layer}' placeholder.")
     capacity = _validate_configuration(args)
+    if args.update_mode == "mapping":
+        if args.input_layout is None:
+            raise ValueError("--input-layout is required by --update-mode mapping.")
+        payload = json.loads(args.input_layout.read_text(encoding="utf-8"))
+        args.input_plans = validate_placemoe_artifact(payload)
+        topology = payload["topology"]
+        expected_topology = {
+            "ep_size": args.ep_size,
+            "ranks_per_node": args.ranks_per_node,
+            "num_experts": args.num_experts,
+            "slots_per_rank": args.slots_per_rank,
+        }
+        if any(int(topology[name]) != value for name, value in expected_topology.items()):
+            raise ValueError("Input layout topology does not match the requested planner topology.")
+        expected_keys = (
+            set(args.layer_keys)
+            if args.layer_keys
+            else {
+                args.layer_name_template.format(layer=layer)
+                for layer in range(args.layer_start, args.layer_start + args.layers)
+            }
+        )
+        if set(args.input_plans) != expected_keys:
+            raise ValueError("Input layout layer keys do not match the requested planner layers.")
+        active_copy_counts = {
+            int(plan.copy_counts[: args.num_experts].sum()) - args.num_experts for plan in args.input_plans.values()
+        }
+        if len(active_copy_counts) != 1:
+            raise ValueError("All input-layout layers must use the same replica budget.")
+        active_replicas = active_copy_counts.pop()
+        capacity = _CapacityPlan(
+            primary_slots_per_rank=capacity.primary_slots_per_rank,
+            reserved_replicas=capacity.reserved_replicas,
+            active_replicas=active_replicas,
+            empty_slots=capacity.reserved_replicas - active_replicas,
+        )
+    elif args.input_layout is not None:
+        raise ValueError("--input-layout is only valid with --update-mode mapping.")
     if args.workers <= 0 or args.candidate_workers <= 0 or args.worker_threads <= 0:
         raise ValueError("workers, candidate-workers, and worker-threads must be positive.")
     layer_ids = tuple(range(args.layer_start, args.layer_start + args.layers))
@@ -1863,7 +2013,9 @@ def main() -> None:
     rows = [item[4] for item in results]
 
     validation_total = sum(float(row["validation"]["total_ms"]) for row in rows)
-    if args.comparison_layout == "mirrored-r2":
+    if args.update_mode == "mapping":
+        comparison_ms = sum(float(row["comparison_validation"]["total_ms"]) for row in rows)
+    elif args.comparison_layout == "mirrored-r2":
         comparison_ms = sum(float(row["comparison_validation"]["total_ms"]) for row in rows)
     else:
         comparison_ms = float(args.comparison_validation_ms)
@@ -1873,7 +2025,7 @@ def main() -> None:
         "configuration": {
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items()
-            if key not in {"output_layout", "output_report"}
+            if key not in {"input_plans", "output_layout", "output_report"}
         },
         "layers": rows,
         "aggregate": {

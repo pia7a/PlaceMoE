@@ -38,7 +38,8 @@ export PAPER32_HIERMOE_LOG_INTERVAL=1
 export PAPER32_SKIP_PAPER_SUMMARY=1
 export PAPER32_SKIP_COMPLETED=0
 export PAPER32_PERIODIC_FULL_REPLAN_LAST_STEP=${last_trigger}
-export HIERMOE_SWAP_INTERVAL_OVERRIDE=${interval}
+export PAPER32_LAYOUT_REFRESH_INTERVAL=${interval}
+export PAPER32_MAPPING_REFRESH_INTERVAL=${interval}
 
 bash "${script_dir}/sync_hiermoe_paper32_source.sh"
 

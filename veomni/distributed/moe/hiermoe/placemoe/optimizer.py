@@ -279,3 +279,88 @@ def optimize_replica_allocation(
             previous_mapping,
         )
     return OptimizationResult(candidates=tuple(candidates))
+
+
+def optimize_fixed_layout_mapping(
+    statistics: ProfileStatistics,
+    current_plan: LayerPlan,
+    config: OptimizerConfig,
+    evaluate: Callable[[LayerPlan], float],
+) -> OptimizationResult:
+    """Optimize ``M`` while preserving every physical slot and runtime owner in ``L``."""
+
+    topology = config.topology
+    if statistics.ep_size != topology.ep_size or statistics.num_experts != topology.num_experts:
+        raise ValueError("Profile statistics do not match the optimizer topology.")
+    current_plan.validate(topology)
+    logical_instances = current_plan.slot_to_logical.copy()
+    instance_ranks = np.arange(topology.total_slots, dtype=np.int64) // topology.slots_per_rank
+    fresh_mapping = initialize_mapping(
+        logical_instances,
+        instance_ranks,
+        statistics.demand,
+        ranks_per_node=topology.ranks_per_node,
+        prefer_node_local=config.prefer_node_local,
+    )
+    seeds = (current_plan.source_logical_to_physical, fresh_mapping)
+    candidates: list[OptimizerCandidate] = []
+    seen_mappings: set[bytes] = set()
+    for initial_mapping in seeds:
+        initial_key = initial_mapping.tobytes()
+        if initial_key in seen_mappings:
+            continue
+        seen_mappings.add(initial_key)
+        initial_plan = LayerPlan(
+            slot_to_logical=logical_instances,
+            owner_slots=current_plan.owner_slots,
+            source_logical_to_physical=initial_mapping,
+        )
+        candidates.append(
+            OptimizerCandidate(
+                plan=initial_plan,
+                logical_instances=logical_instances,
+                instance_ranks=instance_ranks,
+                instance_mapping=initial_mapping,
+                cost=float(evaluate(initial_plan)),
+                round_index=0,
+                placement_repaired=False,
+                mapping_sweeps=0,
+                mapping_changes=0,
+            )
+        )
+        refined = optimize_mapping(
+            logical_instances,
+            instance_ranks,
+            initial_mapping,
+            statistics,
+            MappingConfig(
+                ranks_per_node=topology.ranks_per_node,
+                node_omega=config.node_omega,
+                rank_omega=config.rank_omega,
+                gamma=config.gamma,
+                sweep_limit=config.mapping_sweep_limit,
+            ),
+        )
+        refined_key = refined.mapping.tobytes()
+        if refined_key in seen_mappings:
+            continue
+        seen_mappings.add(refined_key)
+        refined_plan = LayerPlan(
+            slot_to_logical=logical_instances,
+            owner_slots=current_plan.owner_slots,
+            source_logical_to_physical=refined.mapping,
+        )
+        candidates.append(
+            OptimizerCandidate(
+                plan=refined_plan,
+                logical_instances=logical_instances,
+                instance_ranks=instance_ranks,
+                instance_mapping=refined.mapping,
+                cost=float(evaluate(refined_plan)),
+                round_index=0,
+                placement_repaired=False,
+                mapping_sweeps=refined.sweeps,
+                mapping_changes=refined.changes,
+            )
+        )
+    return OptimizationResult(candidates=tuple(candidates))
