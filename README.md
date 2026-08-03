@@ -1,112 +1,278 @@
-
 <div align="center">
 
-<img src="./docs/assets/logo.png" width="50%">
+# PlaceMoE
 
-<div align="center">
-    VeOmni: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo
-    <br>
-    <br>
-</div>
+### Accelerating MoE Training through Expert Placement and Replica Coordination
 
-[![GitHub Repo stars](https://img.shields.io/github/stars/ByteDance-Seed/VeOmni)](https://github.com/ByteDance-Seed/VeOmni/stargazers)
-[![Paper](https://img.shields.io/badge/Paper-red)](https://arxiv.org/abs/2508.02317)
-[![Documentation](https://img.shields.io/badge/Documentation-blue)](https://veomni.readthedocs.io/en/latest/)
-[![WeChat](https://img.shields.io/badge/WeChat-green?logo=wechat&amp)](https://raw.githubusercontent.com/ByteDance-Seed/VeOmni/refs/heads/main/docs/assets/wechat.png)
+[![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](pyproject.toml)
+[![Repository](https://img.shields.io/badge/GitHub-pia7a%2FPlaceMoE-black?logo=github)](https://github.com/pia7a/PlaceMoE)
 
 </div>
 
-## 🍪 Overview
-VeOmni is a versatile framework for both single- and multi-modal pre-training and post-training. It empowers users to seamlessly scale models of any modality across various accelerators, offering both flexibility and user-friendliness.
+PlaceMoE is a profile-guided system for distributed mixture-of-experts (MoE)
+training. It jointly optimizes:
 
-Our guiding principles when building VeOmni are:
-- **Flexibility and Modularity**: VeOmni is built with a modular design, allowing users to decouple most components and replace them with their own implementations as needed.
-- **Trainer-free**: VeOmni supports linear training scripts that avoid rigid, structured trainer classes (e.g., [PyTorch-Lightning](https://github.com/Lightning-AI/pytorch-lightning) or [HuggingFace](https://huggingface.co/docs/transformers/v4.50.0/en/main_classes/trainer#transformers.Trainer) Trainer). These training scripts expose the entire training logic to users for maximum transparency and control. Besides, VeOmni supports a basic trainer for text-only or vlm/omni models training and a rl trainer as a trainer backend in reinforcement learning.
+- the number of physical copies allocated to each logical expert;
+- the hierarchical physical expert layout, denoted by `L`; and
+- the source-aware token-to-copy mapping, denoted by `M`.
 
-- **Omni model native**: VeOmni enables users to effortlessly scale any omni-model across devices and accelerators.
-- **Torch native**: VeOmni is designed to leverage PyTorch’s native functions to the fullest extent, ensuring maximum compatibility and performance.
+The key observation is that hierarchical token deduplication and expert
+computation have different load semantics. Communication counts a token once
+per destination group at each topology level, while expert computation must
+execute every token--expert assignment. PlaceMoE models both costs, constructs
+topology-aware `L,M` candidates, and selects the lowest-cost pair by replaying
+the complete profiled token routes.
 
-<div align="center">
-<img src="./docs/assets/system.png" width="90%">
-</div>
+PlaceMoE is implemented on top of
+[VeOmni](https://github.com/ByteDance-Seed/VeOmni) and retains its PyTorch-native
+training stack, including FSDP2, expert parallelism, sequence parallelism,
+multimodal training, and GPU/NPU backends.
 
-## 🔥 Latest News
-- [2025/11] Our Paper [OmniScale: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo](https://arxiv.org/abs/2508.02317) was accepted by AAAI 2026
-- [2025/09] We release first offical release [v0.1.0](https://github.com/ByteDance-Seed/VeOmni/pull/75) of VeOmni.
-- [2025/08] We release [VeOmni Tech report](https://arxiv.org/abs/2508.02317) and open the [WeChat group](./docs/assets/wechat.png). Feel free to join us!
-- [2025/04] We release VeOmni!
+## Highlights
 
+- **Joint layout and mapping optimization.** PlaceMoE coordinates replica
+  allocation, node-to-rank placement, and source-aware dispatch instead of
+  optimizing expert load or communication independently.
+- **Communication-aware candidate generation.** Profiled expert demand and
+  token-level co-selection affinity guide capacity-constrained hierarchical
+  partitioning and topology-general community proposals.
+- **Exact candidate selection.** Pairwise statistics generate candidates, but
+  complete token routes determine the final `L,M` pair through calibrated
+  communication and expert-compute costs.
+- **Static and adaptive execution.** A validated `L,M` artifact can be loaded
+  at startup. During training, `M` can be refreshed without moving expert
+  state, while a full `L,M` update migrates expert parameters and optimizer
+  states at a training-step boundary.
+- **Asynchronous planning.** CPU planning overlaps with training. Completed
+  artifacts are validated before an atomic mapping or layout installation.
+- **Replica-gradient overlap.** Gradients of physical copies are aggregated
+  without changing logical model semantics, and synchronization is overlapped
+  with same-layer attention backward.
+- **Explicit compatibility boundary.** Fixed replication, EPLB, HierMoE, and
+  historical swap/cover planners remain available as baselines but are not
+  hidden dependencies of the canonical PlaceMoE optimizer.
 
-## 📚 Key Features
-- **FSDP**, **FSDP2** backend for training.
-- **Sequence Parallelism** with [Deepspeed Ulysess](https://arxiv.org/abs/2309.14509), support with non-async and async mode.
-- **Experts Parallelism** support large MOE model training, like [Qwen3-Moe](https://veomni.readthedocs.io/en/latest/key_features/ep_fsdp2.html).
-- Efficient **GroupGemm** kernel for Moe model, [Liger-Kernel](https://github.com/linkedin/Liger-Kernel).
-- Compatible with HuggingFace Transformers models. [Qwen3](https://veomni.readthedocs.io/en/latest/examples/qwen3.html), [Qwen3-VL](https://veomni.readthedocs.io/en/latest/examples/qwen3_vl.html), Qwen3-Moe, etc
-- Dynamic batching strategy, Omnidata processing
-- [**Torch Distributed Checkpoint**](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html) for checkpoint.
-- Support for both Nvidia-GPU and Ascend-NPU training.
-- Experiment tracking with wandb
+## How PlaceMoE works
 
-## 📝 Upcoming Features and Changes
+```mermaid
+flowchart LR
+    A[Token-level routing snapshots] --> B[Demand and co-selection affinity]
+    C[Topology and calibrated costs] --> D[Replica-allocation candidates]
+    B --> D
+    D --> E[Hierarchical layout L]
+    E --> F[Source-aware mapping M]
+    F --> G[Exact route replay]
+    G --> H[Validated schema-v2 artifact]
+    H --> I[Static preload or hot update]
+```
 
-- VeOmni v0.2 Roadmap https://github.com/ByteDance-Seed/VeOmni/issues/268, https://github.com/ByteDance-Seed/VeOmni/issues/271
-- Vit balance tool https://github.com/ByteDance-Seed/VeOmni/issues/280
-- Validation dataset during training https://github.com/ByteDance-Seed/VeOmni/issues/247
-- RL post training for omni-modality models with VeRL https://github.com/ByteDance-Seed/VeOmni/issues/262
+For every MoE layer, the canonical optimizer:
 
+1. collects source-conditioned assignment demand and expert co-selection
+   affinity from token-level routes;
+2. retains a bounded shortlist of exact-budget replica allocations;
+3. places physical copies across nodes and then ranks under slot capacities;
+4. initializes and refines the source-aware mapping `M` over copies in `L`;
+5. alternates layout and mapping refinement for a bounded number of rounds;
+6. evaluates every retained pair on held-out complete routes; and
+7. emits a schema-v2 artifact for static startup or a runtime update.
 
-## 🚀 Getting Started
+The optimizer preserves the router's logical top-k decisions. It changes only
+where those assignments execute physically.
 
-<a href="https://veomni.readthedocs.io/en/latest/index.html"><b>Documentation</b></a>
+## Installation
 
-### Quick Start
-  - [Installation](https://veomni.readthedocs.io/en/latest/get_started/installation/install.html)
-  - [Quick Start with Qwen3](https://veomni.readthedocs.io/en/latest/examples/qwen3.html)
+PlaceMoE uses [uv](https://docs.astral.sh/uv/) and targets the dependency
+versions pinned in `pyproject.toml` and `uv.lock`. Python 3.11 is the validated
+environment.
 
+```bash
+git clone https://github.com/pia7a/PlaceMoE.git
+cd PlaceMoE
 
-## ✏️ Supported Models
+# Ascend NPU on x86
+uv sync --extra npu --dev
 
-| Model                                                    | Model size                    | Example config File                                                   |
-| -------------------------------------------------------- | ----------------------------- | ----------------------------------------------------------------------|
-| [DeepSeek2.5/3/R1](https://huggingface.co/deepseek-ai)   | 236B/671B                     | [deepseek.yaml](configs/text/deepseek.yaml)                           |
-| [Llama3-3.3](https://huggingface.co/meta-llama)          | 1B/3B/8B/70B                  | [llama3.yaml](configs/text/llama3.yaml)                               |
-| [Qwen2-3](https://huggingface.co/Qwen)                   | 0.5B/1.5B/3B/7B/14B/32B/72B/  | [qwen2_5.yaml](configs/text/qwen2_5.yaml)                             |
-| [Qwen2-3 VL/QVQ](https://huggingface.co/Qwen)            | 2B/3B/7B/32B/72B              | [qwen3_vl_dense.yaml](configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml)|
-| [Qwen3-VL MoE](https://huggingface.co/Qwen)              | 30BA3B/235BA22B               | [qwen3_vl_moe.yaml](configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml)    |
-| [Qwen3-MoE](https://huggingface.co/Qwen)                 | 30BA3B/235BA22B               | [qwen3-moe.yaml](configs/text/qwen3-moe.yaml)                         |
-| [Qwen2-3 Omni](https://huggingface.co/Qwen)              | 7B/30BA3B                     | [qwen25_omni.yaml](configs/multimodal/qwen25_omni/qwen25_omni.yaml)   |
-| [Wan](https://huggingface.co/Wan-AI)                     | Wan2.1-I2V-14B-480P           | [wan_sft.yaml](configs/dit/wan_sft.yaml)                              |
-| Omni Model                                               | Any Modality Training         | [seed_omni.yaml](configs/multimodal/omni/seed_omni.yaml)              |
+# Or use exactly one alternative hardware extra:
+# uv sync --extra npu_aarch64 --dev
+# uv sync --extra gpu --dev
 
-Support new models to VeOmni see [Support New Models](https://veomni.readthedocs.io/en/latest/usage/support_new_models/guide_and_checklist.html)
+source .venv/bin/activate
+```
 
-## ⛰️ Performance
+The `gpu`, `npu`, and `npu_aarch64` extras are mutually exclusive. Distributed
+training additionally requires a working NCCL or HCCL environment and shared
+access to the model, dataset, and checkpoint paths referenced by the VeOmni
+training configuration.
 
-<div align="left">
-<img src="./docs/assets/performance.png" width="90%">
-</div>
+## Production configuration and launch
 
-For more details, please refer to our [paper](https://arxiv.org/abs/2508.02317).
+The production entry point uses one PlaceMoE YAML file for startup placement,
+calibration, planner resources, and training-time updates:
 
-## 💡 Awesome work using VeOmni
-- [dFactory: Easy and Efficient dLLM Fine-Tuning](https://github.com/inclusionAI/dFactory)
-- [LMMs-Engine](https://github.com/EvolvingLMMs-Lab/lmms-engine)
-- [UI-TARS: Pioneering Automated GUI Interaction with Native Agents](https://github.com/bytedance/UI-TARS)
-- [OpenHA: A Series of Open-Source Hierarchical
-Agentic Models in Minecraft](https://arxiv.org/pdf/2509.13347)
-- [UI-TARS-2 Technical Report: Advancing GUI Agent with Multi-Turn Reinforcement Learning](https://arxiv.org/abs/2509.02544)
-- [Open-dLLM: Open Diffusion Large Language Models](https://github.com/pengzhangzhi/Open-dLLM)
-- [LingBot-VLA: A Pragmatic VLA Foundation Model](https://github.com/Robbyant/lingbot-vla)
+```bash
+bash scripts/placemoe/pretrain.sh \
+  configs/placemoe/local.yaml \
+  qwen3vl sharegpt4v full
+```
 
-## 🎨 Contributing
+Before launching, create `configs/placemoe/local.yaml` from the following
+template and ensure that its artifact paths exist in your environment:
 
-Contributions from the community are welcome! Please check out [CONTRIBUTING.md](CONTRIBUTING.md) our project roadmap(To be updated),
+```yaml
+placemoe:
+  initial_artifact: ../../results/placemoe_layout.json
+  runtime_perf_model: ../../results/placemoe_runtime_perf_model.json
+  calibration:
+    artifact: calibration/placemoe_calibration.json
+  hot_update:
+    enabled: true
+    layout_interval_steps: 100
+    mapping_interval_steps: 20
+    last_update_step: 500
+    work_root: ../../profile/runs/pretrain/placemoe_hot_update
+    failure_policy: continue
+  resources:
+    workers: 48
+    candidate_workers: 4
+    worker_threads: 1
+    planner_cpu_ids: 144-191
+    training_cpu_ids: 0-143
+```
 
+All paths are resolved relative to the PlaceMoE configuration file. The
+launcher validates the initial artifact, topology, calibration metadata,
+runtime performance model, and CPU affinities before reserving accelerators:
 
-## 📝 Citation and Acknowledgement
+```bash
+python scripts/placemoe/validate_config.py \
+  configs/placemoe/local.yaml
+```
 
-If you find VeOmni useful for your research and applications, feel free to give us a star ⭐ or cite us using:
+The included `pretrain.sh` is a reference distributed launcher. For another
+cluster allocation, adapt its host, container, model, and dataset settings or
+set `VEOMNI_PLACEMOE_CONFIG` from an existing VeOmni launcher. The canonical
+optimizer and artifact schema are independent of a particular EP size; the
+configuration, routing snapshots, slot capacities, and calibration artifacts
+must describe the target deployment consistently.
+
+See [PlaceMoE pre-training](docs/usage/placemoe_pretraining.md) for deployment,
+source synchronization, artifact distribution, and failure-policy details.
+
+## Controlling layout and mapping updates
+
+`L` and `M` use independent update intervals:
+
+| `layout_interval_steps` | `mapping_interval_steps` | Runtime behavior |
+| ---: | ---: | --- |
+| `0` | `0` | Keep the startup `L,M` static. |
+| `100` | `0` | Recompute and install `L,M` every 100 steps. |
+| `0` | `20` | Keep `L` fixed and refresh only the dispatch lookup table `M`. |
+| `100` | `20` | Refresh `M` every 20 steps and perform a full update every 100 steps. |
+
+When both events are due at the same step, the full update subsumes the
+mapping-only event. At most one planner process runs at a time; later events
+are coalesced while training continues with the current pair. With
+`failure_policy: continue`, a failed planner leaves the current pair active;
+`raise` turns planner failure into a training error.
+
+## Canonical interfaces
+
+| Path | Purpose |
+| --- | --- |
+| `veomni/distributed/moe/hiermoe/placemoe/` | Routing statistics, allocation, placement, mapping, exact-cost optimization, and artifact validation. |
+| `veomni/distributed/moe/hiermoe/placemoe/runtime/` | Typed configuration, independent update scheduling, asynchronous planner control, and process construction. |
+| `scripts/profile/plan_placemoe.py` | Canonical offline and runtime planner CLI. |
+| `scripts/placemoe/pretrain.sh` | Reference distributed pre-training launcher with config and artifact validation. |
+| `configs/placemoe/` | Example runtime and calibration configurations. |
+
+Inspect the planner options with:
+
+```bash
+python scripts/profile/plan_placemoe.py --help
+```
+
+The historical `build_hiermoe_recursive_classifier_layout.py` command is a
+deprecated compatibility wrapper. New integrations should use
+`plan_placemoe.py` or set `VEOMNI_PLACEMOE_CONFIG`; legacy
+`VEOMNI_HIERMOE_*` variables remain available only for older launchers and
+paper-reproduction workflows.
+
+For a module-by-module explanation, see the
+[PlaceMoE code map](docs/perf/placemoe_code_map.md).
+
+## Results
+
+Experiments with the repository implementation evaluate PlaceMoE on multi-node
+GPU and NPU clusters with Qwen3-VL and DeepSeek-V3 using multimodal and text
+workloads. Relative to the unmodified VeOmni runtime, PlaceMoE achieves:
+
+| Metric | Result |
+| --- | ---: |
+| Hierarchical A2A speedup | up to `6.94x` |
+| End-to-end training speedup | `1.74x`--`2.33x` |
+| End-to-end speedup over the strongest same-runtime baseline | `1.05x`--`1.25x` |
+
+A 600-step experiment reports `2.16x` average speedup over VeOmni with a
+tighter step-time band. CPU optimization runs asynchronously, and 5 periodic
+updates expose `58.6 s` in total, or `0.64%` of the run.
+
+Workload definitions, reproduction procedures, and detailed measurements are
+documented separately:
+
+- [Experiment reproduction record](docs/perf/placemoe_paper_reproduction_20260802.md)
+- [General planner E2E validation](docs/perf/placemoe_general_e2e_validation_20260802.md)
+
+## Supported and validated scope
+
+- The canonical general workflow is validated with Qwen3-VL and a
+  6-MoE-layer DeepSeek-V3 configuration.
+- PlaceMoE is evaluated on multi-node NVIDIA GPU/NCCL and Ascend NPU/HCCL
+  platforms with hierarchical node-to-rank communication.
+- The general planner consumes the target communication hierarchy, EP
+  topology, replica budget, and slot capacities through the same optimization
+  workflow across supported deployments.
+- A mapping-only update replaces the runtime lookup table without expert-state
+  movement; a full update migrates expert parameters and optimizer states and
+  atomically installs `L,M` at a step boundary.
+- PlaceMoE does not currently support FSDP2 CPU offload when replicated expert
+  placement is enabled.
+
+Other VeOmni model families and training tasks remain in the repository, but
+they should not be treated as validated PlaceMoE workloads without a matching
+route collector, calibration artifact, and runtime integration test.
+
+## Testing
+
+The focused CPU suite covers statistics, replica allocation, hierarchical
+placement, mapping refinement, exact candidate selection, artifact validation,
+runtime configuration, and hot-update scheduling:
+
+```bash
+python -m pytest \
+  tests/distributed/test_placemoe_optimizer.py \
+  tests/distributed/test_placemoe_runtime.py \
+  tests/distributed/test_placemoe_runtime_config.py \
+  tests/distributed/test_hiermoe_recursive_classifier_init.py
+```
+
+Before contributing, run the repository quality checks:
+
+```bash
+make style
+make quality
+```
+
+Distributed end-to-end tests require the corresponding multi-GPU or multi-NPU
+environment and are not part of the default CPU test suite.
+
+## Repository lineage and citation
+
+PlaceMoE is derived from VeOmni and retains its Apache-2.0 license and general
+training infrastructure. If this repository is useful in your work, please
+cite the PlaceMoE paper when its public citation is available and acknowledge
+the VeOmni project:
 
 ```bibtex
 @article{ma2025veomni,
@@ -117,35 +283,6 @@ If you find VeOmni useful for your research and applications, feel free to give 
 }
 ```
 
-Thanks to the following projects for their excellent work:
+## License
 
-- [ByteCheckpoint](https://arxiv.org/abs/2407.20143)
-- [veScale](https://github.com/volcengine/veScale)
-- [Liger-Kernel](https://github.com/linkedin/Liger-Kernel)
-- [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory)
-- [torchtitan](https://github.com/pytorch/torchtitan/)
-- [torchtune](https://github.com/pytorch/torchtune)
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=ByteDance-Seed/VeOmni&type=date&legend=top-left)](https://www.star-history.com/#ByteDance-Seed/VeOmni&type=date&legend=top-left)
-
-
-## 🌱 About [ByteDance Seed Team](https://team.doubao.com/)
-
-<div align="center">
-<img src="https://github.com/user-attachments/assets/c42e675e-497c-4508-8bb9-093ad4d1f216" width="100%">
-</div>
-
-Founded in 2023, ByteDance Seed Team is dedicated to crafting the industry's most advanced AI foundation models. The team aspires to become a world-class research team and make significant contributions to the advancement of science and society. You can get to know Bytedance Seed better through the following channels👇
-<div>
-  <a href="https://team.doubao.com/">
-    <img src="https://img.shields.io/badge/Website-%231e37ff?style=for-the-badge&logo=bytedance&logoColor=white"></a>
-  <a href="https://github.com/user-attachments/assets/469535a8-42f2-4797-acdf-4f7a1d4a0c3e">
-    <img src="https://img.shields.io/badge/WeChat-07C160?style=for-the-badge&logo=wechat&logoColor=white"></a>
- <a href="https://www.xiaohongshu.com/user/profile/668e7e15000000000303157d?xsec_token=ABl2-aqekpytY6A8TuxjrwnZskU-6BsMRE_ufQQaSAvjc%3D&xsec_source=pc_search">
-    <img src="https://img.shields.io/badge/Xiaohongshu-%23FF2442?style=for-the-badge&logo=xiaohongshu&logoColor=white"></a>
-  <a href="https://www.zhihu.com/org/dou-bao-da-mo-xing-tuan-dui/">
-    <img src="https://img.shields.io/badge/zhihu-%230084FF?style=for-the-badge&logo=zhihu&logoColor=white"></a>
-
-</div>
+This project is licensed under the [Apache License 2.0](LICENSE).
