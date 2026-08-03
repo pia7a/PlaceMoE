@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "status": "accepted",
+  "model_id": "DeepSeek-V3-6MoE-Half",
+  "topology_id": "huawei2",
+  "ep_size": 32,
+  "ranks_per_node": 8,
+  "coefficients": {
+    "inter_ms_per_byte": 3.69235444043744e-08,
+    "intra_ms_per_byte": 8.5092387758084e-09,
+    "route_ms_per_assignment": 8.746548178958447e-05,
+    "communication_multiplier": 3.1,
+    "compute_ms_per_assignment": 6.58480842410144e-05,
+    "compute_multiplier": 4.19
+  }
+}

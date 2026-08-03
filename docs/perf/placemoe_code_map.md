@@ -32,9 +32,10 @@ The reusable implementation now lives in
 | `artifacts.py` | Validated schema-v2 runtime artifacts. |
 | `seeds.py` | Deterministic feasible seeds that prevent needless regressions from the default layout. |
 
-The canonical CLI is `scripts/profile/plan_placemoe.py`. The older
-`build_hiermoe_recursive_classifier_layout.py` name remains only as its
-compatibility implementation while downstream imports migrate.
+The canonical CLI is `scripts/profile/plan_placemoe.py`, backed by
+`scripts/profile/placemoe_planner.py`. The older
+`build_hiermoe_recursive_classifier_layout.py` name is a deprecated wrapper
+for external scripts that have not migrated.
 
 The CLI retains the paper's calibrated partition candidate and also evaluates
 two proposal families that protect exact-route search from pairwise-surrogate
@@ -73,7 +74,8 @@ joint cost is lower.
 | `routing.py` | Duplicate-free and assignment-load accounting. |
 | `perf_model.py` | Communication and expert-compute calibration. |
 | `state.py` | Trainer integration, checkpoint state, and lifecycle. |
-| `expert_swap.py` | Shared layout installation, state migration, gradient synchronization, and hot-update runtime. Periodic full replanning invokes the canonical CLI and accepts only validated schema-v2 artifacts. Historical online swap selectors remain isolated behind explicit runtime configuration. |
+| `placemoe/runtime/` | Typed configuration, independent layout/mapping scheduling, and canonical planner-process construction. |
+| `expert_swap.py` | Compatibility runtime for layout installation, state migration, gradient synchronization, and retained historical swap/cover methods. Canonical hot updates enter through `placemoe/runtime/`, invoke the canonical CLI, and accept only validated schema-v2 artifacts. |
 | `online_lut_planner.py` | Mapping-only updates over copies already present in `L`. |
 | `metrics.py` | Runtime metrics exposed to the trainer. |
 
@@ -97,7 +99,7 @@ runtime substrate but do not share an optimizer:
 | Method | Role | Layout or mapping source |
 | --- | --- | --- |
 | `ours` | Canonical static PlaceMoE | Validated schema-v2 `L,M` artifact from `plan_placemoe.py`. |
-| `ours_full_replan` | Canonical PlaceMoE hot update | Recent routes are passed to `plan_placemoe.py`; the validated artifact is migrated and atomically installed. |
+| `ours_full_replan` | Paper-launcher compatibility name for PlaceMoE hot updates | Recent routes are passed to `plan_placemoe.py`; the validated artifact is migrated and atomically installed. |
 | `ours_online_lut` | Mapping-only diagnostic | Keeps `L` fixed and updates only the runtime LUT. |
 | `r2` | Fixed-replication baseline | Uniform mirrored copies in default expert order. |
 | `eplb` | Placement baseline | Externally generated static placement on the common runtime. |

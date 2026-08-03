@@ -10,8 +10,8 @@ all 64 NPUs.
 ## Scope
 
 - Branch: `refactor/placemoe-cleanup`
-- Validation container: `tzq_npu_coremoe_verify_20260717`
-- Distributed testbed: 8 nodes, 8 NPUs per node, EP64
+- Historical validation container: `tzq_npu_coremoe_verify_20260717`
+- Historical distributed testbed: 8 nodes, 8 NPUs per node, EP64
 - Common runtime: hierarchical token-deduplicated A2A with hidden
   replica-gradient synchronization
 - Canonical artifact: schema version 2 with
@@ -20,6 +20,32 @@ all 64 NPUs.
 The static A/B runs change only the preloaded physical layout `L` and
 source-aware mapping `M`. They use the same model, data, runtime, batch and
 sequence configuration, and gradient-synchronization mode.
+
+## Production interface regression on 4 nodes
+
+The production cleanup was revalidated on the 4 available nodes
+`huawei1_node1`, `huawei1_node2`, `huawei2_node1`, and `huawei2_node2`, with 8
+NPUs per node and EP32. The 20-step Qwen3-VL/ShareGPT4V run used
+`qwen3vl_ep32_hot_smoke.yaml`, including the canonical initial artifact,
+runtime performance model, accepted calibration coefficients, and independent
+layout and mapping intervals. All 4 node launchers returned exit code 0.
+
+| Event | Source / apply step | Planner wall time | Installation | Result |
+| --- | ---: | ---: | ---: | --- |
+| Mapping-only refresh | 1 / 3 | 8.95 s | 0.16 s | `M` updated without moving slots |
+| Full layout and mapping refresh | 4 / 18 | 178.43 s | 7.97 s | 11,989 slots moved across 48 layers |
+
+The full planner ran 48 layer jobs concurrently. Its mean per-layer time was
+161.78 s, close to the 178.43-s wall time rather than their sum. Exact
+held-out evaluation predicted a 1.113x joint-cost improvement over the current
+pair. Training continued while both planners ran; after the full update, steps
+19 and 20 took 14.49 s and 13.65 s with finite losses of 0.839 and 0.838. This
+run verifies canonical configuration loading before model sharding, explicit
+calibration propagation, independent refresh scheduling, asynchronous
+planning, mapping-only installation, full state migration, and continued
+training after the atomic update.
+
+Run name: `placemoe_production_ep32_qwen3vl_hot_smoke_20260803_v4`.
 
 ## CPU regression and artifact checks
 

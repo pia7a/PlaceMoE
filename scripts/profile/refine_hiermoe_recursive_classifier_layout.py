@@ -36,7 +36,7 @@ from scripts.profile.build_hiermoe_hierarchical_init_layout import (
     _load_routes,
     _replay_payload,
 )
-from scripts.profile.build_hiermoe_recursive_classifier_layout import (
+from scripts.profile.placemoe_planner import (
     _mapped_instance_statistics,
     _materialize_layout,
     _optimize_lut_instances,

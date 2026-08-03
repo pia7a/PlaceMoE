@@ -1,0 +1,18 @@
+placemoe:
+  initial_artifact: ../../results/paper32_huawei2_qwen3vl30b_sharegpt4v_ours_b4_ep32_general_e2e_min_20260802_w48c4_v1_layout.json
+  runtime_perf_model: ../../../../hiermoe_perf_model_c009_ep32_20260720/v2/hiermoe_perf_model.json
+  calibration:
+    artifact: calibration/qwen3vl_ep32_huawei2.json
+  hot_update:
+    enabled: true
+    layout_interval_steps: 100
+    mapping_interval_steps: 20
+    last_update_step: 500
+    work_root: ../../profile/runs/pretrain/placemoe_hot_update
+    failure_policy: continue
+  resources:
+    workers: 48
+    candidate_workers: 4
+    worker_threads: 1
+    planner_cpu_ids: 144-191
+    training_cpu_ids: 0-143

@@ -1,0 +1,16 @@
+placemoe:
+  initial_artifact: ../../results/placemoe_refactor_ep64_deepseek6moe_tulu3_layout.json
+  runtime_perf_model: ../../../../hiermoe_perf_model_huawei12_ep64_2d_20260730_v1/hiermoe_perf_model.json
+  calibration:
+    artifact: calibration/deepseek_v3_6moe_ep64.json
+  hot_update:
+    enabled: true
+    layout_interval_steps: 100
+    mapping_interval_steps: 20
+    last_update_step: 500
+    work_root: ../../profile/runs/pretrain/placemoe_hot_update_deepseek
+    failure_policy: continue
+  resources:
+    workers: 6
+    candidate_workers: 2
+    worker_threads: 1

@@ -21,15 +21,13 @@ import pytest
 import torch
 
 from veomni.distributed.moe.hiermoe import expert_swap as expert_swap_module
-from veomni.distributed.moe.hiermoe.expert_swap import (
-    ExpertSwapManager,
-    _encode_periodic_full_replan_layer_keys,
-)
+from veomni.distributed.moe.hiermoe.expert_swap import ExpertSwapManager
 from veomni.distributed.moe.hiermoe.placemoe import (
     LayerPlan,
     PlaceMoETopology,
     build_placemoe_artifact,
 )
+from veomni.distributed.moe.hiermoe.placemoe.runtime import HotUpdateController
 
 
 def _runtime_manager() -> ExpertSwapManager:
@@ -40,26 +38,15 @@ def _runtime_manager() -> ExpertSwapManager:
     return manager
 
 
-def test_periodic_full_replan_uses_canonical_placemoe_cli(monkeypatch):
-    monkeypatch.setattr(expert_swap_module, "_PERIODIC_FULL_REPLAN_BUILDER", "")
+def test_hot_update_uses_canonical_placemoe_cli(monkeypatch):
+    monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE_BUILDER", "")
 
-    path = _runtime_manager()._periodic_full_replan_builder_path()
+    path = _runtime_manager()._hot_update_builder_path()
 
     assert path.endswith("/scripts/profile/plan_placemoe.py")
 
 
-def test_periodic_full_replan_passes_runtime_layer_keys() -> None:
-    layers = [
-        SimpleNamespace(key="model.layers.2.mlp.experts"),
-        SimpleNamespace(key="model.layers.10.mlp.experts"),
-    ]
-
-    encoded = _encode_periodic_full_replan_layer_keys(layers)
-
-    assert encoded == "model.layers.2.mlp.experts,model.layers.10.mlp.experts"
-
-
-def test_periodic_full_replan_validates_canonical_artifact(tmp_path):
+def test_hot_update_validates_canonical_artifact(tmp_path):
     topology = PlaceMoETopology(ep_size=1, ranks_per_node=1, num_experts=2, slots_per_rank=3)
     plan = LayerPlan(
         slot_to_logical=[0, 1, 0],
@@ -71,21 +58,21 @@ def test_periodic_full_replan_validates_canonical_artifact(tmp_path):
     layout_path.write_text(json.dumps(payload), encoding="utf-8")
     state = SimpleNamespace(layout_path=str(layout_path))
 
-    loaded = _runtime_manager()._broadcast_periodic_full_replan_payload(state, torch.device("cpu"))
+    loaded = _runtime_manager()._broadcast_hot_update_payload(state, torch.device("cpu"))
 
     assert loaded == payload
 
 
-def test_periodic_full_replan_rejects_legacy_artifact(tmp_path):
+def test_hot_update_rejects_legacy_artifact(tmp_path):
     layout_path = tmp_path / "layout.json"
     layout_path.write_text(json.dumps({"schema_version": 1, "layers": {}}), encoding="utf-8")
     state = SimpleNamespace(layout_path=str(layout_path))
 
     with pytest.raises(RuntimeError, match="invalid PlaceMoE artifact"):
-        _runtime_manager()._broadcast_periodic_full_replan_payload(state, torch.device("cpu"))
+        _runtime_manager()._broadcast_hot_update_payload(state, torch.device("cpu"))
 
 
-def test_periodic_full_replan_rejects_non_placemoe_schema_v2_artifact(tmp_path):
+def test_hot_update_rejects_non_placemoe_schema_v2_artifact(tmp_path):
     topology = PlaceMoETopology(ep_size=1, ranks_per_node=1, num_experts=2, slots_per_rank=3)
     plan = LayerPlan(
         slot_to_logical=[0, 1, 0],
@@ -99,7 +86,7 @@ def test_periodic_full_replan_rejects_non_placemoe_schema_v2_artifact(tmp_path):
     state = SimpleNamespace(layout_path=str(layout_path))
 
     with pytest.raises(RuntimeError, match="invalid PlaceMoE artifact"):
-        _runtime_manager()._broadcast_periodic_full_replan_payload(state, torch.device("cpu"))
+        _runtime_manager()._broadcast_hot_update_payload(state, torch.device("cpu"))
 
 
 @pytest.mark.parametrize(
@@ -112,35 +99,37 @@ def test_periodic_full_replan_rejects_non_placemoe_schema_v2_artifact(tmp_path):
         (0, 100, 99, "mapping"),
     ],
 )
-def test_periodic_replan_schedules_independent_layout_and_mapping_intervals(
+def test_hot_update_schedules_independent_layout_and_mapping_intervals(
     monkeypatch,
     layout_interval,
     mapping_interval,
     placement_step,
     expected_mode,
 ):
-    monkeypatch.setattr(expert_swap_module, "_PERIODIC_FULL_REPLAN_LAST_STEP", 10_000)
+    monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE_LAST_STEP", 10_000)
     manager = _runtime_manager()
-    manager._periodic_layout_refresh_interval = layout_interval
-    manager._periodic_mapping_refresh_interval = mapping_interval
-    manager._periodic_pending_layout = False
-    manager._periodic_pending_mapping = False
-    manager._periodic_full_replan_state = None
+    manager._hot_update_layout_interval = layout_interval
+    manager._hot_update_mapping_interval = mapping_interval
+    manager._hot_update_controller = HotUpdateController(
+        layout_interval_steps=layout_interval,
+        mapping_interval_steps=mapping_interval,
+        last_update_step=10_000,
+    )
     manager.latest_pair = ""
     launched = []
-    manager._launch_periodic_full_replan = lambda **kwargs: launched.append(kwargs)
+    manager._launch_hot_update = lambda **kwargs: launched.append(kwargs)
 
-    result = manager._run_periodic_full_replan_step(placement_step)
+    result = manager._run_hot_update_step(placement_step)
 
     if expected_mode is None:
         assert result == "none"
         assert not launched
     else:
         assert launched[0]["update_mode"] == expected_mode
-        assert result == f"periodic_{expected_mode}_replan_submitted:{placement_step + 1}"
+        assert result == f"placemoe_{expected_mode}_update_submitted:{placement_step + 1}"
 
 
-def test_periodic_replan_passes_calibration_coefficients_to_planner(monkeypatch, tmp_path):
+def test_hot_update_passes_calibration_coefficients_to_planner(monkeypatch, tmp_path):
     manager = _runtime_manager()
     layer = SimpleNamespace(
         key="layers.0.experts",
@@ -152,20 +141,20 @@ def test_periodic_replan_passes_calibration_coefficients_to_planner(monkeypatch,
     )
     manager.layers = {layer.key: layer}
     manager.hierarchy = SimpleNamespace(local_world_size=1)
-    manager._periodic_full_replan_state = None
-    manager._periodic_full_replan_last_source_step = -1
-    manager._periodic_full_replan_last_snapshot_ms = 0.0
-    manager._capture_periodic_full_routes = lambda *_args: 1.0
-    manager._periodic_full_replan_builder_path = lambda: "/bin/true"
-    manager._periodic_full_replan_event = lambda *_args, **_kwargs: None
-    monkeypatch.setattr(expert_swap_module, "_PERIODIC_FULL_REPLAN_WORK_ROOT", str(tmp_path))
-    monkeypatch.setattr(expert_swap_module, "_PERIODIC_FULL_REPLAN_CPU_IDS", "")
-    monkeypatch.setattr(expert_swap_module, "_PERIODIC_REPLAN_INTER_MS_PER_BYTE", 1.25)
-    monkeypatch.setattr(expert_swap_module, "_PERIODIC_REPLAN_INTRA_MS_PER_BYTE", 2.5)
-    monkeypatch.setattr(expert_swap_module, "_PERIODIC_REPLAN_ROUTE_MS_PER_ASSIGNMENT", 3.75)
-    monkeypatch.setattr(expert_swap_module, "_PERIODIC_REPLAN_COMMUNICATION_MULTIPLIER", 4.5)
-    monkeypatch.setattr(expert_swap_module, "_PERIODIC_REPLAN_COMPUTE_MS_PER_ASSIGNMENT", 5.25)
-    monkeypatch.setattr(expert_swap_module, "_PERIODIC_REPLAN_COMPUTE_MULTIPLIER", 6.5)
+    manager._hot_update_controller = HotUpdateController(100, 20, 500)
+    manager._hot_update_last_source_step = -1
+    manager._hot_update_last_snapshot_ms = 0.0
+    manager._capture_hot_update_routes = lambda *_args: 1.0
+    manager._hot_update_builder_path = lambda: "/bin/true"
+    manager._hot_update_event = lambda *_args, **_kwargs: None
+    monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE_WORK_ROOT", str(tmp_path))
+    monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE_CPU_IDS", "")
+    monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE_INTER_MS_PER_BYTE", 1.25)
+    monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE_INTRA_MS_PER_BYTE", 2.5)
+    monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE_ROUTE_MS_PER_ASSIGNMENT", 3.75)
+    monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE_COMMUNICATION_MULTIPLIER", 4.5)
+    monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE_COMPUTE_MS_PER_ASSIGNMENT", 5.25)
+    monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE_COMPUTE_MULTIPLIER", 6.5)
     commands = []
 
     class _Process:
@@ -176,7 +165,7 @@ def test_periodic_replan_passes_calibration_coefficients_to_planner(monkeypatch,
 
     monkeypatch.setattr(expert_swap_module.subprocess, "Popen", _Process)
 
-    manager._launch_periodic_full_replan(
+    manager._launch_hot_update(
         placement_step=9,
         training_step=10,
         update_mode="full",
@@ -193,3 +182,23 @@ def test_periodic_replan_passes_calibration_coefficients_to_planner(monkeypatch,
     }
     for flag, value in expected.items():
         assert command[command.index(flag) + 1] == value
+
+
+def test_canonical_hot_update_keeps_current_pair_when_planner_fails() -> None:
+    manager = _runtime_manager()
+    manager._hot_update_controller = HotUpdateController(100, 20, 500)
+    manager._hot_update_controller.active_job = SimpleNamespace(
+        update_mode="mapping",
+        source_step=20,
+        planner_log_path="planner.log",
+    )
+    manager.layers = {"layer": object()}
+    manager.latest_pair = ""
+    manager._pipeline_device = lambda _layer: torch.device("cpu")
+    manager._hot_update_status = lambda _state, _device: 2
+    manager._hot_update_event = lambda *_args, **_kwargs: None
+
+    result = manager._run_hot_update_step(20)
+
+    assert result == "placemoe_hot_update_failed:20"
+    assert manager._hot_update_controller.active_job is None

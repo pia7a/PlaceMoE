@@ -19,6 +19,9 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "${script_dir}/hiermoe_paper32_common.sh"
 paper32_configure_model "${model}"
 paper32_configure_dataset "${dataset}"
+if [[ "${model}" == "deepseek_v3_6moe_half" || "${model}" == "deepseek6moe" ]]; then
+  paper32_load_compute_calibration
+fi
 
 pause_file=${PAPER32_PAUSE_FILE:-${paper32_source_root}/.paper32_pause}
 if [[ "${method}" != "baseline" ]]; then
@@ -97,7 +100,9 @@ case "${method}" in
     layout_stem=${PAPER32_LAYOUT_STEM_OVERRIDE:-${layout_stem}}
     replay=${paper32_source_root}/results/${layout_stem}_layout.json
     layout_report=${paper32_source_root}/results/${layout_stem}_report.json
-    if [[ (! -s "${replay}" || ! -s "${layout_report}") && "${PAPER32_DRY_RUN:-0}" != "1" ]]; then
+    if [[ "${method}" == "ours_full_replan" && -n "${PAPER32_PLACEMOE_CONFIG:-}" ]]; then
+      : # The canonical config owns and validates the initial artifact.
+    elif [[ (! -s "${replay}" || ! -s "${layout_report}") && "${PAPER32_DRY_RUN:-0}" != "1" ]]; then
       echo "missing ${method} layout for ${model}/${dataset}; run:" >&2
       echo "  bash ${script_dir}/prepare_hiermoe_paper32_layouts.sh ${model} ${dataset}" >&2
       exit 1
@@ -196,9 +201,10 @@ if [[ "${method}" == "eplb" || "${method}" == "ours" || "${method}" == "ours_onl
   || "${method}" == "ours_full_replan" \
   || "${method}" == "static" ]]
 then
+  placemoe_initial_artifact=${PAPER32_PLACEMOE_INITIAL_ARTIFACT:-${paper32_container_source_root}/results/${layout_stem}_layout.json}
   case_env+=(
-    "HIERMOE_ABLATION_REPLAY_PATH_OVERRIDE=${paper32_container_source_root}/results/${layout_stem}_layout.json"
-    "HIERMOE_STATIC_PRELOAD_LAYOUT_PATH_OVERRIDE=${paper32_container_source_root}/results/${layout_stem}_layout.json"
+    "HIERMOE_ABLATION_REPLAY_PATH_OVERRIDE=${placemoe_initial_artifact}"
+    "HIERMOE_STATIC_PRELOAD_LAYOUT_PATH_OVERRIDE=${placemoe_initial_artifact}"
   )
 fi
 if [[ "${method}" == "ours_online_lut" ]]; then
@@ -213,6 +219,7 @@ if [[ "${method}" == "ours_online_lut" ]]; then
 fi
 if [[ "${method}" == "ours_full_replan" ]]; then
   case_env+=(
+    "HIERMOE_PLACEMOE_CONFIG_PATH_OVERRIDE=${PAPER32_PLACEMOE_CONFIG:-}"
     "HIERMOE_LAYOUT_REFRESH_INTERVAL_OVERRIDE=${PAPER32_LAYOUT_REFRESH_INTERVAL:-${HIERMOE_SWAP_INTERVAL_OVERRIDE:-100}}"
     "HIERMOE_MAPPING_REFRESH_INTERVAL_OVERRIDE=${PAPER32_MAPPING_REFRESH_INTERVAL:-0}"
     "HIERMOE_PLACEMOE_INTER_MS_PER_BYTE_OVERRIDE=${paper32_inter_ms_per_byte}"

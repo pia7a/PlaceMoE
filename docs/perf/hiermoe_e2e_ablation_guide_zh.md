@@ -30,7 +30,7 @@
 3. `veomni/distributed/moe/hiermoe/expert_swap.py`
    - 当前 placement manager、布局安装、迁移、梯度同步、exact swap、
      static replay 和在线 remap 的训练接入。
-4. `scripts/profile/build_hiermoe_recursive_classifier_layout.py`
+4. `scripts/profile/plan_placemoe.py`
    - Ours 的离线聚类布局与 source LUT 生成器。
 5. `veomni/distributed/moe/hiermoe/forward_cover_planner.py`
    - 复用 Forward physical route 的在线 cover/remap 原型。
@@ -199,7 +199,7 @@ T_total = T_communication + T_compute
   - 再乘 `compute_phase_multiplier`。
 
 常用的当前参数默认值可以从
-`build_hiermoe_recursive_classifier_layout.py --help` 查看。系数只能用于相同
+`plan_placemoe.py --help` 查看。系数只能用于相同
 模型、hidden size、dtype、通信拓扑和训练阶段；更换模型或平台后应重新校准。
 
 ## 6. 比较方法的准确定义
@@ -345,7 +345,7 @@ hybrid evaluator 使用真实 physical route 选择。
 | exact P1 | `expert_swap.py` 中 `_plan_exact_single_swap_layers` |
 | Forward-cache online cover/remap | `forward_cover_planner.py` 与 `expert_swap.py` |
 | 旧 full-exact greedy planner | `greedy_planner.py`, `statistical_scorer.py` |
-| Ours 离线初始化 | `scripts/profile/build_hiermoe_recursive_classifier_layout.py` |
+| Ours 离线初始化 | `scripts/profile/plan_placemoe.py` |
 | EPLB 适配 | `scripts/profile/build_hiermoe_eplb_layout.py` |
 | 静态布局预加载 | `veomni/distributed/parallel_plan.py` |
 | EP32 四节点底层实验入口 | `scripts/profile/launch_hiermoe_greedy_e2e_4node.sh` |
@@ -562,7 +562,7 @@ Route capture 会发生 D2H 和文件写入，因此只能作为布局输入，�
 示例：
 
 ```bash
-python scripts/profile/build_hiermoe_recursive_classifier_layout.py \
+python scripts/profile/plan_placemoe.py \
   --route-root route_captures/<profile-name> \
   --optimize-steps 0,1,2 \
   --validation-steps 3 \

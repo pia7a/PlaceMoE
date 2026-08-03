@@ -22,6 +22,7 @@ from ....utils import logging
 from .expert_swap import ExpertSwapManager, expand_redundant_expert_slots
 from .metrics import peek_hiermoe_metrics
 from .perf_model import HierMoEPerfModel, fit_perf_model_on_startup
+from .placemoe.runtime import PlaceMoERuntimeConfig
 from .topology import Hierarchy, infer_hierarchy
 
 
@@ -91,7 +92,13 @@ def configure_hiermoe(
         topology=str(config.topology),
         hierarchy_group_sizes=tuple(config.hierarchy_group_sizes),
     )
-    perf_model = HierMoEPerfModel.from_path(config.perf_model_path)
+    placemoe_config = PlaceMoERuntimeConfig.from_environment()
+    perf_model_path = (
+        placemoe_config.runtime_perf_model
+        if placemoe_config.source_path and placemoe_config.runtime_perf_model
+        else config.perf_model_path
+    )
+    perf_model = HierMoEPerfModel.from_path(perf_model_path)
     active = bool(config.enable and config.token_dedup and ep_size > 1)
     placement_enabled = bool(
         config.expert_swap

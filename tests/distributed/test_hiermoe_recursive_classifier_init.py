@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from scripts.profile.build_hiermoe_hierarchical_init_layout import HybridCost, _load_routes, _route_statistics
-from scripts.profile.build_hiermoe_recursive_classifier_layout import (
+from scripts.profile.placemoe_planner import (
     _build_candidate,
     _classify_instances,
     _group_route_statistics,

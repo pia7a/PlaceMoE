@@ -31,6 +31,20 @@ from .utils import check_fqn_match, get_module_from_path, set_module_from_path
 logger = logging.get_logger(__name__)
 
 
+@lru_cache(maxsize=1)
+def _hiermoe_static_preload_layout_path() -> str:
+    """Resolve the canonical PlaceMoE artifact before model sharding."""
+    if os.environ.get("VEOMNI_PLACEMOE_CONFIG", "").strip():
+        # Import lazily so generic parallel plans do not load HierMoE unless
+        # PlaceMoE is explicitly configured.
+        from .moe.hiermoe.placemoe.runtime import PlaceMoERuntimeConfig
+
+        config = PlaceMoERuntimeConfig.from_environment()
+        if config.initial_artifact:
+            return config.initial_artifact
+    return os.environ.get("VEOMNI_HIERMOE_STATIC_PRELOAD_LAYOUT_PATH", "").strip()
+
+
 @lru_cache(maxsize=4)
 def _hiermoe_static_preload_layouts(path: str) -> dict[str, tuple[int, ...]]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -52,7 +66,7 @@ def _hiermoe_static_preload_shard(
     *,
     para_rank: int,
 ) -> "torch.Tensor | None":
-    path = os.environ.get("VEOMNI_HIERMOE_STATIC_PRELOAD_LAYOUT_PATH", "").strip()
+    path = _hiermoe_static_preload_layout_path()
     if not path:
         return None
     layer_key = parameter_name.rsplit(".", maxsplit=1)[0]

@@ -128,7 +128,7 @@ paper32_configure_model() {
       paper32_is_text_model=1
       paper32_lightweight_timing_default=1
       if [[ "${paper32_world_size}" == "64" ]]; then
-        paper32_compute_calibration_artifact=${PAPER32_COMPUTE_CALIBRATION_ARTIFACT:-results/paper64_deepseekv3_6moe_half_compute_calibration_ep64_20260730_v1.json}
+        paper32_compute_calibration_artifact=${PAPER32_COMPUTE_CALIBRATION_ARTIFACT:-results/paper64_deepseekv3_6moe_half_compute_calibration_ep64_mb2_ga2_seq16k_lr0_accepted_v5.json}
       else
         paper32_compute_calibration_artifact=${PAPER32_COMPUTE_CALIBRATION_ARTIFACT:-results/paper32_deepseekv3_6moe_half_compute_calibration_ep32_20260730_v3.json}
       fi

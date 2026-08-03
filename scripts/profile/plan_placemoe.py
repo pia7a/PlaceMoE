@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 
-"""Generate validated PlaceMoE layout and mapping artifacts from route profiles."""
+"""Canonical CLI for validated PlaceMoE layout and mapping artifacts."""
 
-from scripts.profile.build_hiermoe_recursive_classifier_layout import main
+from scripts.profile.placemoe_planner import main
 
 
 if __name__ == "__main__":

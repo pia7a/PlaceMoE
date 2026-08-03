@@ -26,7 +26,7 @@ from scripts.profile.build_hiermoe_hierarchical_init_layout import (
     _HybridEvaluator,
     _load_routes,
 )
-from scripts.profile.build_hiermoe_recursive_classifier_layout import _parse_int_list
+from scripts.profile.placemoe_planner import _parse_int_list
 from scripts.profile.refine_hiermoe_online_cover import (
     _CoverAction,
     _LayerState,
