@@ -108,13 +108,14 @@ training configuration.
 
 ## Production configuration and launch
 
-The production entry point uses one PlaceMoE YAML file for startup placement,
-calibration, planner resources, and training-time updates:
+The hardware-neutral production entry point is `VEOMNI_PLACEMOE_CONFIG`. It
+points to one PlaceMoE YAML file for startup placement, calibration, planner
+resources, and training-time updates, and can be used with the normal VeOmni
+launcher on either GPU or NPU:
 
 ```bash
-bash scripts/placemoe/pretrain.sh \
-  configs/placemoe/local.yaml \
-  qwen3vl sharegpt4v full
+export VEOMNI_PLACEMOE_CONFIG=$(realpath configs/placemoe/local.yaml)
+# Start the regular tasks/train_vlm.py command for the selected accelerator.
 ```
 
 Before launching, create `configs/placemoe/local.yaml` from the following
@@ -137,25 +138,26 @@ placemoe:
     workers: 48
     candidate_workers: 4
     worker_threads: 1
-    planner_cpu_ids: 144-191
-    training_cpu_ids: 0-143
 ```
 
 All paths are resolved relative to the PlaceMoE configuration file. The
-launcher validates the initial artifact, topology, calibration metadata,
-runtime performance model, and CPU affinities before reserving accelerators:
+planner automatically reserves a NUMA-balanced subset of the CPUs visible to
+the training process and keeps complete SMT sibling groups together. Explicit
+`planner_cpu_ids` and `training_cpu_ids` remain available as a paired advanced
+override. Validate the initial artifact, topology, calibration metadata,
+runtime performance model, and CPU affinities before launching:
 
 ```bash
 python scripts/placemoe/validate_config.py \
   configs/placemoe/local.yaml
 ```
 
-The included `pretrain.sh` is a reference distributed launcher. For another
-cluster allocation, adapt its host, container, model, and dataset settings or
-set `VEOMNI_PLACEMOE_CONFIG` from an existing VeOmni launcher. The canonical
-optimizer and artifact schema are independent of a particular EP size; the
-configuration, routing snapshots, slot capacities, and calibration artifacts
-must describe the target deployment consistently.
+The scripts under `scripts/placemoe/reproduction/` preserve the NPU and GPU
+EP32 paper testbeds. They are examples for their recorded cluster allocations,
+not additional runtime interfaces. The canonical optimizer and artifact schema
+are independent of a particular accelerator or EP size; the configuration,
+routing snapshots, slot capacities, and calibration artifacts must describe
+the target deployment consistently.
 
 See [PlaceMoE pre-training](docs/usage/placemoe_pretraining.md) for deployment,
 source synchronization, artifact distribution, and failure-policy details.
@@ -184,7 +186,8 @@ are coalesced while training continues with the current pair. With
 | `veomni/distributed/moe/hiermoe/placemoe/` | Routing statistics, allocation, placement, mapping, exact-cost optimization, and artifact validation. |
 | `veomni/distributed/moe/hiermoe/placemoe/runtime/` | Typed configuration, independent update scheduling, asynchronous planner control, and process construction. |
 | `scripts/profile/plan_placemoe.py` | Canonical offline and runtime planner CLI. |
-| `scripts/placemoe/pretrain.sh` | Reference distributed pre-training launcher with config and artifact validation. |
+| `scripts/placemoe/reproduction/npu_ep32.sh` | Original NPU EP32 paper-reproduction launcher. |
+| `scripts/placemoe/reproduction/gpu_ep32/` | GPU EP32 calibration and paper-reproduction matrix. |
 | `configs/placemoe/` | Example runtime and calibration configurations. |
 
 Inspect the planner options with:

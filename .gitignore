@@ -1,6 +1,10 @@
 __pycache__/
 *.py[cod]
 *.so
+*.pt
+*.pth
+*.ckpt
+*.safetensors
 .pytest_cache/
 .ruff_cache/
 .venv/
@@ -9,6 +13,7 @@ dist/
 *.egg-info/
 log.txt
 *.md
+/configs/placemoe/gpu_ep32.env
 !docs/perf/hiermoe_e2e_ablation_guide_zh.md
 !docs/usage/placemoe_pretraining.md
 profile/runs/
@@ -17,6 +22,7 @@ profile/processed/
 pretrain_runs/
 /export_only_prof_dir/
 /route_captures/
+/route_captures_rejected/
 veomni/ops/platform/npu/hiermoe_planner_ops/build/
 
 /results/

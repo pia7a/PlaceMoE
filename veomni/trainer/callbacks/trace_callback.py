@@ -38,6 +38,10 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.lower() in {"1", "true", "yes", "on", "y"}
 
 
+def _true_step_time_enabled() -> bool:
+    return _env_flag("VEOMNI_TRUE_STEP_TIME", bool(os.environ.get("VEOMNI_CONVERGENCE_METRICS_DIR")))
+
+
 if TYPE_CHECKING:
     from ..base import BaseTrainer, VeOmniArguments
 
@@ -392,7 +396,7 @@ class EnvironMeterCallback(Callback):
             data_path=args.data.train_path,
             gc_steps=args.train.gc_steps,
         )
-        self.measure_true_step_time = bool(os.environ.get("VEOMNI_CONVERGENCE_METRICS_DIR"))
+        self.measure_true_step_time = _true_step_time_enabled()
 
     def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         for micro_batch in micro_batches:

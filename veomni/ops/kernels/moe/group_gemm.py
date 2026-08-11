@@ -757,7 +757,7 @@ def group_gemm_fused_moe_forward(
                 start_event=region_start,
                 end_event=region_end,
             )
-            if placement_manager is not None and layer_key is not None:
+            if placement_manager is not None and layer_key is not None and state.layer_swap_forward_enabled:
                 assert layer_key is not None
                 placement_manager.record_dispatch_statistics(
                     layer_key=layer_key,

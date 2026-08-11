@@ -38,6 +38,22 @@ from .utils import sort_fqn_by_submodule_first
 logger = logging.get_logger(__name__)
 
 
+def _resolve_checkpoint_context_fn(external_context_fn):
+    from .moe.hiermoe.state import (
+        hiermoe_checkpoint_context_fn,
+        hiermoe_checkpoint_physical_route_replay_enabled,
+        hiermoe_checkpoint_replay_enabled,
+    )
+
+    if not hiermoe_checkpoint_replay_enabled():
+        return external_context_fn
+    if hiermoe_checkpoint_physical_route_replay_enabled():
+        logger.info_rank0("Enable HierMoE activation-checkpoint physical-route replay.")
+    else:
+        logger.info_rank0("Enable HierMoE activation-checkpoint recompute guard for static physical routes.")
+    return partial(hiermoe_checkpoint_context_fn, external_context_fn)
+
+
 def _reset_hf_initialized_flag(module: nn.Module) -> None:
     if hasattr(module, "_is_hf_initialized"):
         module._is_hf_initialized = False
@@ -446,7 +462,7 @@ def build_parallelize_model(
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={
                 "use_reentrant": use_reentrant,
-                "context_fn": kwargs.pop("recompute_context_fn", noop_context_fn),
+                "context_fn": _resolve_checkpoint_context_fn(kwargs.pop("recompute_context_fn", noop_context_fn)),
             },
         )
 

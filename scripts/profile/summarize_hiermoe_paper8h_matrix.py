@@ -120,8 +120,8 @@ def _read_run(spec: dict[str, Any]) -> dict[str, Any]:
         values = payload.get(metric, {})
         row[f"{metric}_mean"] = values.get("mean")
         row[f"{metric}_std"] = values.get("std")
-    row["peak_npu_allocated_gib"] = payload.get("peak_npu_allocated_gib")
-    row["peak_npu_reserved_gib"] = payload.get("peak_npu_reserved_gib")
+    row["peak_accelerator_allocated_gib"] = payload.get("peak_accelerator_allocated_gib")
+    row["peak_accelerator_reserved_gib"] = payload.get("peak_accelerator_reserved_gib")
     row["shared_profile_train_seconds"] = PROFILE_TRAIN_SECONDS.get(row["dataset"])
     row["offline_layout_seconds"] = payload.get("offline_layout_seconds")
     return row
@@ -150,9 +150,7 @@ def _comparison(
             other["e2e_step_ms_mean"],
         ),
         "throughput_increase_fraction": (
-            other["tokens_per_second_millions_mean"]
-            / base["tokens_per_second_millions_mean"]
-            - 1.0
+            other["tokens_per_second_millions_mean"] / base["tokens_per_second_millions_mean"] - 1.0
         ),
         "forward_a2a_reduction_fraction": _fraction(
             base["forward_a2a_ms_mean"],
@@ -170,11 +168,7 @@ def _comparison(
 
 
 def _paired_repeats(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    selected = [
-        row
-        for row in rows
-        if row["dataset"] == "ShareGPT4V" and row["method"] in {"R2", "Ours"}
-    ]
+    selected = [row for row in rows if row["dataset"] == "ShareGPT4V" and row["method"] in {"R2", "Ours"}]
     by_method: dict[str, list[dict[str, Any]]] = {}
     for row in selected:
         by_method.setdefault(row["method"], []).append(row)
@@ -229,8 +223,7 @@ def _diagnostics() -> list[dict[str, Any]]:
                 "eplb_layout": str(b1_report),
                 "eplb_layout_build_seconds": b1["layout_build_ms"] / 1000.0,
                 "ours_layout": (
-                    "no feasible recursive-classifier placement under both "
-                    "structured and generic-instance seeds"
+                    "no feasible recursive-classifier placement under both structured and generic-instance seeds"
                 ),
             },
             "reason": (
@@ -268,8 +261,7 @@ def _table(rows: list[dict[str, Any]]) -> list[str]:
                     _fmt(row["moe_communication_region_ms_mean"]),
                     _fmt(row["expert_compute_ms_mean"]),
                     _fmt(row["dedup_ratio_dispatch_mean"], 5),
-                    f"{_fmt(row['peak_npu_allocated_gib'])}/"
-                    f"{_fmt(row['peak_npu_reserved_gib'])}",
+                    f"{_fmt(row['peak_accelerator_allocated_gib'])}/{_fmt(row['peak_accelerator_reserved_gib'])}",
                     _fmt(row["shared_profile_train_seconds"]),
                     _fmt(row["offline_layout_seconds"]),
                 )
@@ -289,9 +281,7 @@ def _write_markdown(
     main = [row for row in rows if row["suite"] == "P0-main"]
     data = [row for row in rows if row["suite"] == "P1-data"]
     repeat = [row for row in rows if row["suite"] == "P0-repeat"]
-    comp = {
-        (row["suite"], row["baseline"], row["contender"]): row for row in comparisons
-    }
+    comp = {(row["suite"], row["baseline"], row["contender"]): row for row in comparisons}
     ours_r2 = comp[("P0-main", "R2", "Ours")]
     ours_hire = comp[("P0-main", "HireMoE", "Ours")]
     tulu = comp[("P1-data", "EPLB", "Ours")]
@@ -333,8 +323,7 @@ def _write_markdown(
     for row in diagnostics:
         lines.extend(
             [
-                f"- **{row['suite']} ({row['model']}, B={row['budget']})**: "
-                f"{row['reason']}",
+                f"- **{row['suite']} ({row['model']}, B={row['budget']})**: {row['reason']}",
             ]
         )
     lines.extend(

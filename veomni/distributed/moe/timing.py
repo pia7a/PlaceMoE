@@ -283,6 +283,34 @@ def _sum_span_rows(spans: list[dict[str, Any]], keys: list[str]) -> list[dict[st
     return rows
 
 
+def _individual_span_rows(spans: list[dict[str, Any]], keys: list[str]) -> list[dict[str, Any]]:
+    occurrences: dict[tuple[Any, ...], int] = defaultdict(int)
+    rows = []
+    for span in spans:
+        group_key = tuple(span.get(key) for key in keys)
+        invocation = occurrences[group_key]
+        occurrences[group_key] += 1
+        cuda_ms = float(span["start_event"].elapsed_time(span["end_event"]))
+        wall_ms = float((span["end_event"].wall_time - span["start_event"].wall_time) * 1000.0)
+        row = dict(zip(keys, group_key, strict=True))
+        row.update(
+            {
+                "invocation": invocation,
+                "calls": 1,
+                "cuda_ms_sum": cuda_ms,
+                "cuda_ms_max": cuda_ms,
+                "wall_ms_sum": wall_ms,
+                "wall_ms_max": wall_ms,
+                "tokens": int(span.get("tokens") or 0),
+                "token_expert_assignments": int(span.get("token_expert_assignments") or 0),
+                "cuda_ms_avg": cuda_ms,
+                "wall_ms_avg": wall_ms,
+            }
+        )
+        rows.append(row)
+    return sorted(rows, key=lambda item: tuple(str(item.get(key)) for key in [*keys, "invocation"]))
+
+
 def flush_moe_timing_spans() -> dict[str, Any]:
     global _MOE_TIMING_SPANS
     spans = _MOE_TIMING_SPANS
@@ -291,7 +319,7 @@ def flush_moe_timing_spans() -> dict[str, Any]:
         return {}
 
     synchronize_accelerator()
-    return {
+    payload = {
         "span_layers": _sum_span_rows(spans, ["layer", "direction", "component", "section"]),
         "span_layers_by_phase": _sum_span_rows(spans, ["phase", "layer", "direction", "component", "section"]),
         "span_calls": _sum_span_rows(
@@ -303,3 +331,9 @@ def flush_moe_timing_spans() -> dict[str, Any]:
         "span_components": _sum_span_rows(spans, ["direction", "component"]),
         "span_phase_components": _sum_span_rows(spans, ["phase", "direction", "component"]),
     }
+    if _env_flag("VEOMNI_MOE_TIMING_INDIVIDUAL_SPANS", False):
+        payload["span_invocations"] = _individual_span_rows(
+            [span for span in spans if span.get("component") in {"all_to_all", "expert_compute"}],
+            ["call_index", "micro_batch", "layer", "direction", "component", "section"],
+        )
+    return payload

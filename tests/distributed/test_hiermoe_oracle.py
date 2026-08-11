@@ -155,6 +155,45 @@ def test_distributed_local_capture_writes_each_rank_without_route_collective(tmp
         assert torch.equal(payload["slot_to_logical"], torch.tensor([0, 1, rank]))
 
 
+def test_ordinal_route_capture_wraps_gradient_accumulation_for_call_filter(tmp_path, monkeypatch):
+    output = tmp_path / "step{step:04d}" / "layer{layer_index:02d}_call{call}_rank{rank:02d}.pt"
+    monkeypatch.setattr(oracle_module, "_CAPTURE_PATH_TEMPLATE", str(output))
+    monkeypatch.setattr(oracle_module, "_CAPTURE_CALLS", {})
+    monkeypatch.setattr(oracle_module, "_CAPTURED", set())
+    monkeypatch.setattr(oracle_module, "_CAPTURE_LAYER_ORDINALS", {})
+    monkeypatch.setenv("VEOMNI_HIERMOE_ORACLE_CAPTURE_MODE", "local")
+    monkeypatch.setenv("VEOMNI_HIERMOE_ORACLE_CAPTURE_CALL", "0")
+    monkeypatch.setenv("VEOMNI_HIERMOE_ORACLE_CAPTURE_NUM_LAYERS", "2")
+
+    outputs = []
+    for value in range(4):
+        outputs.append(
+            maybe_capture_route_snapshot(
+                selected_experts=torch.tensor([[value % 2]], dtype=torch.long),
+                num_experts=2,
+                hidden_size=4,
+                bytes_per_element=2,
+                ep_group=None,
+                hierarchy=Hierarchy(ep_size=1, group_sizes=(1,), source="test"),
+                layer_key=None,
+                step=0,
+                selected_dim=1,
+            )
+        )
+
+    assert outputs[:2] == [
+        tmp_path / "step0000" / "layer00_call0_rank00.pt",
+        tmp_path / "step0000" / "layer01_call0_rank00.pt",
+    ]
+    assert outputs[2:] == [None, None]
+    assert sorted(path.name for path in (tmp_path / "step0000").glob("*.pt")) == [
+        "layer00_call0_rank00.pt",
+        "layer01_call0_rank00.pt",
+    ]
+    assert oracle_module._CAPTURE_CALLS[(0, "model.layers.0.mlp.experts")] == 2
+    assert oracle_module._CAPTURE_CALLS[(0, "model.layers.1.mlp.experts")] == 2
+
+
 class _FakeExperts(torch.nn.Module):
     def __init__(self, num_experts: int, num_local_experts: int):
         super().__init__()

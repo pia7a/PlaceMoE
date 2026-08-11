@@ -12,27 +12,7 @@ from pathlib import Path
 from veomni.distributed.moe.hiermoe.placemoe.artifacts import validate_placemoe_artifact
 from veomni.distributed.moe.hiermoe.placemoe.runtime import PlaceMoERuntimeConfig
 from veomni.distributed.moe.hiermoe.placemoe.runtime.config import PlaceMoEConfigurationError
-
-
-def _parse_cpu_ids(value: str) -> set[int]:
-    result: set[int] = set()
-    for item in value.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        if "-" in item:
-            lower_text, upper_text = item.split("-", 1)
-            lower = int(lower_text)
-            upper = int(upper_text)
-            if lower < 0 or upper < lower:
-                raise PlaceMoEConfigurationError(f"invalid CPU range {item!r}.")
-            result.update(range(lower, upper + 1))
-        else:
-            cpu_id = int(item)
-            if cpu_id < 0:
-                raise PlaceMoEConfigurationError(f"invalid CPU id {cpu_id}.")
-            result.add(cpu_id)
-    return result
+from veomni.distributed.moe.hiermoe.placemoe.runtime.cpu_affinity import resolve_cpu_affinity
 
 
 def _parse_args() -> argparse.Namespace:
@@ -54,11 +34,8 @@ def main() -> None:
     if not runtime_perf_model.is_file():
         raise PlaceMoEConfigurationError(f"runtime performance model does not exist: {runtime_perf_model}.")
 
-    planner_ids = _parse_cpu_ids(config.resources.planner_cpu_ids)
-    training_ids = _parse_cpu_ids(config.resources.training_cpu_ids)
-    overlap = sorted(planner_ids & training_ids)
-    if overlap:
-        raise PlaceMoEConfigurationError(f"planner and training CPU affinities overlap: {overlap}.")
+    cpu_plan = resolve_cpu_affinity(config.resources)
+    planner_resources = cpu_plan.planner_resources()
 
     calibration_metadata: dict[str, object] = {}
     if config.calibration.artifact:
@@ -82,6 +59,15 @@ def main() -> None:
         "layout_interval_steps": config.hot_update.layout_interval_steps,
         "mapping_interval_steps": config.hot_update.mapping_interval_steps,
         "last_update_step": config.hot_update.last_update_step,
+        "cpu_affinity": {
+            "mode": "auto" if cpu_plan.automatic else "explicit",
+            "training_cpu_ids": planner_resources.training_cpu_ids,
+            "planner_cpu_ids": planner_resources.planner_cpu_ids,
+            "planner_physical_cores": cpu_plan.planner_physical_cores,
+            "workers": cpu_plan.workers,
+            "candidate_workers": cpu_plan.candidate_workers,
+            "worker_threads": cpu_plan.worker_threads,
+        },
     }
     print(json.dumps(summary, indent=2, sort_keys=True))
 

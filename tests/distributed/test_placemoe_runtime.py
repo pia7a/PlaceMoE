@@ -28,10 +28,12 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     build_placemoe_artifact,
 )
 from veomni.distributed.moe.hiermoe.placemoe.runtime import HotUpdateController
+from veomni.distributed.moe.hiermoe.placemoe.runtime.config import PlaceMoEPlannerResources
 
 
 def _runtime_manager() -> ExpertSwapManager:
     manager = object.__new__(ExpertSwapManager)
+    manager._hot_update_resources = PlaceMoEPlannerResources()
     manager.ep_rank = 0
     manager.ep_size = 1
     manager.ep_group = None
@@ -148,7 +150,6 @@ def test_hot_update_passes_calibration_coefficients_to_planner(monkeypatch, tmp_
     manager._hot_update_builder_path = lambda: "/bin/true"
     manager._hot_update_event = lambda *_args, **_kwargs: None
     monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE_WORK_ROOT", str(tmp_path))
-    monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE_CPU_IDS", "")
     monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE_INTER_MS_PER_BYTE", 1.25)
     monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE_INTRA_MS_PER_BYTE", 2.5)
     monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE_ROUTE_MS_PER_ASSIGNMENT", 3.75)

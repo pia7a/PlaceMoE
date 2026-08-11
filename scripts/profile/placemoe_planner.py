@@ -184,6 +184,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--ep-size", type=int, default=32)
     parser.add_argument("--ranks-per-node", type=int, default=8)
+    parser.add_argument(
+        "--hierarchy-group-sizes",
+        type=_parse_int_list,
+        default=(),
+        help="Optional runtime hierarchy chain; legacy callers retain ranks-per-node,EP.",
+    )
     parser.add_argument("--num-experts", type=int, default=128)
     parser.add_argument(
         "--slots-per-rank",
@@ -265,6 +271,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-size", type=int, default=2048)
     parser.add_argument("--bytes-per-element", type=int, default=2)
     parser.add_argument("--inter-ms-per-byte", type=float, default=6.765449326279194e-08)
+    parser.add_argument(
+        "--mid-ms-per-byte",
+        type=float,
+        default=None,
+        help="Optional middle-link coefficient for a three-stage hierarchy.",
+    )
     parser.add_argument("--intra-ms-per-byte", type=float, default=5.02482606728045e-09)
     parser.add_argument("--route-ms-per-assignment", type=float, default=8.746548178958447e-05)
     parser.add_argument("--communication-phase-multiplier", type=float, default=3.1)
@@ -315,15 +327,44 @@ def _source_statistics(
     return statistics.demand.copy(), statistics.affinity.copy()
 
 
-def _partition_coefficients(args: argparse.Namespace) -> tuple[float, float, float]:
-    """Return calibrated inter-node, intra-node, and compute coefficients."""
+def _hierarchy_coefficients(
+    args: argparse.Namespace,
+) -> tuple[tuple[int, ...], tuple[float, ...], float]:
+    """Return the runtime hierarchy, per-stage affinity weights, and compute weight."""
 
+    hierarchy_group_sizes = tuple(
+        int(size) for size in (getattr(args, "hierarchy_group_sizes", ()) or (args.ranks_per_node, args.ep_size))
+    )
+    if hierarchy_group_sizes[-1] != args.ep_size or len(hierarchy_group_sizes) not in {2, 3}:
+        raise ValueError("PlaceMoE requires a two- or three-stage EP hierarchy.")
+    if any(lhs <= 0 or rhs % lhs for lhs, rhs in zip(hierarchy_group_sizes, hierarchy_group_sizes[1:], strict=False)):
+        raise ValueError("Hierarchy group sizes must form an increasing divisibility chain.")
+    middle = getattr(args, "mid_ms_per_byte", None)
+    if len(hierarchy_group_sizes) == 3:
+        link_coefficients = (
+            float(args.inter_ms_per_byte),
+            float(args.inter_ms_per_byte if middle is None else middle),
+            float(args.intra_ms_per_byte),
+        )
+    else:
+        link_coefficients = (
+            float(args.inter_ms_per_byte),
+            float(args.intra_ms_per_byte),
+        )
+    if any(coefficient < 0.0 for coefficient in link_coefficients):
+        raise ValueError("Hierarchy link coefficients must be non-negative.")
     payload_bytes = float(args.hidden_size * args.bytes_per_element)
-    communication_multiplier = float(args.communication_phase_multiplier)
-    node_omega = communication_multiplier * payload_bytes * float(args.inter_ms_per_byte)
-    rank_omega = communication_multiplier * payload_bytes * float(args.intra_ms_per_byte)
+    multiplier = float(args.communication_phase_multiplier) * payload_bytes
+    level_omegas = tuple(multiplier * coefficient for coefficient in link_coefficients)
     gamma = float(args.compute_phase_multiplier) * float(args.compute_ms_per_assignment)
-    return node_omega, rank_omega, gamma
+    return hierarchy_group_sizes, level_omegas, gamma
+
+
+def _partition_coefficients(args: argparse.Namespace) -> tuple[float, float, float]:
+    """Return compatibility aliases for coarse, rank, and compute coefficients."""
+
+    _hierarchy, level_omegas, gamma = _hierarchy_coefficients(args)
+    return level_omegas[0], level_omegas[-1], gamma
 
 
 def _logical_base_partitions(
@@ -1063,6 +1104,8 @@ def _classify_instances(
     node_omega: float,
     rank_omega: float,
     gamma: float,
+    hierarchy_group_sizes: tuple[int, ...] = (),
+    level_omegas: tuple[float, ...] = (),
 ) -> np.ndarray:
     result = place_instances(
         instance_demand,
@@ -1078,6 +1121,8 @@ def _classify_instances(
             node_exchange_limit=iterations,
             rank_exchange_limit=max(1, iterations // 2),
             seed=seed,
+            hierarchy_group_sizes=hierarchy_group_sizes,
+            level_omegas=level_omegas,
         ),
     )
     return result.instance_ranks.copy()
@@ -1090,6 +1135,7 @@ def _initial_lut_instances(
     *,
     ranks_per_node: int,
     prefer_local: bool = True,
+    hierarchy_group_sizes: tuple[int, ...] = (),
 ) -> np.ndarray:
     return initialize_mapping(
         logical_instances,
@@ -1097,6 +1143,7 @@ def _initial_lut_instances(
         demand_by_source,
         ranks_per_node=ranks_per_node,
         prefer_node_local=prefer_local,
+        hierarchy_group_sizes=hierarchy_group_sizes,
     )
 
 
@@ -1112,6 +1159,8 @@ def _optimize_lut_instances(
     node_omega: float,
     rank_omega: float,
     gamma: float,
+    hierarchy_group_sizes: tuple[int, ...] = (),
+    level_omegas: tuple[float, ...] = (),
 ) -> np.ndarray:
     statistics = ProfileStatistics(demand=demand_by_source, affinity=affinity_by_source)
     result = optimize_mapping(
@@ -1125,6 +1174,8 @@ def _optimize_lut_instances(
             rank_omega=rank_omega,
             gamma=gamma,
             sweep_limit=iterations,
+            hierarchy_group_sizes=hierarchy_group_sizes,
+            level_omegas=level_omegas,
         ),
     )
     return result.mapping.copy()
@@ -1183,10 +1234,11 @@ def _build_placemoe_candidate(
         demand=demand_by_source,
         affinity=np.zeros_like(affinity_by_source) if communication_blind else affinity_by_source,
     )
-    node_omega, rank_omega, gamma = _partition_coefficients(args)
+    hierarchy_group_sizes, level_omegas, gamma = _hierarchy_coefficients(args)
     if communication_blind:
-        node_omega = 0.0
-        rank_omega = 0.0
+        level_omegas = tuple(0.0 for _ in level_omegas)
+    node_omega = level_omegas[0]
+    rank_omega = level_omegas[-1]
     topology = PlaceMoETopology(
         ep_size=args.ep_size,
         ranks_per_node=args.ranks_per_node,
@@ -1225,6 +1277,8 @@ def _build_placemoe_candidate(
                 calibrated_mapping_refinement=calibrated_partition_refinement,
                 carry_mapping_across_rounds=calibrated_partition_refinement,
                 calibrated_partition_refinement=calibrated_partition_refinement,
+                hierarchy_group_sizes=hierarchy_group_sizes,
+                level_omegas=level_omegas,
             ),
             evaluate,
         )
@@ -1300,10 +1354,11 @@ def _build_candidate(
             logical_instances=logical_instances,
         )
     best: _Candidate | None = None
-    node_omega, rank_omega, gamma = _partition_coefficients(args)
+    hierarchy_group_sizes, level_omegas, gamma = _hierarchy_coefficients(args)
     if communication_blind:
-        node_omega = 0.0
-        rank_omega = 0.0
+        level_omegas = tuple(0.0 for _ in level_omegas)
+    node_omega = level_omegas[0]
+    rank_omega = level_omegas[-1]
     for alternation in range(args.alternations):
         instance_ranks = _greedy_ranks_with_fixed_nodes(
             fixed_instance_nodes,
@@ -1320,6 +1375,7 @@ def _build_candidate(
                 demand_by_source,
                 ranks_per_node=args.ranks_per_node,
                 prefer_local=not communication_blind,
+                hierarchy_group_sizes=hierarchy_group_sizes,
             )
         else:
             initial_lut = fixed_initial_lut
@@ -1337,6 +1393,8 @@ def _build_candidate(
                     node_omega=node_omega,
                     rank_omega=rank_omega,
                     gamma=gamma,
+                    hierarchy_group_sizes=hierarchy_group_sizes,
+                    level_omegas=level_omegas,
                 )
             )
         for lut_instances in lut_variants:
@@ -1396,6 +1454,7 @@ def _build_candidate(
 def _validate_configuration(args: argparse.Namespace) -> _CapacityPlan:
     if args.ep_size % args.ranks_per_node:
         raise ValueError("EP size must be divisible by ranks per node.")
+    _hierarchy_coefficients(args)
     if args.num_experts <= 0 or args.ep_size <= 0:
         raise ValueError("Expert and EP sizes must be positive.")
     community_shortlist = int(getattr(args, "community_shortlist", 2))
@@ -1475,6 +1534,9 @@ def _preloaded_replay_payload(
             "layer_name_template": args.layer_name_template,
             "layer_keys": list(args.layer_keys),
             "update_mode": getattr(args, "update_mode", "full"),
+            "hierarchy_group_sizes": list(
+                getattr(args, "hierarchy_group_sizes", ()) or (args.ranks_per_node, args.ep_size)
+            ),
         },
     )
 
@@ -1501,7 +1563,9 @@ def _plan_fixed_mapping_layer(
         num_experts=args.num_experts,
         slots_per_rank=args.slots_per_rank,
     )
-    node_omega, rank_omega, gamma = _partition_coefficients(args)
+    hierarchy_group_sizes, level_omegas, gamma = _hierarchy_coefficients(args)
+    node_omega = level_omegas[0]
+    rank_omega = level_omegas[-1]
     statistics = ProfileStatistics(demand=source_demand, affinity=source_affinity)
     evaluated: dict[bytes, HybridCost] = {}
 
@@ -1523,6 +1587,8 @@ def _plan_fixed_mapping_layer(
             rank_omega=rank_omega,
             gamma=gamma,
             mapping_sweep_limit=args.lut_iterations,
+            hierarchy_group_sizes=hierarchy_group_sizes,
+            level_omegas=level_omegas,
         ),
         evaluate,
     )

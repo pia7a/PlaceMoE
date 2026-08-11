@@ -67,13 +67,13 @@ from .placemoe.runtime import (
     HotUpdateController,
     HotUpdateJob,
     PlaceMoECalibration,
-    PlaceMoEPlannerResources,
     PlaceMoERuntimeConfig,
     PlannerCommandSpec,
     UpdateKind,
     build_planner_command,
     planner_environment,
 )
+from .placemoe.runtime.cpu_affinity import resolve_cpu_affinity
 from .placemoe.types import LayerPlan, PlaceMoETopology
 from .planner import (
     CurrentRoutePlanner,
@@ -200,10 +200,10 @@ _ABLATION_REPLAY_PATH = os.environ.get("VEOMNI_HIERMOE_ABLATION_REPLAY_PATH", ""
 _ABLATION_REPLAY_MODE = os.environ.get("VEOMNI_HIERMOE_ABLATION_REPLAY_MODE", "off").strip().lower()
 _ABLATION_MIGRATION_MODE = os.environ.get("VEOMNI_HIERMOE_ABLATION_MIGRATION_MODE", "hidden").strip().lower()
 _ABLATION_GRAD_MODE = os.environ.get("VEOMNI_HIERMOE_ABLATION_GRAD_MODE", "hidden").strip().lower()
-_STATIC_PRELOAD_LAYOUT_PATH = os.environ.get("VEOMNI_HIERMOE_STATIC_PRELOAD_LAYOUT_PATH", "").strip()
+_INITIAL_LAYOUT_PATH = os.environ.get("VEOMNI_HIERMOE_INITIAL_LAYOUT", "").strip()
 _PLACEMOE_RUNTIME_CONFIG = PlaceMoERuntimeConfig.from_environment()
 if _PLACEMOE_RUNTIME_CONFIG.source_path:
-    _STATIC_PRELOAD_LAYOUT_PATH = _PLACEMOE_RUNTIME_CONFIG.initial_artifact
+    _INITIAL_LAYOUT_PATH = _PLACEMOE_RUNTIME_CONFIG.initial_artifact
     _ABLATION_REPLAY_PATH = _PLACEMOE_RUNTIME_CONFIG.initial_artifact
 _CPU_PLANNER_MODE = os.environ.get("VEOMNI_HIERMOE_CPU_PLANNER_MODE", "off").strip().lower()
 _CPU_TRAIN_CORES_PER_RANK = _env_int("VEOMNI_HIERMOE_CPU_TRAIN_CORES_PER_RANK", 8)
@@ -219,12 +219,8 @@ _NPU_LAYER_OWNER_COLLECTIVE = (
 _HOT_UPDATE = _PLACEMOE_RUNTIME_CONFIG.hot_update.enabled
 _HOT_UPDATE_WORK_ROOT = _PLACEMOE_RUNTIME_CONFIG.hot_update.work_root
 _HOT_UPDATE_BUILDER = _PLACEMOE_RUNTIME_CONFIG.hot_update.planner_path
-_HOT_UPDATE_WORKERS = _PLACEMOE_RUNTIME_CONFIG.resources.workers
-_HOT_UPDATE_CANDIDATE_WORKERS = _PLACEMOE_RUNTIME_CONFIG.resources.candidate_workers
-_HOT_UPDATE_WORKER_THREADS = _PLACEMOE_RUNTIME_CONFIG.resources.worker_threads
+_HOT_UPDATE_RESOURCES = _PLACEMOE_RUNTIME_CONFIG.resources
 _HOT_UPDATE_LAST_STEP = _PLACEMOE_RUNTIME_CONFIG.hot_update.last_update_step
-_HOT_UPDATE_CPU_IDS = _PLACEMOE_RUNTIME_CONFIG.resources.planner_cpu_ids
-_HOT_UPDATE_TRAIN_CPU_IDS = _PLACEMOE_RUNTIME_CONFIG.resources.training_cpu_ids
 _HOT_UPDATE_LAYOUT_INTERVAL = _PLACEMOE_RUNTIME_CONFIG.hot_update.layout_interval_steps
 _HOT_UPDATE_MAPPING_INTERVAL = _PLACEMOE_RUNTIME_CONFIG.hot_update.mapping_interval_steps
 _HOT_UPDATE_INTER_MS_PER_BYTE = _PLACEMOE_RUNTIME_CONFIG.calibration.inter_ms_per_byte
@@ -414,6 +410,7 @@ class _PendingLayerTiming:
 class _CostModelTiming:
     step: int
     physical_routes: torch.Tensor
+    local_expert_token_counts: torch.Tensor
     local_assignment_count: torch.Tensor
     communication_events: dict[str, tuple[AcceleratorEvent, AcceleratorEvent]] | None
     dispatch_start: AcceleratorEvent
@@ -730,6 +727,8 @@ class _PipelineMigrationResult:
 class _PipelineGradResult:
     layer_key: str
     raw_ms: float
+    start_event: AcceleratorEvent | None = None
+    completion_event: AcceleratorEvent | None = None
 
 
 @dataclass(frozen=True)
@@ -2922,8 +2921,7 @@ class ExpertSwapManager:
                 "round for every redundant slot."
             )
         if _COST_MODEL_VERIFY and (
-            not self.fixed_pipeline_overlap
-            or self.expert_swap_mode != "step"
+            self.expert_swap_mode != "step"
             or self.expert_swap_selector != "hiermoe_greedy_cover_p1"
             or not _FIXED_R2_LAYOUT
             or self.expert_swap_max_pairs_per_layer != 0
@@ -2931,7 +2929,7 @@ class ExpertSwapManager:
             or _FORWARD_REUSE_COVER
         ):
             raise ValueError(
-                "Cost-model verification requires fixed R2, fixed-pipeline step mode, "
+                "Cost-model verification requires fixed R2 step mode, "
                 "the hiermoe_greedy_cover_p1 selector, zero swaps, and all placement "
                 "experiments disabled."
             )
@@ -2957,7 +2955,7 @@ class ExpertSwapManager:
             or self.expert_swap_mode != "step"
             or self.expert_swap_selector != "hiermoe_greedy_cover_p1"
             or _ABLATION_REPLAY_MODE != "static"
-            or not _STATIC_PRELOAD_LAYOUT_PATH
+            or not _INITIAL_LAYOUT_PATH
             or not _FORWARD_REUSE_COVER
             or not _FORWARD_REUSE_COVER_PATCH_REMAP
             or _ONLINE_LUT_UPDATE
@@ -3002,11 +3000,12 @@ class ExpertSwapManager:
                 "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_SERVICE_SCOPE must be rank or node, "
                 f"got {_FORWARD_REUSE_COVER_SERVICE_SCOPE!r}."
             )
-        if _ABLATION_REPLAY_MODE != "off" and not self.fixed_pipeline_overlap:
-            raise ValueError("HierMoE ablation replay requires fixed_pipeline_overlap=true.")
+        if _ABLATION_REPLAY_MODE == "step" and not self.fixed_pipeline_overlap:
+            raise ValueError("Step-by-step HierMoE ablation replay requires fixed_pipeline_overlap=true.")
         if _ABLATION_REPLAY_MODE != "off" and not _ABLATION_REPLAY_PATH:
             raise ValueError("VEOMNI_HIERMOE_ABLATION_REPLAY_PATH is required when ablation replay is enabled.")
         self._ablation_replay_mode = _ABLATION_REPLAY_MODE
+        self._initial_layout_path = _INITIAL_LAYOUT_PATH
         self._ablation_migration_mode = _ABLATION_MIGRATION_MODE
         self._ablation_grad_mode = _ABLATION_GRAD_MODE
         self._cpu_planner_mode = _CPU_PLANNER_MODE
@@ -3052,13 +3051,9 @@ class ExpertSwapManager:
         self._forward_reuse_cover_pending: dict[str, tuple[PlacementAction, int]] = {}
         self._hot_update = _HOT_UPDATE
         self._hot_update_layout_interval = (
-            self.expert_swap_interval
-            if _HOT_UPDATE_LAYOUT_INTERVAL is None
-            else _HOT_UPDATE_LAYOUT_INTERVAL
+            self.expert_swap_interval if _HOT_UPDATE_LAYOUT_INTERVAL is None else _HOT_UPDATE_LAYOUT_INTERVAL
         )
-        self._hot_update_mapping_interval = (
-            0 if _HOT_UPDATE_MAPPING_INTERVAL is None else _HOT_UPDATE_MAPPING_INTERVAL
-        )
+        self._hot_update_mapping_interval = 0 if _HOT_UPDATE_MAPPING_INTERVAL is None else _HOT_UPDATE_MAPPING_INTERVAL
         self._hot_update_controller = HotUpdateController(
             layout_interval_steps=self._hot_update_layout_interval,
             mapping_interval_steps=self._hot_update_mapping_interval,
@@ -3091,27 +3086,33 @@ class ExpertSwapManager:
         self._ablation_expected_owner_slots: dict[str, tuple[int, ...]] = {}
         self._ablation_expected_source_luts: dict[str, tuple[tuple[int, ...], ...]] = {}
         self._ablation_initial_layout = ""
-        if self._ablation_replay_mode != "off":
-            self._load_ablation_replay(_ABLATION_REPLAY_PATH)
+        layout_metadata_path = self._initial_layout_path or (
+            _ABLATION_REPLAY_PATH if self._ablation_replay_mode != "off" else ""
+        )
+        if layout_metadata_path:
+            self._load_ablation_replay(layout_metadata_path)
 
         self.activation_checkpointing_enabled = bool(activation_checkpointing_enabled)
+        self.gradient_overlap_enabled = bool(
+            self._ablation_grad_mode == "hidden"
+            and self.redundant_slot_increment_per_device > 0
+            and ep_group is not None
+        )
         self._swap_group = (
             _create_expert_swap_process_group(ep_group, self.ep_size)
             if self.expert_swap_max_pairs_per_layer > 0 and not self.fixed_pipeline_overlap
             else None
         )
         # Planner and migration collectives are serialized and can reuse the
-        # training EP group. Hidden replica-gradient P2P is launched from a
-        # separate NPU stream while backward/FSDP collectives are active.
+        # training EP group. Hidden replica-gradient P2P is launched on a
+        # separate accelerator stream while backward/FSDP collectives are active.
         # Arbitrary partial-capacity layouts require multiple peer waves, so
         # sharing the training group can violate cross-stream HCCL ordering.
         # Give only that path a dedicated group.
         self._pipeline_background_group = ep_group if self.fixed_pipeline_overlap else None
         self._pipeline_planner_group = self._pipeline_background_group
         self._pipeline_migration_group = self._pipeline_background_group
-        self._owns_pipeline_grad_group = bool(
-            self.fixed_pipeline_overlap and self._ablation_grad_mode == "hidden" and ep_group is not None
-        )
+        self._owns_pipeline_grad_group = self.gradient_overlap_enabled
         self._pipeline_grad_group = (
             _create_expert_swap_process_group(
                 ep_group,
@@ -3131,7 +3132,7 @@ class ExpertSwapManager:
         # Replica-gradient waves are executed layer by layer and synchronously
         # waited. Reuse one manager-wide staging pool instead of retaining a
         # send/receive pair for every layer.
-        self._replica_grad_buffers: dict[tuple[str, int, str, str, int], torch.Tensor] = {}
+        self._replica_grad_buffers: dict[tuple[str, int, str, str], torch.Tensor] = {}
         self._swap_staging_buffers: dict[tuple[torch.device, torch.dtype], _SwapStagingBuffer] = {}
         self._swap_comm_streams: dict[torch.device, Any] = {}
         self._pending_layer_swaps: dict[str, _PendingLayerSwap] = {}
@@ -3162,11 +3163,8 @@ class ExpertSwapManager:
             if self.fixed_pipeline_overlap
             else None
         )
-        self._pipeline_grad_executor = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="hiermoe-grad")
-            if self.fixed_pipeline_overlap
-            else None
-        )
+        # NCCL host launches stay on the autograd thread; GPU work overlaps on its dedicated stream.
+        self._pipeline_grad_executor = None
         self._cpu_plan_executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="hiermoe-cpu-batch")
             if self._cpu_planner_mode == "background"
@@ -3192,6 +3190,9 @@ class ExpertSwapManager:
         self._cpu_process_runtime: Any | None = None
         self._cpu_training_affinity: tuple[int, ...] = ()
         self._cpu_planner_affinity: tuple[int, ...] = ()
+        self._hot_update_resources = _HOT_UPDATE_RESOURCES
+        self._hot_update_affinity_automatic = False
+        self._hot_update_planner_physical_cores = 0
         self._pipeline_step = -1
         self._pipeline_micro_step = 0
         self._pipeline_num_micro_steps = 1
@@ -3436,12 +3437,7 @@ class ExpertSwapManager:
 
     @torch.no_grad()
     def _install_static_ablation_layout(self) -> None:
-        if _STATIC_PRELOAD_LAYOUT_PATH:
-            if _STATIC_PRELOAD_LAYOUT_PATH != _ABLATION_REPLAY_PATH:
-                raise RuntimeError(
-                    "HierMoE static preload and ablation replay must use the same layout file: "
-                    f"preload={_STATIC_PRELOAD_LAYOUT_PATH!r}, replay={_ABLATION_REPLAY_PATH!r}."
-                )
+        if self._initial_layout_path:
             for layer_key, layer in self.layers.items():
                 expected_layout = self._ablation_expected_layouts[layer_key]
                 validated_layout, _owners = self._validate_placement_layout(
@@ -3458,8 +3454,8 @@ class ExpertSwapManager:
             self._install_static_ablation_route_metadata()
             self._validate_ablation_final_layout()
             logger.info_rank0(
-                "HierMoE installed preloaded static ablation metadata from %s without expert P2P.",
-                _STATIC_PRELOAD_LAYOUT_PATH,
+                "HierMoE installed preloaded static placement metadata from %s without expert P2P.",
+                self._initial_layout_path,
             )
             return
 
@@ -3589,7 +3585,8 @@ class ExpertSwapManager:
 
     def placement_planning_enabled(self) -> bool:
         return self._online_lut_update or (
-            self._ablation_replay_mode == "off"
+            not self._initial_layout_path
+            and self._ablation_replay_mode != "static"
             and (self.expert_swap_max_pairs_per_layer > 0 or self.redundant_slot_increment_per_device > 0)
         )
 
@@ -3622,6 +3619,7 @@ class ExpertSwapManager:
             "hiermoe/cost_model_verify": int(self._cost_model_verify),
             "hiermoe/expert_swap_selector": self.expert_swap_selector,
             "hiermoe/fixed_pipeline_overlap": int(self.fixed_pipeline_overlap),
+            "hiermoe/gradient_overlap_enabled": int(self.gradient_overlap_enabled),
             "hiermoe/cpu_planner_mode": self._cpu_planner_mode,
             "hiermoe/cpu_training_affinity_cores": len(self._cpu_training_affinity),
             "hiermoe/cpu_planner_affinity_cores": len(self._cpu_planner_affinity),
@@ -3637,21 +3635,12 @@ class ExpertSwapManager:
             "hiermoe/online_lut_update": int(self._online_lut_update),
             "hiermoe/online_lut_start_step": self._online_lut_start_step,
             "hiermoe/online_lut_min_gain": self._online_lut_min_gain,
-            "hiermoe/periodic_full_replan": int(self._hot_update),
-            "hiermoe/periodic_layout_refresh_interval": self._hot_update_layout_interval,
-            "hiermoe/periodic_mapping_refresh_interval": self._hot_update_mapping_interval,
-            "hiermoe/periodic_full_replan_running": int(self._hot_update_controller.active_job is not None),
-            "hiermoe/periodic_full_replan_updates": self._hot_update_updates,
-            "hiermoe/periodic_layout_updates": self._hot_update_layout_updates,
-            "hiermoe/periodic_mapping_updates": self._hot_update_mapping_updates,
-            "hiermoe/periodic_full_replan_last_source_step": self._hot_update_last_source_step,
-            "hiermoe/periodic_full_replan_last_apply_step": self._hot_update_last_apply_step,
-            "hiermoe/periodic_full_replan_last_staleness_steps": (self._hot_update_last_staleness_steps),
-            "hiermoe/periodic_full_replan_last_snapshot_ms": self._hot_update_last_snapshot_ms,
-            "hiermoe/periodic_full_replan_last_planner_ms": self._hot_update_last_planner_ms,
-            "hiermoe/periodic_full_replan_last_migration_ms": self._hot_update_last_migration_ms,
-            "hiermoe/periodic_full_replan_last_moved_slots": self._hot_update_last_moved_slots,
             "placemoe/hot_update_enabled": int(self._hot_update),
+            "placemoe/cpu_affinity_automatic": int(self._hot_update_affinity_automatic),
+            "placemoe/planner_physical_cores": self._hot_update_planner_physical_cores,
+            "placemoe/planner_workers": self._hot_update_resources.workers,
+            "placemoe/planner_candidate_workers": self._hot_update_resources.candidate_workers,
+            "placemoe/planner_worker_threads": self._hot_update_resources.worker_threads,
             "placemoe/layout_interval_steps": self._hot_update_layout_interval,
             "placemoe/mapping_interval_steps": self._hot_update_mapping_interval,
             "placemoe/hot_update_running": int(self._hot_update_controller.active_job is not None),
@@ -3758,9 +3747,9 @@ class ExpertSwapManager:
         return result
 
     def configure_pipeline_microstep(self, step: int, micro_step: int, num_micro_steps: int) -> None:
-        """Advance the fixed pipeline at a deterministic microbatch boundary."""
+        """Advance placement and gradient-overlap state at a microbatch boundary."""
 
-        if not self.fixed_pipeline_overlap:
+        if not self.fixed_pipeline_overlap and not self.gradient_overlap_enabled:
             return
         self._pipeline_step = int(step)
         self._pipeline_micro_step = int(micro_step)
@@ -3769,10 +3758,6 @@ class ExpertSwapManager:
             return
         self._debug_log_redundant_copy_stats("step_begin", include_grads=False)
         self._begin_metrics_step(step)
-        if self._uses_cpu_process_planner():
-            self._ensure_cpu_process_runtime()
-        if self._ablation_replay_mode == "off" and not self._npu_layer_owner_blocking:
-            self._ensure_pipeline_plan_worker_capacity()
         with self._pipeline_lock:
             if self._pipeline_grad_futures:
                 raise RuntimeError("HierMoE started a new step before redundant gradient synchronization completed.")
@@ -3785,6 +3770,12 @@ class ExpertSwapManager:
             self._pipeline_layer_order = tuple(self.layers)
             self._pipeline_next_migration_index = 0
             self._pipeline_next_grad_index = 0
+        if not self.fixed_pipeline_overlap:
+            return
+        if self._uses_cpu_process_planner():
+            self._ensure_cpu_process_runtime()
+        if self._ablation_replay_mode == "off" and not self._npu_layer_owner_blocking:
+            self._ensure_pipeline_plan_worker_capacity()
         if self._ablation_migration_mode == "hidden":
             self._launch_next_pipeline_migration()
 
@@ -3936,40 +3927,30 @@ class ExpertSwapManager:
                 continue
         os.sched_setaffinity(0, cpus)
 
-    @staticmethod
-    def _parse_cpu_ids(value: str) -> tuple[int, ...]:
-        cpu_ids: set[int] = set()
-        for raw_part in value.split(","):
-            part = raw_part.strip()
-            if not part:
-                continue
-            if "-" not in part:
-                cpu_ids.add(int(part))
-                continue
-            raw_start, raw_end = part.split("-", maxsplit=1)
-            start = int(raw_start)
-            end = int(raw_end)
-            if start < 0 or end < start:
-                raise ValueError(f"Invalid CPU range {part!r}.")
-            cpu_ids.update(range(start, end + 1))
-        return tuple(sorted(cpu_ids))
-
     def _configure_hot_update_training_affinity(self) -> None:
-        if not self._hot_update or not _HOT_UPDATE_TRAIN_CPU_IDS:
+        if not self._hot_update:
             return
         node_rank = int(os.environ.get("GROUP_RANK", os.environ.get("NODE_RANK", "0")))
         if node_rank != 0:
             return
-        cpu_ids = self._parse_cpu_ids(_HOT_UPDATE_TRAIN_CPU_IDS)
-        if not cpu_ids:
-            raise ValueError("PlaceMoE training CPU affinity must not be empty.")
-        visible = set(os.sched_getaffinity(0))
-        unavailable = set(cpu_ids) - visible
-        if unavailable:
-            raise RuntimeError(f"PlaceMoE training CPUs are not visible: {sorted(unavailable)}.")
-        self._bind_all_process_threads(cpu_ids)
-        self._cpu_training_affinity = cpu_ids
-        logger.info_rank0("PlaceMoE reserved training CPU affinity %s for hot updates.", cpu_ids)
+        plan = resolve_cpu_affinity(_HOT_UPDATE_RESOURCES)
+        self._bind_all_process_threads(plan.training_cpu_ids)
+        self._cpu_training_affinity = plan.training_cpu_ids
+        self._cpu_planner_affinity = plan.planner_cpu_ids
+        self._hot_update_resources = plan.planner_resources()
+        self._hot_update_affinity_automatic = plan.automatic
+        self._hot_update_planner_physical_cores = plan.planner_physical_cores
+        logger.info_rank0(
+            "PlaceMoE isolated hot-update CPU planner mode=%s training_cpus=%s planner_cpus=%s "
+            "planner_physical_cores=%s workers=%s candidate_workers=%s worker_threads=%s.",
+            "auto" if plan.automatic else "explicit",
+            self._hot_update_resources.training_cpu_ids,
+            self._hot_update_resources.planner_cpu_ids,
+            plan.planner_physical_cores,
+            plan.workers,
+            plan.candidate_workers,
+            plan.worker_threads,
+        )
 
     def _cpu_process_affinity_masks(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
         visible = sorted(os.sched_getaffinity(0))
@@ -5164,7 +5145,7 @@ class ExpertSwapManager:
             self._finish_pipeline_migration(active[0], wait=True)
 
     def _register_pipeline_gradient_hooks(self, layer: ExpertLayerState) -> None:
-        if not self.fixed_pipeline_overlap or self._ablation_grad_mode != "hidden":
+        if not self.gradient_overlap_enabled:
             return
         for param_index, param in enumerate((layer.gate_up_proj, layer.down_proj)):
             if id(param) in self._pipeline_grad_hook_params:
@@ -5172,7 +5153,7 @@ class ExpertSwapManager:
             register = getattr(param, "register_post_accumulate_grad_hook", None)
             if register is None:
                 logger.warning_rank0(
-                    "HierMoE fixed pipeline cannot register a post-accumulate hook for layer %s; "
+                    "HierMoE gradient overlap cannot register a post-accumulate hook for layer %s; "
                     "that layer will synchronize at the optimizer deadline.",
                     layer.key,
                 )
@@ -5186,7 +5167,7 @@ class ExpertSwapManager:
                 handle = register(hook)
             except (RuntimeError, TypeError) as error:
                 logger.warning_rank0(
-                    "HierMoE fixed pipeline failed to register a gradient hook for layer %s: %s. "
+                    "HierMoE gradient overlap failed to register a gradient hook for layer %s: %s. "
                     "The optimizer deadline fallback remains active.",
                     layer.key,
                     error,
@@ -5201,12 +5182,7 @@ class ExpertSwapManager:
         param_index: int,
         ready_event: Any | None = None,
     ) -> None:
-        if (
-            not self.fixed_pipeline_overlap
-            or self._ablation_grad_mode != "hidden"
-            or self._pipeline_shutdown
-            or not self._pipeline_is_final_microstep()
-        ):
+        if not self.gradient_overlap_enabled or self._pipeline_shutdown or not self._pipeline_is_final_microstep():
             return
         with self._pipeline_lock:
             index = int(param_index)
@@ -5239,11 +5215,7 @@ class ExpertSwapManager:
     def close_pipeline_gradient_window_before_dispatch(self, _layer_key: str) -> None:
         """Drain background gradient communication before training dispatch backward."""
 
-        if (
-            not self.fixed_pipeline_overlap
-            or self._ablation_grad_mode != "hidden"
-            or not self._pipeline_is_final_microstep()
-        ):
+        if not self.gradient_overlap_enabled or not self._pipeline_is_final_microstep():
             return
         if self._owns_pipeline_grad_group:
             # A dedicated gradient process group is allowed to overlap the
@@ -5263,7 +5235,7 @@ class ExpertSwapManager:
         exposed_ms = 0.0
         for layer_key, future in futures:
             wait_started = time.perf_counter()
-            future.result()
+            self._wait_pipeline_gradient_result(future)
             exposed_ms += (time.perf_counter() - wait_started) * 1000.0
             with self._pipeline_lock:
                 self._pipeline_grad_window_waited.add(layer_key)
@@ -5275,11 +5247,7 @@ class ExpertSwapManager:
     def open_pipeline_gradient_window_after_dispatch(self, layer_key: str) -> None:
         """Admit this layer's redundant-gradient sync after dispatch backward."""
 
-        if (
-            not self.fixed_pipeline_overlap
-            or self._ablation_grad_mode != "hidden"
-            or not self._pipeline_is_final_microstep()
-        ):
+        if not self.gradient_overlap_enabled or not self._pipeline_is_final_microstep():
             return
         with self._pipeline_grad_submit_lock:
             with self._pipeline_lock:
@@ -5289,8 +5257,7 @@ class ExpertSwapManager:
 
     @torch.no_grad()
     def _submit_pipeline_gradient_sync(self, layer_key: str) -> None:
-        executor = self._pipeline_grad_executor
-        if executor is None or self._pipeline_shutdown:
+        if not self.gradient_overlap_enabled or self._pipeline_shutdown:
             return
         layer = self.layers[layer_key]
         schedule = self._replica_grad_schedule_for_layer(layer)
@@ -5299,6 +5266,14 @@ class ExpertSwapManager:
         with self._pipeline_lock:
             if layer_key in self._pipeline_grad_futures:
                 return
+            previous_layer_key = next(reversed(self._pipeline_grad_futures), None)
+            previous_future = None if previous_layer_key is None else self._pipeline_grad_futures[previous_layer_key]
+        if previous_future is not None:
+            wait_started = time.perf_counter()
+            self._wait_pipeline_gradient_result(previous_future)
+            exposed_ms = (time.perf_counter() - wait_started) * 1000.0
+            self._pipeline_grad_window_exposed_ms += exposed_ms
+            self._accumulate_metric("hiermoe/pipeline_grad_sync_backpressure_exposed_ms", exposed_ms)
         device = self._pipeline_device(layer)
         dispatch_event = self._pipeline_ready_event(device)
         with self._pipeline_lock:
@@ -5307,12 +5282,9 @@ class ExpertSwapManager:
                 for index in sorted(self._pipeline_grad_ready_events[layer_key])
             )
         ready_events = parameter_events + ((dispatch_event,) if dispatch_event is not None else ())
-        future = executor.submit(
-            self._pipeline_gradient_worker,
-            layer_key,
-            schedule,
-            ready_events or None,
-        )
+        future: Future[_PipelineGradResult] = Future()
+        result = self._pipeline_gradient_worker(layer_key, schedule, ready_events or None)
+        future.set_result(result)
         with self._pipeline_lock:
             self._pipeline_grad_futures[layer_key] = future
 
@@ -5326,6 +5298,8 @@ class ExpertSwapManager:
         layer = self.layers[layer_key]
         device = self._pipeline_device(layer)
         started = time.perf_counter()
+        start_event: AcceleratorEvent | None = None
+        completion_event: AcceleratorEvent | None = None
 
         def run() -> None:
             self._zero_inactive_slot_grads_for_layer(layer)
@@ -5343,11 +5317,40 @@ class ExpertSwapManager:
                     process_group=self._pipeline_grad_group,
                 )
 
-        self._run_pipeline_stream_task("gradient", device, ready_event, run)
+        if device.type == "cpu":
+            run()
+        else:
+            device_api = get_torch_device()
+            device_api.set_device(device)
+            stream = self._pipeline_stream("gradient", device)
+            assert stream is not None
+            with device_api.stream(stream):
+                ready_events = ready_event if isinstance(ready_event, tuple) else (ready_event,)
+                for event in ready_events:
+                    if event is not None:
+                        stream.wait_event(event)
+                start_event = record_accelerator_event()
+                run()
+                completion_event = record_accelerator_event()
         return _PipelineGradResult(
             layer_key=layer_key,
             raw_ms=(time.perf_counter() - started) * 1000.0,
+            start_event=start_event,
+            completion_event=completion_event,
         )
+
+    @staticmethod
+    def _wait_pipeline_gradient_result(
+        future: Future[_PipelineGradResult],
+    ) -> tuple[_PipelineGradResult, float]:
+        result = future.result()
+        completion_event = result.completion_event
+        if completion_event is not None and completion_event.event is not None:
+            completion_event.event.synchronize()
+        raw_ms = result.raw_ms
+        if result.start_event is not None and completion_event is not None:
+            raw_ms = result.start_event.elapsed_time(completion_event)
+        return result, raw_ms
 
     @torch.no_grad()
     def _finish_pipeline_gradient_sync(self) -> None:
@@ -5368,12 +5371,12 @@ class ExpertSwapManager:
         deadline_exposed_ms = 0.0
         for layer_key, future in futures:
             if layer_key in self._pipeline_grad_window_waited:
-                result = future.result()
+                _result, layer_raw_ms = self._wait_pipeline_gradient_result(future)
             else:
                 wait_started = time.perf_counter()
-                result = future.result()
+                _result, layer_raw_ms = self._wait_pipeline_gradient_result(future)
                 deadline_exposed_ms += (time.perf_counter() - wait_started) * 1000.0
-            raw_ms += result.raw_ms
+            raw_ms += layer_raw_ms
             with self._pipeline_lock:
                 self._pipeline_grad_futures.pop(layer_key, None)
         exposed_ms = self._pipeline_grad_window_exposed_ms + deadline_exposed_ms
@@ -5395,11 +5398,15 @@ class ExpertSwapManager:
         self._clear_accumulated_token_counts()
 
     def shutdown_pipeline(self) -> None:
-        if not self.fixed_pipeline_overlap or self._pipeline_shutdown:
+        if (not self.fixed_pipeline_overlap and not self.gradient_overlap_enabled) or self._pipeline_shutdown:
             return
         self._pipeline_shutdown = True
         hot_update_state = self._hot_update_controller.active_job
-        if hot_update_state is not None and hot_update_state.process is not None and hot_update_state.process.poll() is None:
+        if (
+            hot_update_state is not None
+            and hot_update_state.process is not None
+            and hot_update_state.process.poll() is None
+        ):
             hot_update_state.process.terminate()
             try:
                 hot_update_state.process.wait(timeout=10.0)
@@ -5598,7 +5605,7 @@ class ExpertSwapManager:
         self._normalize_ablation_layer_keys()
         if _FIXED_R2_LAYOUT:
             self.install_fixed_r2_layout()
-        if self._ablation_replay_mode == "static":
+        if self._initial_layout_path or self._ablation_replay_mode == "static":
             self._install_static_ablation_layout()
         if self._pending_state is not None:
             self.load_state_dict(self._pending_state)
@@ -5834,12 +5841,15 @@ class ExpertSwapManager:
             return selected_experts
         if checkpoint_recompute and checkpoint_replay is not None:
             replay = checkpoint_replay.next(layer_key)
-            if (
-                replay is not None
-                and replay.device == selected_experts.device
-                and replay.shape == selected_experts.shape
-            ):
-                return self._validate_checkpoint_replay(layer, selected_experts, replay)
+            if replay is None:
+                raise RuntimeError(f"Checkpoint route replay is missing an occurrence for {layer_key}.")
+            if replay.shape != selected_experts.shape:
+                raise RuntimeError(
+                    f"Checkpoint route replay for {layer_key} does not match recompute input: "
+                    f"replay_shape={tuple(replay.shape)}, input_shape={tuple(selected_experts.shape)}."
+                )
+            replay = replay.to(device=selected_experts.device, dtype=torch.long)
+            return self._validate_checkpoint_replay(layer, selected_experts, replay)
         pending = layer.pending_physical_routes
         if (
             pending is not None
@@ -5853,16 +5863,20 @@ class ExpertSwapManager:
             if checkpoint_replay is not None and not checkpoint_recompute:
                 checkpoint_replay.record(layer_key, dispatched_routes)
             return dispatched_routes
-        if checkpoint_replay is not None and not checkpoint_recompute:
-            checkpoint_replay.record(layer_key, None)
         if layer.slot_layout_enabled:
-            if self._uses_compact_identity_dispatch(layer):
-                return selected_experts
-            return self._map_logical_to_slot(layer, selected_experts)
-        if layer.is_identity:
-            return selected_experts
-        mapping = layer.mapping_for_device(selected_experts.device)
-        return mapping.index_select(0, selected_experts.reshape(-1)).view_as(selected_experts)
+            dispatched_routes = (
+                selected_experts
+                if self._uses_compact_identity_dispatch(layer)
+                else self._map_logical_to_slot(layer, selected_experts)
+            )
+        elif layer.is_identity:
+            dispatched_routes = selected_experts
+        else:
+            mapping = layer.mapping_for_device(selected_experts.device)
+            dispatched_routes = mapping.index_select(0, selected_experts.reshape(-1)).view_as(selected_experts)
+        if checkpoint_replay is not None and not checkpoint_recompute:
+            checkpoint_replay.record(layer_key, dispatched_routes)
+        return dispatched_routes
 
     def num_physical_slots(self, layer_key: str, fallback_num_experts: int) -> int:
         layer = self.layers.get(layer_key)
@@ -5897,7 +5911,11 @@ class ExpertSwapManager:
         del chosen, redundant_groups
         if layer.slot_to_logical is None:
             raise RuntimeError(f"HierMoE layer {layer.key} has no physical slot layout.")
-        if self._forward_reuse_cover_patch_remap and layer.source_logical_to_physical is not None:
+        # A source-conditioned LUT is the authoritative routing policy emitted
+        # by PlaceMoE. Static preload and hot-update paths install it without
+        # enabling Forward-reuse Cover, so gating it on that optimization
+        # silently replaces the scored mapping with the generic greedy mapper.
+        if layer.source_logical_to_physical is not None:
             mapping = layer.source_mapping_for_device(selected.device, self.ep_rank)
             physical = mapping.index_select(0, selected.reshape(-1)).view_as(selected)
             return physical.squeeze(-1) if original_ndim == 1 else physical
@@ -6167,6 +6185,7 @@ class ExpertSwapManager:
                 _CostModelTiming(
                     step=int(step),
                     physical_routes=physical_routes.detach(),
+                    local_expert_token_counts=tokens_per_local_expert.detach(),
                     local_assignment_count=tokens_per_local_expert.detach().sum().to(dtype=torch.float32),
                     communication_events=communication_events,
                     dispatch_start=dispatch_start,
@@ -6310,7 +6329,7 @@ class ExpertSwapManager:
     ) -> tuple[QuotaPolicyEntry, ...]:
         layout = torch.as_tensor(slot_to_logical, dtype=torch.long).detach().cpu().reshape(-1)
         entries = tuple(quota_policy)
-        policy_keys: set[tuple[int, int, tuple[int, ...], int | None]] = set()
+        policy_keys: set[tuple[int, int, tuple[int, ...]]] = set()
         for entry in entries:
             if not 0 <= entry.source_rank < self.ep_size:
                 raise ValueError(f"HierMoE quota policy for {layer.key} has an invalid source rank.")
@@ -6324,13 +6343,10 @@ class ExpertSwapManager:
                 raise ValueError(f"HierMoE quota policy for {layer.key} has invalid destination ranks.")
             if any(quota < 0 for quota in entry.quotas):
                 raise ValueError(f"HierMoE quota policy for {layer.key} has a negative quota.")
-            if entry.multiplicity is not None and entry.multiplicity <= 0:
-                raise ValueError(f"HierMoE quota policy for {layer.key} has an invalid multiplicity.")
             policy_key = (
                 entry.source_rank,
                 entry.logical_expert,
                 entry.destination_ranks,
-                entry.multiplicity,
             )
             if policy_key in policy_keys:
                 raise ValueError(f"HierMoE quota policy for {layer.key} contains duplicate rows.")
@@ -6881,12 +6897,12 @@ class ExpertSwapManager:
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
-        key = (kind, int(peer_rank), str(device), str(dtype), int(numel))
+        key = (kind, int(peer_rank), str(device), str(dtype))
         cached = self._replica_grad_buffers.get(key)
-        if cached is None:
+        if cached is None or cached.numel() < numel:
             cached = torch.empty((numel,), dtype=dtype, device=device)
             self._replica_grad_buffers[key] = cached
-        return cached
+        return cached[:numel]
 
     def _pack_replica_grad_items(
         self,
@@ -7202,7 +7218,7 @@ class ExpertSwapManager:
 
     @torch.no_grad()
     def sync_redundant_gradients(self) -> None:
-        if self.fixed_pipeline_overlap and self._ablation_grad_mode == "hidden":
+        if self.gradient_overlap_enabled:
             with _full_timing_range("hiermoe_redundant_grad_sync_deadline"):
                 self._finish_pipeline_gradient_sync()
             return
@@ -7582,13 +7598,20 @@ class ExpertSwapManager:
         local_packed_rows: list[torch.Tensor] = []
         local_assignment_packed_rows: list[torch.Tensor] = []
         local_timing_rows: list[tuple[float, ...]] = []
+        local_expert_token_rows: list[torch.Tensor] = []
         layer_row_ranges: list[tuple[GreedyCommunicationPlanner, int, int]] = []
         row_start = 0
         communication_event_names = (
-            "stage1_a2a",
-            "stage2_a2a",
-            "combine_stage2_a2a",
-            "combine_stage1_a2a",
+            (
+                "stage1_a2a",
+                "stage2_a2a",
+                "stage3_a2a",
+                "combine_stage3_a2a",
+                "combine_stage2_a2a",
+                "combine_stage1_a2a",
+            )
+            if int(self.hierarchy.selected_dim) == 3
+            else ("stage1_a2a", "stage2_a2a", "combine_stage2_a2a", "combine_stage1_a2a")
         )
         for layer in ordered_layers:
             timings = [timing for timing in layer.cost_model_timings if int(timing.step) == int(step)]
@@ -7638,6 +7661,7 @@ class ExpertSwapManager:
                         *stage_times,
                     )
                 )
+                local_expert_token_rows.append(timing.local_expert_token_counts.to(dtype=torch.float32))
             row_end = row_start + len(timings)
             layer_row_ranges.append((planner, row_start, row_end))
             row_start = row_end
@@ -7705,6 +7729,7 @@ class ExpertSwapManager:
                 target[start:end] = values
 
         local_timings = torch.tensor(local_timing_rows, dtype=torch.float32, device=common_device)
+        local_expert_tokens = torch.stack(local_expert_token_rows).to(device=common_device, dtype=torch.float32)
         if self.ep_group is not None and self.ep_size > 1:
             gathered_timings = torch.empty(
                 (self.ep_size * row_start, local_timings.shape[1]),
@@ -7713,8 +7738,16 @@ class ExpertSwapManager:
             )
             dist.all_gather_into_tensor(gathered_timings, local_timings, group=self.ep_group)
             gathered_timings = gathered_timings.view(self.ep_size, row_start, local_timings.shape[1])
+            gathered_expert_tokens = torch.empty(
+                (self.ep_size * row_start, local_expert_tokens.shape[1]),
+                dtype=local_expert_tokens.dtype,
+                device=common_device,
+            )
+            dist.all_gather_into_tensor(gathered_expert_tokens, local_expert_tokens.contiguous(), group=self.ep_group)
+            gathered_expert_tokens = gathered_expert_tokens.view(self.ep_size, row_start, local_expert_tokens.shape[1])
         else:
             gathered_timings = local_timings.view(1, row_start, local_timings.shape[1])
+            gathered_expert_tokens = local_expert_tokens.view(1, row_start, local_expert_tokens.shape[1])
 
         actual_communication = gathered_timings[:, :, 0].max(dim=0).values
         actual_compute = gathered_timings[:, :, 1].max(dim=0).values
@@ -7746,6 +7779,10 @@ class ExpertSwapManager:
             "actual_raw_a2a_ms": actual_raw_a2a.detach().cpu().tolist(),
             "actual_stage_a2a_ms": actual_stage_a2a.detach().cpu().tolist(),
             "actual_stage_a2a_names": list(communication_event_names),
+            "paired_expert_token_counts": gathered_expert_tokens.reshape(-1, gathered_expert_tokens.shape[-1])
+            .detach()
+            .cpu()
+            .tolist(),
             "paired_assignments": gathered_timings[:, :, 2].reshape(-1).detach().cpu().tolist(),
             "paired_compute_ms": gathered_timings[:, :, 1].reshape(-1).detach().cpu().tolist(),
         }
@@ -7838,6 +7875,11 @@ class ExpertSwapManager:
                 "stage1_payload_endpoint_bytes",
                 "stage2_payload_endpoint_bytes",
             ),
+            "stage_payload_levels": (
+                "stage1_payload_endpoint_bytes",
+                "stage2_payload_endpoint_bytes",
+                "stage3_payload_endpoint_bytes",
+            ),
             "stage_payload_lane_shared_node": (
                 "stage_payload_endpoint_link_units",
                 "stage_shared_node_endpoint_link_units",
@@ -7853,6 +7895,11 @@ class ExpertSwapManager:
             ),
         }
         feature_values = {"legacy_source_aware": communication_units, **traffic_features}
+        base_feature_models = {
+            name: features
+            for name, features in base_feature_models.items()
+            if all(feature in feature_values for feature in features)
+        }
         model_rows = {
             name: [
                 [float(feature_values[feature][row]) for feature in features]
@@ -8026,7 +8073,44 @@ class ExpertSwapManager:
         if _EXPORT_COST_MODEL_SAMPLES:
             paired_assignments = [float(value) for value in observations["paired_assignments"]]
             paired_compute = [float(value) for value in observations["paired_compute_ms"]]
-            sample_model = "stage_payload_inter_intra"
+            actual_stage_rows = [
+                [float(value) for value in row] for row in observations.get("actual_stage_a2a_ms", ())
+            ]
+            offline_samples = {
+                "paired_expert_token_counts": observations["paired_expert_token_counts"],
+                "paired_assignments": observations["paired_assignments"],
+                "paired_compute_ms": observations["paired_compute_ms"],
+                "peak_assignments": observations["peak_assignments"],
+                "actual_communication_ms": observations["actual_communication_ms"],
+                **{
+                    name: [float(value) for value in values]
+                    for name, values in traffic_features.items()
+                    if name.startswith("stage") and name.endswith("_payload_endpoint_bytes")
+                },
+            }
+            if int(self.hierarchy.selected_dim) == 3:
+                if any(len(row) != 6 for row in actual_stage_rows):
+                    raise RuntimeError("Three-stage cost samples require six dispatch/combine A2A timings.")
+                offline_samples.update(
+                    {
+                        "actual_stage1_a2a_ms": [row[0] + row[5] for row in actual_stage_rows],
+                        "actual_stage2_a2a_ms": [row[1] + row[4] for row in actual_stage_rows],
+                        "actual_stage3_a2a_ms": [row[2] + row[3] for row in actual_stage_rows],
+                    }
+                )
+            else:
+                if any(len(row) != 4 for row in actual_stage_rows):
+                    raise RuntimeError("Two-stage cost samples require four dispatch/combine A2A timings.")
+                offline_samples.update(
+                    {
+                        "actual_stage1_a2a_ms": [row[0] + row[3] for row in actual_stage_rows],
+                        "actual_stage2_a2a_ms": [row[1] + row[2] for row in actual_stage_rows],
+                    }
+                )
+            report["offline_scorer_samples"] = offline_samples
+            sample_model = (
+                "stage_payload_levels" if int(self.hierarchy.selected_dim) == 3 else "stage_payload_inter_intra"
+            )
             report["sample_data"] = {
                 "feature_values": {
                     **{name: [float(value) for value in values] for name, values in traffic_features.items()},
@@ -10363,6 +10447,7 @@ class ExpertSwapManager:
                     plan = self._build_layer_swap_plan(
                         layer.key,
                         pair,
+                        validate_optimizer_state=False,
                     )
                     if plan is not None:
                         plans.append(plan)
@@ -10627,13 +10712,7 @@ class ExpertSwapManager:
             redundant_slots = layers[0].num_local_experts - primary_slots
             if update_mode == "mapping":
                 self._write_hot_update_current_layout(layers, input_layout_path)
-            resources = PlaceMoEPlannerResources(
-                workers=_HOT_UPDATE_WORKERS,
-                candidate_workers=_HOT_UPDATE_CANDIDATE_WORKERS,
-                worker_threads=_HOT_UPDATE_WORKER_THREADS,
-                planner_cpu_ids=_HOT_UPDATE_CPU_IDS,
-                training_cpu_ids=_HOT_UPDATE_TRAIN_CPU_IDS,
-            )
+            resources = self._hot_update_resources
             calibration = PlaceMoECalibration(
                 inter_ms_per_byte=_HOT_UPDATE_INTER_MS_PER_BYTE,
                 intra_ms_per_byte=_HOT_UPDATE_INTRA_MS_PER_BYTE,
@@ -10664,11 +10743,6 @@ class ExpertSwapManager:
                 calibration,
                 resources,
             )
-            if _HOT_UPDATE_CPU_IDS:
-                planner_cpu_ids = self._parse_cpu_ids(_HOT_UPDATE_CPU_IDS)
-                if not planner_cpu_ids:
-                    raise ValueError("PlaceMoE planner CPU affinity must not be empty.")
-                self._cpu_planner_affinity = planner_cpu_ids
             environment = planner_environment(resources)
             os.makedirs(job_dir, exist_ok=True)
             with open(planner_log_path, "wb") as planner_log:
@@ -10970,10 +11044,7 @@ class ExpertSwapManager:
                     source_step=state.source_step,
                     planner_log_path=state.planner_log_path,
                 )
-                message = (
-                    f"PlaceMoE planner failed for source step {state.source_step}; "
-                    f"see {state.planner_log_path}."
-                )
+                message = f"PlaceMoE planner failed for source step {state.source_step}; see {state.planner_log_path}."
                 self._hot_update_controller.finish()
                 if self._hot_update_controller.failure_policy == "continue":
                     logger.error("%s Keeping the current layout and mapping.", message)
@@ -11643,6 +11714,8 @@ class ExpertSwapManager:
         self,
         layer_key: str,
         pair: tuple[int, int],
+        *,
+        validate_optimizer_state: bool = True,
     ) -> _LayerSwapPlan | None:
         layer = self.layers[layer_key]
         lhs, rhs = pair
@@ -11659,7 +11732,7 @@ class ExpertSwapManager:
                 f"rank={lhs_rank}, experts=({lhs}, {rhs})."
             )
         state_rows = self._slot_op_state_rows(layer)
-        if self.debug_validate and self.ep_size > 1:
+        if validate_optimizer_state and self.debug_validate and self.ep_size > 1:
             self._validate_optimizer_state_slot_tensors_across_ep(state_rows)
         entries = [
             _SwapTensorEntry(tensor, lhs_slot=lhs_slot, rhs_slot=rhs_slot)

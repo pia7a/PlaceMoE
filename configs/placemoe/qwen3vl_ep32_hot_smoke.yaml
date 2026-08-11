@@ -14,5 +14,3 @@ placemoe:
     workers: 48
     candidate_workers: 4
     worker_threads: 1
-    planner_cpu_ids: 144-191
-    training_cpu_ids: 0-143

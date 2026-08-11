@@ -1,0 +1,4 @@
+# These source files already use CRLF; treat their carriage return as part of EOL.
+tests/distributed/test_core_moe_planner.py whitespace=cr-at-eol
+veomni/distributed/moe/hiermoe/state.py whitespace=cr-at-eol
+veomni/distributed/moe/hiermoe/perf_model.py whitespace=cr-at-eol

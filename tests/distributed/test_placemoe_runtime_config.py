@@ -13,7 +13,7 @@ from veomni.distributed.moe.hiermoe.placemoe.runtime import (
     UpdateKind,
 )
 from veomni.distributed.moe.hiermoe.placemoe.runtime.config import PlaceMoEConfigurationError
-from veomni.distributed.parallel_plan import _hiermoe_static_preload_layout_path
+from veomni.distributed.parallel_plan import _hiermoe_initial_layout_path
 
 
 def test_runtime_config_loads_single_file_and_resolves_paths(tmp_path) -> None:
@@ -63,20 +63,20 @@ placemoe:
 def test_model_sharding_prefers_canonical_initial_artifact(tmp_path, monkeypatch) -> None:
     canonical_artifact = tmp_path / "canonical.json"
     canonical_artifact.write_text("{}", encoding="utf-8")
-    legacy_artifact = tmp_path / "legacy.json"
-    legacy_artifact.write_text("{}", encoding="utf-8")
+    hiermoe_artifact = tmp_path / "hiermoe.json"
+    hiermoe_artifact.write_text("{}", encoding="utf-8")
     config_path = tmp_path / "placemoe.yaml"
     config_path.write_text(
         "placemoe:\n  initial_artifact: canonical.json\n  hot_update:\n    enabled: false\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("VEOMNI_PLACEMOE_CONFIG", str(config_path))
-    monkeypatch.setenv("VEOMNI_HIERMOE_STATIC_PRELOAD_LAYOUT_PATH", str(legacy_artifact))
-    _hiermoe_static_preload_layout_path.cache_clear()
+    monkeypatch.setenv("VEOMNI_HIERMOE_INITIAL_LAYOUT", str(hiermoe_artifact))
+    _hiermoe_initial_layout_path.cache_clear()
 
-    assert _hiermoe_static_preload_layout_path() == str(canonical_artifact)
+    assert _hiermoe_initial_layout_path() == str(canonical_artifact)
 
-    _hiermoe_static_preload_layout_path.cache_clear()
+    _hiermoe_initial_layout_path.cache_clear()
 
 
 def test_runtime_config_loads_accepted_calibration_artifact(tmp_path) -> None:
@@ -132,20 +132,13 @@ placemoe:
         PlaceMoERuntimeConfig.from_file(config_path)
 
 
-def test_legacy_environment_preserves_historical_defaults() -> None:
-    config = PlaceMoERuntimeConfig.from_environment(
-        {
-            "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN": "1",
-            "VEOMNI_HIERMOE_LAYOUT_REFRESH_INTERVAL": "100",
-            "VEOMNI_HIERMOE_MAPPING_REFRESH_INTERVAL": "20",
-            "VEOMNI_HIERMOE_PLACEMOE_COMPUTE_MS_PER_ASSIGNMENT": "0.25",
-        }
-    )
+def test_runtime_config_is_disabled_without_canonical_config() -> None:
+    config = PlaceMoERuntimeConfig.from_environment({})
 
-    assert config.hot_update.enabled
-    assert config.hot_update.layout_interval_steps == 100
-    assert config.hot_update.mapping_interval_steps == 20
-    assert config.calibration.compute_ms_per_assignment == pytest.approx(0.25)
+    assert not config.source_path
+    assert not config.initial_artifact
+    assert not config.hot_update.enabled
+    assert config.hot_update.layout_interval_steps is None
 
 
 def test_scheduler_coalesces_equal_intervals_into_full_update() -> None:
@@ -175,3 +168,169 @@ def test_controller_preserves_pending_update_while_a_job_runs() -> None:
     assert controller.next_update() is None
     controller.finish()
     assert controller.next_update() is UpdateKind.FULL
+
+
+def _write_scoped_calibration(tmp_path, scope: dict) -> None:
+    (tmp_path / "calibration.json").write_text(
+        json.dumps(
+            {
+                "status": "accepted",
+                "scope": scope,
+                "coefficients": {
+                    "inter_ms_per_byte": 1.0e-8,
+                    "intra_ms_per_byte": 2.0e-9,
+                    "route_ms_per_assignment": 3.0e-5,
+                    "communication_multiplier": 3.1,
+                    "compute_ms_per_assignment": 4.0e-5,
+                    "compute_multiplier": 4.19,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_runtime_config_accepts_exact_calibration_scope(tmp_path) -> None:
+    expected_scope = {
+        "device_type": "cuda",
+        "accelerator_model": "NVIDIA RTX A6000",
+        "communication_backend": "nccl",
+        "world_size": 32,
+        "ranks_per_node": 8,
+        "model_id": "Qwen3-VL-30B-A3B-Instruct",
+        "dataset_id": "sharegpt4v",
+        "moe_implementation": "fused_triton",
+    }
+    _write_scoped_calibration(tmp_path, expected_scope)
+    config_path = tmp_path / "placemoe.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "calibration": {
+                    "artifact": "calibration.json",
+                    "require_scope": True,
+                    "expected_scope": expected_scope,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = PlaceMoERuntimeConfig.from_file(config_path)
+
+    assert config.calibration.require_scope
+    assert config.calibration.artifact_scope == expected_scope
+
+
+def test_runtime_config_rejects_mismatched_calibration_scope(tmp_path) -> None:
+    _write_scoped_calibration(
+        tmp_path,
+        {
+            "device_type": "npu",
+            "accelerator_model": "Ascend 910B",
+            "world_size": 32,
+        },
+    )
+    config_path = tmp_path / "placemoe.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "calibration": {
+                    "artifact": "calibration.json",
+                    "require_scope": True,
+                    "expected_scope": {
+                        "device_type": "cuda",
+                        "accelerator_model": "NVIDIA RTX A6000",
+                        "world_size": 32,
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PlaceMoEConfigurationError, match="does not match expected scope"):
+        PlaceMoERuntimeConfig.from_file(config_path)
+
+
+def test_runtime_config_rejects_required_scope_without_artifact(tmp_path) -> None:
+    config_path = tmp_path / "placemoe.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "calibration": {
+                    "require_scope": True,
+                    "expected_scope": {"device_type": "cuda"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PlaceMoEConfigurationError, match="artifact is required"):
+        PlaceMoERuntimeConfig.from_file(config_path)
+
+
+def test_runtime_config_rejects_non_mapping_calibration_artifact(tmp_path) -> None:
+    (tmp_path / "calibration.json").write_text("[]", encoding="utf-8")
+    config_path = tmp_path / "placemoe.json"
+    config_path.write_text(
+        json.dumps({"calibration": {"artifact": "calibration.json"}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PlaceMoEConfigurationError, match="must contain a mapping"):
+        PlaceMoERuntimeConfig.from_file(config_path)
+
+
+def test_runtime_config_ignores_legacy_string_scope_unless_strict(tmp_path) -> None:
+    calibration = tmp_path / "calibration.json"
+    calibration.write_text(
+        json.dumps(
+            {
+                "status": "accepted",
+                "scope": "cluster_topology",
+                "coefficients": {"inter_ms_per_byte": 1.0e-8},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "placemoe.json"
+    config_path.write_text(
+        json.dumps({"calibration": {"artifact": "calibration.json"}}),
+        encoding="utf-8",
+    )
+
+    config = PlaceMoERuntimeConfig.from_file(config_path)
+
+    assert config.calibration.artifact_scope == {}
+
+    config_path.write_text(
+        json.dumps(
+            {
+                "calibration": {
+                    "artifact": "calibration.json",
+                    "require_scope": True,
+                    "expected_scope": {"device_type": "cuda"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(PlaceMoEConfigurationError, match="scope must be a mapping"):
+        PlaceMoERuntimeConfig.from_file(config_path)
+
+
+def test_runtime_config_requires_explicit_cpu_masks_together(tmp_path) -> None:
+    config_path = tmp_path / "placemoe.yaml"
+    config_path.write_text(
+        """
+placemoe:
+  resources:
+    planner_cpu_ids: 8-15
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PlaceMoEConfigurationError, match="must be configured together"):
+        PlaceMoERuntimeConfig.from_file(config_path)

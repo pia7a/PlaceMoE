@@ -49,6 +49,8 @@ class OptimizerConfig:
     calibrated_mapping_refinement: bool = True
     carry_mapping_across_rounds: bool = True
     calibrated_partition_refinement: bool = True
+    hierarchy_group_sizes: tuple[int, ...] = ()
+    level_omegas: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         if self.primary_slots_per_rank <= 0 or self.primary_slots_per_rank > self.topology.slots_per_rank:
@@ -61,6 +63,13 @@ class OptimizerConfig:
             raise ValueError("At least one non-negative seed load weight is required.")
         if any(weight < 0 for weight in self.normalized_mapping_weights):
             raise ValueError("Normalized mapping weights must be non-negative.")
+        if self.hierarchy_group_sizes and (
+            self.hierarchy_group_sizes[-1] != self.topology.ep_size
+            or len(self.level_omegas) != len(self.hierarchy_group_sizes)
+        ):
+            raise ValueError("Optimizer hierarchy and level coefficients must match the EP topology.")
+        if any(weight < 0 for weight in self.level_omegas):
+            raise ValueError("Hierarchy optimizer coefficients must be non-negative.")
 
 
 @dataclass(frozen=True)
@@ -143,6 +152,8 @@ def optimize_replica_allocation(
                     seed=config.seed + 1009 * round_index,
                     seed_load_weight=config.seed_load_weights[round_index % len(config.seed_load_weights)],
                     calibrated_partition_refinement=config.calibrated_partition_refinement,
+                    hierarchy_group_sizes=config.hierarchy_group_sizes,
+                    level_omegas=config.level_omegas,
                 ),
             )
         except RuntimeError:
@@ -156,6 +167,7 @@ def optimize_replica_allocation(
             statistics.demand,
             ranks_per_node=topology.ranks_per_node,
             prefer_node_local=config.prefer_node_local,
+            hierarchy_group_sizes=config.hierarchy_group_sizes,
         )
         mapping_seeds = [fresh_mapping]
         if (
@@ -207,6 +219,8 @@ def optimize_replica_allocation(
                         rank_omega=config.rank_omega,
                         gamma=config.gamma,
                         sweep_limit=config.mapping_sweep_limit,
+                        hierarchy_group_sizes=config.hierarchy_group_sizes,
+                        level_omegas=config.level_omegas,
                     ),
                 )
                 mapping_key = mapping.mapping.tobytes()
@@ -301,6 +315,7 @@ def optimize_fixed_layout_mapping(
         statistics.demand,
         ranks_per_node=topology.ranks_per_node,
         prefer_node_local=config.prefer_node_local,
+        hierarchy_group_sizes=config.hierarchy_group_sizes,
     )
     seeds = (current_plan.source_logical_to_physical, fresh_mapping)
     candidates: list[OptimizerCandidate] = []
@@ -339,6 +354,8 @@ def optimize_fixed_layout_mapping(
                 rank_omega=config.rank_omega,
                 gamma=config.gamma,
                 sweep_limit=config.mapping_sweep_limit,
+                hierarchy_group_sizes=config.hierarchy_group_sizes,
+                level_omegas=config.level_omegas,
             ),
         )
         refined_key = refined.mapping.tobytes()

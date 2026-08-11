@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 from html import escape
 from pathlib import Path
@@ -67,7 +68,7 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--dataset", required=True)
     parser.add_argument(
         "--steady-steps-label",
-        default="steps 11–20",
+        default="steps 3–5",
         help="Human-readable sampling-window label shown in the SVG subtitle.",
     )
     parser.add_argument(
@@ -109,6 +110,10 @@ def _mean(payload: dict[str, Any], key: str) -> float | None:
         return None
     value = metric.get("mean")
     return float(value) if isinstance(value, (int, float)) else None
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _render_svg(report: dict[str, Any]) -> str:
@@ -206,6 +211,32 @@ def main() -> None:
         summaries.append((method, path, json.loads(path.read_text(encoding="utf-8"))))
     if "baseline" not in seen:
         raise ValueError("a baseline=PATH summary is required")
+    grad_protocols = {payload.get("grad_protocol") for _, _, payload in summaries}
+    if len(grad_protocols) != 1 or None in grad_protocols:
+        raise ValueError(f"summaries must use one explicit grad protocol, got {grad_protocols}")
+    grad_protocol = grad_protocols.pop()
+
+    provenance_payloads = [payload.get("provenance") for _, _, payload in summaries]
+    has_provenance = [isinstance(value, dict) for value in provenance_payloads]
+    if any(has_provenance) and not all(has_provenance):
+        raise ValueError("summaries mix provenance-aware and legacy schemas")
+    shared_provenance: dict[str, Any] = {}
+    shared_execution_policy = None
+    if all(has_provenance):
+        for key in (
+            "cost_model_sha256",
+            "communication_calibration_sha256",
+            "preflight_report_sha256",
+            "communication_source_sha256",
+        ):
+            values = {payload[key] for payload in provenance_payloads if isinstance(payload, dict)}
+            if len(values) != 1 or None in values:
+                raise ValueError(f"summaries do not share one {key}: {values!r}")
+            shared_provenance[key] = values.pop()
+        execution_policies = {payload.get("execution_policy") for _, _, payload in summaries}
+        if len(execution_policies) != 1 or None in execution_policies:
+            raise ValueError(f"summaries do not share one execution policy: {execution_policies!r}")
+        shared_execution_policy = execution_policies.pop()
 
     baseline_path, baseline_payload = next(
         (path, payload) for method, path, payload in summaries if method == "baseline"
@@ -216,12 +247,20 @@ def main() -> None:
         mean, std = _step_ms(payload, path)
         forward_a2a_ms = _mean(payload, "forward_a2a_ms")
         backward_a2a_ms = _mean(payload, "backward_a2a_ms")
+        provenance = payload.get("provenance") if isinstance(payload.get("provenance"), dict) else {}
+        peak_accelerator_allocated_gib = payload.get("peak_accelerator_allocated_gib")
+        peak_accelerator_reserved_gib = payload.get("peak_accelerator_reserved_gib")
         rows.append(
             {
                 "method": method,
+                "grad_protocol": grad_protocol,
                 "label": METHOD_LABELS.get(method, method),
                 "run_name": payload.get("run_name"),
                 "summary_path": str(path.resolve()),
+                "summary_sha256": _sha256(path),
+                "input_summary_sha256": payload.get("input_summary_sha256"),
+                "execution_policy": payload.get("execution_policy"),
+                "execution_order": payload.get("execution_order"),
                 "e2e_source": payload.get("e2e_source"),
                 "e2e_step_ms": mean,
                 "e2e_step_std_ms": std,
@@ -236,23 +275,37 @@ def main() -> None:
                 ),
                 "moe_communication_region_ms": _mean(payload, "moe_communication_region_ms"),
                 "dedup_ratio_dispatch": _mean(payload, "dedup_ratio_dispatch"),
-                "peak_npu_allocated_gib": payload.get("peak_npu_allocated_gib"),
-                "peak_npu_reserved_gib": payload.get("peak_npu_reserved_gib"),
+                "peak_accelerator_allocated_gib": peak_accelerator_allocated_gib,
+                "peak_accelerator_reserved_gib": peak_accelerator_reserved_gib,
                 "hiermoe_ablation_grad_mode": (
-                    payload.get("hiermoe_ablation_grad_mode")
-                    or METHOD_GRAD_MODES.get(method)
+                    payload.get("hiermoe_ablation_grad_mode") or METHOD_GRAD_MODES.get(method)
                 ),
+                **{
+                    key: provenance.get(key)
+                    for key in (
+                        "layout_sha256",
+                        "layout_report_sha256",
+                        "layout_bundle_sha256",
+                        "cost_model_sha256",
+                        "communication_calibration_sha256",
+                        "preflight_report_sha256",
+                        "communication_source_sha256",
+                    )
+                },
                 "speedup": baseline_ms / mean,
             }
         )
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "metric": "baseline_e2e_step_ms / method_e2e_step_ms",
         "baseline": "VeOmni",
         "baseline_e2e_step_ms": baseline_ms,
+        "grad_protocol": grad_protocol,
         "model": args.model,
         "dataset": args.dataset,
         "steady_steps_label": args.steady_steps_label,
+        "provenance": shared_provenance,
+        "execution_policy": shared_execution_policy,
         "methods": rows,
     }
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
@@ -263,8 +316,14 @@ def main() -> None:
     with output_csv.open("w", encoding="utf-8", newline="") as handle:
         fieldnames = (
             "method",
+            "grad_protocol",
             "label",
             "run_name",
+            "summary_path",
+            "summary_sha256",
+            "input_summary_sha256",
+            "execution_policy",
+            "execution_order",
             "e2e_source",
             "e2e_step_ms",
             "e2e_step_std_ms",
@@ -275,9 +334,16 @@ def main() -> None:
             "total_a2a_ms",
             "moe_communication_region_ms",
             "dedup_ratio_dispatch",
-            "peak_npu_allocated_gib",
-            "peak_npu_reserved_gib",
+            "peak_accelerator_allocated_gib",
+            "peak_accelerator_reserved_gib",
             "hiermoe_ablation_grad_mode",
+            "layout_sha256",
+            "layout_report_sha256",
+            "layout_bundle_sha256",
+            "cost_model_sha256",
+            "communication_calibration_sha256",
+            "preflight_report_sha256",
+            "communication_source_sha256",
             "speedup",
         )
         writer = csv.DictWriter(handle, fieldnames=fieldnames)

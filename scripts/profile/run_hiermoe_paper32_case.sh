@@ -100,7 +100,7 @@ case "${method}" in
     layout_stem=${PAPER32_LAYOUT_STEM_OVERRIDE:-${layout_stem}}
     replay=${paper32_source_root}/results/${layout_stem}_layout.json
     layout_report=${paper32_source_root}/results/${layout_stem}_report.json
-    if [[ "${method}" == "ours_full_replan" && -n "${PAPER32_PLACEMOE_CONFIG:-}" ]]; then
+    if [[ "${method}" == "ours_full_replan" && -n "${VEOMNI_PLACEMOE_CONFIG:-}" ]]; then
       : # The canonical config owns and validates the initial artifact.
     elif [[ (! -s "${replay}" || ! -s "${layout_report}") && "${PAPER32_DRY_RUN:-0}" != "1" ]]; then
       echo "missing ${method} layout for ${model}/${dataset}; run:" >&2
@@ -198,13 +198,12 @@ then
   case_env+=("HIERMOE_REDUNDANT_SLOTS_OVERRIDE=${paper32_redundant_slots}")
 fi
 if [[ "${method}" == "eplb" || "${method}" == "ours" || "${method}" == "ours_online_lut" \
-  || "${method}" == "ours_full_replan" \
   || "${method}" == "static" ]]
 then
-  placemoe_initial_artifact=${PAPER32_PLACEMOE_INITIAL_ARTIFACT:-${paper32_container_source_root}/results/${layout_stem}_layout.json}
+  initial_layout=${paper32_container_source_root}/results/${layout_stem}_layout.json
   case_env+=(
-    "HIERMOE_ABLATION_REPLAY_PATH_OVERRIDE=${placemoe_initial_artifact}"
-    "HIERMOE_STATIC_PRELOAD_LAYOUT_PATH_OVERRIDE=${placemoe_initial_artifact}"
+    "HIERMOE_ABLATION_REPLAY_PATH_OVERRIDE=${initial_layout}"
+    "HIERMOE_INITIAL_LAYOUT_OVERRIDE=${initial_layout}"
   )
 fi
 if [[ "${method}" == "ours_online_lut" ]]; then
@@ -219,21 +218,7 @@ if [[ "${method}" == "ours_online_lut" ]]; then
 fi
 if [[ "${method}" == "ours_full_replan" ]]; then
   case_env+=(
-    "HIERMOE_PLACEMOE_CONFIG_PATH_OVERRIDE=${PAPER32_PLACEMOE_CONFIG:-}"
-    "HIERMOE_LAYOUT_REFRESH_INTERVAL_OVERRIDE=${PAPER32_LAYOUT_REFRESH_INTERVAL:-${HIERMOE_SWAP_INTERVAL_OVERRIDE:-100}}"
-    "HIERMOE_MAPPING_REFRESH_INTERVAL_OVERRIDE=${PAPER32_MAPPING_REFRESH_INTERVAL:-0}"
-    "HIERMOE_PLACEMOE_INTER_MS_PER_BYTE_OVERRIDE=${paper32_inter_ms_per_byte}"
-    "HIERMOE_PLACEMOE_INTRA_MS_PER_BYTE_OVERRIDE=${paper32_intra_ms_per_byte}"
-    "HIERMOE_PLACEMOE_ROUTE_MS_PER_ASSIGNMENT_OVERRIDE=${PAPER32_ROUTE_MS_PER_ASSIGNMENT:-8.746548178958447e-05}"
-    "HIERMOE_PLACEMOE_COMMUNICATION_MULTIPLIER_OVERRIDE=${paper32_communication_phase_multiplier}"
-    "HIERMOE_PLACEMOE_COMPUTE_MS_PER_ASSIGNMENT_OVERRIDE=${paper32_compute_ms_per_assignment}"
-    "HIERMOE_PLACEMOE_COMPUTE_MULTIPLIER_OVERRIDE=${paper32_compute_phase_multiplier}"
-    "HIERMOE_PERIODIC_FULL_REPLAN_LAST_STEP_OVERRIDE=${PAPER32_PERIODIC_FULL_REPLAN_LAST_STEP:-2147483647}"
-    "HIERMOE_PERIODIC_FULL_REPLAN_WORKERS_OVERRIDE=${PAPER32_PERIODIC_FULL_REPLAN_WORKERS:-48}"
-    "HIERMOE_PERIODIC_FULL_REPLAN_CANDIDATE_WORKERS_OVERRIDE=${PAPER32_PERIODIC_FULL_REPLAN_CANDIDATE_WORKERS:-4}"
-    "HIERMOE_PERIODIC_FULL_REPLAN_WORKER_THREADS_OVERRIDE=${PAPER32_PERIODIC_FULL_REPLAN_WORKER_THREADS:-1}"
-    "HIERMOE_PERIODIC_FULL_REPLAN_CPU_IDS_OVERRIDE=${PAPER32_PERIODIC_FULL_REPLAN_CPU_IDS:-144-191}"
-    "HIERMOE_PERIODIC_FULL_REPLAN_TRAIN_CPU_IDS_OVERRIDE=${PAPER32_PERIODIC_FULL_REPLAN_TRAIN_CPU_IDS:-0-143}"
+    "PLACEMOE_CONFIG_OVERRIDE=${VEOMNI_PLACEMOE_CONFIG:?VEOMNI_PLACEMOE_CONFIG is required for ours_full_replan}"
   )
 fi
 

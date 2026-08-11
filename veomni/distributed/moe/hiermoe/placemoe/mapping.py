@@ -33,6 +33,8 @@ class MappingConfig:
     rank_omega: float
     gamma: float
     sweep_limit: int = 6
+    hierarchy_group_sizes: tuple[int, ...] = ()
+    level_omegas: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         if self.ranks_per_node <= 0:
@@ -41,6 +43,26 @@ class MappingConfig:
             raise ValueError("Calibrated mapping coefficients must be non-negative.")
         if self.sweep_limit < 0:
             raise ValueError("Mapping sweep limit must be non-negative.")
+        _mapping_hierarchy(self)
+
+
+def _mapping_hierarchy(config: MappingConfig) -> tuple[tuple[int, ...], tuple[float, ...]]:
+    """Return coarse-to-fine rank-group sizes and their calibrated weights."""
+
+    if not config.hierarchy_group_sizes:
+        return (config.ranks_per_node, 1), (config.node_omega, config.rank_omega)
+    runtime_sizes = tuple(int(size) for size in config.hierarchy_group_sizes)
+    if runtime_sizes[-1] <= 1:
+        raise ValueError("The final hierarchy group must contain the EP world.")
+    if any(lhs <= 0 or rhs % lhs for lhs, rhs in zip(runtime_sizes, runtime_sizes[1:], strict=False)):
+        raise ValueError("Hierarchy group sizes must form an increasing divisibility chain.")
+    level_sizes = (*reversed(runtime_sizes[:-1]), 1)
+    omegas = tuple(float(value) for value in config.level_omegas)
+    if len(omegas) != len(level_sizes):
+        raise ValueError("One calibrated mapping coefficient is required per hierarchy stage.")
+    if any(value < 0.0 for value in omegas):
+        raise ValueError("Hierarchy mapping coefficients must be non-negative.")
+    return level_sizes, omegas
 
 
 @dataclass(frozen=True)
@@ -163,6 +185,7 @@ def initialize_mapping(
     *,
     ranks_per_node: int,
     prefer_node_local: bool = True,
+    hierarchy_group_sizes: tuple[int, ...] = (),
 ) -> np.ndarray:
     """Construct the paper's demand-ordered initial mapping."""
 
@@ -180,6 +203,11 @@ def initialize_mapping(
         raise ValueError("Profile EP size must be divisible by ranks_per_node.")
     mapping = np.full((ep_size, num_experts), -1, dtype=np.int64)
     rank_loads = np.zeros((ep_size,), dtype=np.float64)
+    level_sizes = (
+        (*reversed(tuple(int(size) for size in hierarchy_group_sizes[:-1])), 1)
+        if len(hierarchy_group_sizes) > 2
+        else ()
+    )
     jobs = sorted(
         (
             (float(demand_by_source[source, expert]), source, expert)
@@ -196,6 +224,7 @@ def initialize_mapping(
         selected = min(
             candidates.tolist(),
             key=lambda instance: (
+                tuple(int(source // size != int(instance_ranks[instance]) // size) for size in level_sizes),
                 rank_loads[int(instance_ranks[instance])] + amount,
                 int(instance_ranks[instance]),
                 instance,
@@ -221,29 +250,15 @@ def _group_affinity_cache(
     return cache
 
 
-def optimize_mapping(
-    logical_instances: np.ndarray,
+def _optimize_mapping_two_level(
     instance_ranks: np.ndarray,
-    initial_mapping: np.ndarray,
+    choices: tuple[np.ndarray, ...],
+    mapping: np.ndarray,
     statistics: ProfileStatistics,
     config: MappingConfig,
 ) -> MappingResult:
-    """Refine a mapping using the calibrated score in the PlaceMoE paper."""
+    """Run the original two-level PlaceMoE coordinate update unchanged."""
 
-    logical_instances, instance_ranks, choices = _validate_layout(
-        logical_instances,
-        instance_ranks,
-        ep_size=statistics.ep_size,
-        num_experts=statistics.num_experts,
-    )
-    if statistics.ep_size % config.ranks_per_node:
-        raise ValueError("Profile EP size must be divisible by ranks_per_node.")
-    mapping = validate_instance_mapping(
-        initial_mapping,
-        logical_instances,
-        ep_size=statistics.ep_size,
-        num_experts=statistics.num_experts,
-    )
     instance_nodes = instance_ranks // config.ranks_per_node
     num_nodes = statistics.ep_size // config.ranks_per_node
     node_cache = _group_affinity_cache(mapping, instance_nodes, statistics, num_groups=num_nodes)
@@ -302,6 +317,116 @@ def optimize_mapping(
             if selected_rank != current_rank:
                 rank_cache[source, :, current_rank] -= affinity_column
                 rank_cache[source, :, selected_rank] += affinity_column
+            mapping[source, expert] = selected
+            sweep_changes += 1
+        completed_sweeps += 1
+        total_changes += sweep_changes
+        if sweep_changes == 0:
+            break
+
+    return MappingResult(
+        mapping=mapping,
+        sweeps=completed_sweeps,
+        changes=total_changes,
+        peak_rank_load=float(rank_loads.max(initial=0.0)),
+    )
+
+
+def optimize_mapping(
+    logical_instances: np.ndarray,
+    instance_ranks: np.ndarray,
+    initial_mapping: np.ndarray,
+    statistics: ProfileStatistics,
+    config: MappingConfig,
+) -> MappingResult:
+    """Refine a mapping using the calibrated score in the PlaceMoE paper."""
+
+    logical_instances, instance_ranks, choices = _validate_layout(
+        logical_instances,
+        instance_ranks,
+        ep_size=statistics.ep_size,
+        num_experts=statistics.num_experts,
+    )
+    if statistics.ep_size % config.ranks_per_node:
+        raise ValueError("Profile EP size must be divisible by ranks_per_node.")
+    mapping = validate_instance_mapping(
+        initial_mapping,
+        logical_instances,
+        ep_size=statistics.ep_size,
+        num_experts=statistics.num_experts,
+    )
+    level_sizes, level_omegas = _mapping_hierarchy(config)
+    if len(level_sizes) == 2:
+        return _optimize_mapping_two_level(instance_ranks, choices, mapping, statistics, config)
+    instance_groups = tuple(instance_ranks // size for size in level_sizes)
+    group_caches = tuple(
+        _group_affinity_cache(
+            mapping,
+            groups,
+            statistics,
+            num_groups=statistics.ep_size // size,
+        )
+        for size, groups in zip(level_sizes, instance_groups, strict=True)
+    )
+    rank_loads = mapping_rank_loads(mapping, instance_ranks, statistics)
+    order = sorted(
+        (
+            (float(statistics.demand[source, expert]), source, expert)
+            for source in range(statistics.ep_size)
+            for expert in range(statistics.num_experts)
+        ),
+        key=lambda row: (-row[0], row[1], row[2]),
+    )
+
+    total_changes = 0
+    completed_sweeps = 0
+    for _ in range(config.sweep_limit):
+        sweep_changes = 0
+        for amount, source, expert in order:
+            if len(choices[expert]) <= 1:
+                continue
+            current = int(mapping[source, expert])
+            current_rank = int(instance_ranks[current])
+            best: tuple[float, int, int] | None = None
+            for candidate in choices[expert].tolist():
+                candidate_rank = int(instance_ranks[candidate])
+                communication = sum(
+                    omega
+                    * (
+                        cache[source, expert, int(groups[candidate])]
+                        + amount * float(int(groups[candidate]) == source // size)
+                    )
+                    for size, omega, groups, cache in zip(
+                        level_sizes,
+                        level_omegas,
+                        instance_groups,
+                        group_caches,
+                        strict=True,
+                    )
+                )
+                projected = rank_loads.copy()
+                projected[current_rank] -= amount
+                projected[candidate_rank] += amount
+                score = communication - float(config.gamma) * float(projected.max(initial=0.0))
+                key = (score, -candidate_rank, -candidate)
+                if best is None or key > best:
+                    best = key
+            if best is None:
+                raise RuntimeError(f"Logical expert {expert} has no mapping candidate.")
+            selected = -best[2]
+            if selected == current:
+                continue
+
+            selected_rank = int(instance_ranks[selected])
+            rank_loads[current_rank] -= amount
+            rank_loads[selected_rank] += amount
+            affinity_column = statistics.affinity[source, :, expert]
+            for groups, cache in zip(instance_groups, group_caches, strict=True):
+                current_group = int(groups[current])
+                selected_group = int(groups[selected])
+                if selected_group != current_group:
+                    cache[source, :, current_group] -= affinity_column
+                    cache[source, :, selected_group] += affinity_column
             mapping[source, expert] = selected
             sweep_changes += 1
         completed_sweeps += 1
@@ -449,11 +574,7 @@ def _remote_group_hits(intersection_hits: np.ndarray, destination_nodes: np.ndar
     for community, node in enumerate(destination_nodes.tolist()):
         community_subsets[node] |= 1 << community
     return float(
-        sum(
-            int(intersection_hits[community_subsets[node]])
-            for node in range(num_nodes)
-            if node != source_node
-        )
+        sum(int(intersection_hits[community_subsets[node]]) for node in range(num_nodes) if node != source_node)
     )
 
 

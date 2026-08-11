@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
+import torch
 import torch.distributed as dist
 
 from ....utils import logging
@@ -27,6 +28,27 @@ from .topology import Hierarchy, infer_hierarchy
 
 
 logger = logging.get_logger(__name__)
+
+
+class _HierMoECheckpointReplay:
+    """Invocation-local physical routes shared by checkpoint forward/recompute."""
+
+    def __init__(self) -> None:
+        self.planned_routes: dict[str, list[torch.Tensor | None]] = {}
+        self._reader_offsets: dict[str, int] = {}
+
+    def record(self, layer_key: str, planned_routes: torch.Tensor | None) -> None:
+        saved = None if planned_routes is None else planned_routes.detach().to(device="cpu", copy=True)
+        self.planned_routes.setdefault(layer_key, []).append(saved)
+
+    def reset_reader(self) -> None:
+        self._reader_offsets.clear()
+
+    def next(self, layer_key: str) -> torch.Tensor | None:
+        offset = self._reader_offsets.get(layer_key, 0)
+        self._reader_offsets[layer_key] = offset + 1
+        values = self.planned_routes.get(layer_key, ())
+        return values[offset] if offset < len(values) else None
 
 
 @dataclass
@@ -57,6 +79,8 @@ class HierMoEState:
     expert_swap_pair: str = "not_implemented"
     layer_swap_forward_enabled: bool = False
     route_capture_forward_enabled: bool = False
+    checkpoint_recompute_enabled: bool = False
+    checkpoint_route_replay: _HierMoECheckpointReplay | None = None
 
 
 _STATE: HierMoEState | None = None
@@ -233,6 +257,103 @@ def configure_hiermoe(
 
 def get_hiermoe_state() -> HierMoEState | None:
     return _STATE
+
+
+def hiermoe_static_cache_release_required() -> bool:
+    state = _STATE
+    manager = None if state is None else state.expert_swap_manager
+    return bool(
+        state is not None
+        and state.active
+        and manager is not None
+        and not manager.checkpoint_route_replay_required
+        and manager._ablation_grad_mode == "blocking"
+    )
+
+
+def hiermoe_checkpoint_replay_enabled() -> bool:
+    state = _STATE
+    return bool(
+        state is not None
+        and state.active
+        and state.expert_swap
+        and (state.expert_swap_mode == "layer" or bool(getattr(state, "fixed_pipeline_overlap", False)))
+        and state.activation_checkpointing_enabled
+        and state.placement_mapping_enabled
+        and state.expert_swap_manager is not None
+    )
+
+
+def hiermoe_checkpoint_physical_route_replay_enabled() -> bool:
+    state = _STATE
+    manager = None if state is None else state.expert_swap_manager
+    return bool(
+        hiermoe_checkpoint_replay_enabled()
+        and manager is not None
+        and bool(getattr(manager, "checkpoint_route_replay_required", True))
+    )
+
+
+def hiermoe_checkpoint_context_fn(external_context_fn=None):
+    """Compose activation-checkpoint contexts with physical-route replay."""
+
+    replay = _HierMoECheckpointReplay()
+    if external_context_fn is None:
+        external_forward = nullcontext()
+        external_recompute = nullcontext()
+    else:
+        external_forward, external_recompute = external_context_fn()
+
+    @contextmanager
+    def forward_context():
+        state = _STATE
+        if state is None:
+            with external_forward:
+                yield
+            return
+        manager = state.expert_swap_manager
+        route_replay = (
+            replay
+            if manager is not None and bool(getattr(manager, "checkpoint_route_replay_required", True))
+            else None
+        )
+        previous_replay = getattr(state, "checkpoint_route_replay", None)
+        previous_recompute = bool(getattr(state, "checkpoint_recompute_enabled", False))
+        state.checkpoint_route_replay = route_replay
+        state.checkpoint_recompute_enabled = False
+        try:
+            with external_forward:
+                yield
+        finally:
+            state.checkpoint_route_replay = previous_replay
+            state.checkpoint_recompute_enabled = previous_recompute
+
+    @contextmanager
+    def recompute_context():
+        state = _STATE
+        replay.reset_reader()
+        if state is None:
+            with external_recompute:
+                yield
+            return
+        manager = state.expert_swap_manager
+        route_replay = (
+            replay
+            if manager is not None and bool(getattr(manager, "checkpoint_route_replay_required", True))
+            else None
+        )
+        previous_replay = getattr(state, "checkpoint_route_replay", None)
+        previous_recompute = bool(getattr(state, "checkpoint_recompute_enabled", False))
+        state.checkpoint_route_replay = route_replay
+        state.checkpoint_recompute_enabled = True
+        try:
+            with external_recompute:
+                yield
+        finally:
+            state.checkpoint_route_replay = previous_replay
+            state.checkpoint_recompute_enabled = previous_recompute
+
+    return forward_context(), recompute_context()
 
 
 def set_hiermoe_step(step: int) -> None:

@@ -9,8 +9,8 @@ from veomni.distributed.moe.hiermoe import expert_swap as expert_swap_module
 from veomni.distributed.moe.hiermoe.perf_model import HierMoEPerfModel
 from veomni.distributed.moe.hiermoe.topology import Hierarchy
 from veomni.distributed.parallel_plan import (
-    _hiermoe_static_preload_layouts,
-    _hiermoe_static_preload_shard,
+    _hiermoe_initial_layout_shard,
+    _hiermoe_initial_layouts,
 )
 
 
@@ -22,7 +22,7 @@ class _FakeExperts(nn.Module):
         self.down_proj = nn.Parameter(torch.arange(6, dtype=torch.float32).view(3, 1, 2))
 
 
-def test_static_preload_shards_checkpoint_by_final_slot_layout(tmp_path, monkeypatch):
+def test_initial_layout_shards_checkpoint_by_final_slot_layout(tmp_path, monkeypatch):
     key = "layers.0.mlp.experts"
     replay_path = tmp_path / "layout.json"
     replay_path.write_text(
@@ -36,17 +36,17 @@ def test_static_preload_shards_checkpoint_by_final_slot_layout(tmp_path, monkeyp
             }
         )
     )
-    _hiermoe_static_preload_layouts.cache_clear()
-    monkeypatch.setenv("VEOMNI_HIERMOE_STATIC_PRELOAD_LAYOUT_PATH", str(replay_path))
+    _hiermoe_initial_layouts.cache_clear()
+    monkeypatch.setenv("VEOMNI_HIERMOE_INITIAL_LAYOUT", str(replay_path))
     tensor = torch.arange(8, dtype=torch.float32).view(4, 2)
 
-    rank0 = _hiermoe_static_preload_shard(
+    rank0 = _hiermoe_initial_layout_shard(
         tensor,
         f"{key}.down_proj",
         (3, 2),
         para_rank=0,
     )
-    rank1 = _hiermoe_static_preload_shard(
+    rank1 = _hiermoe_initial_layout_shard(
         tensor,
         f"{key}.down_proj",
         (3, 2),
@@ -57,7 +57,7 @@ def test_static_preload_shards_checkpoint_by_final_slot_layout(tmp_path, monkeyp
     torch.testing.assert_close(rank1, tensor.index_select(0, torch.tensor([3, 2, 0])))
 
 
-def test_static_preload_resolves_checkpoint_wrapper_prefix(tmp_path, monkeypatch):
+def test_initial_layout_resolves_checkpoint_wrapper_prefix(tmp_path, monkeypatch):
     layout_key = "model.language_model.layers.0.mlp.experts"
     replay_path = tmp_path / "wrapped_layout.json"
     replay_path.write_text(
@@ -71,11 +71,11 @@ def test_static_preload_resolves_checkpoint_wrapper_prefix(tmp_path, monkeypatch
             }
         )
     )
-    _hiermoe_static_preload_layouts.cache_clear()
-    monkeypatch.setenv("VEOMNI_HIERMOE_STATIC_PRELOAD_LAYOUT_PATH", str(replay_path))
+    _hiermoe_initial_layouts.cache_clear()
+    monkeypatch.setenv("VEOMNI_HIERMOE_INITIAL_LAYOUT", str(replay_path))
     tensor = torch.arange(8, dtype=torch.float32).view(4, 2)
 
-    shard = _hiermoe_static_preload_shard(
+    shard = _hiermoe_initial_layout_shard(
         tensor,
         "model.layers.0.mlp.experts.down_proj",
         (3, 2),
@@ -85,7 +85,7 @@ def test_static_preload_resolves_checkpoint_wrapper_prefix(tmp_path, monkeypatch
     torch.testing.assert_close(shard, tensor.index_select(0, torch.tensor([3, 2, 0])))
 
 
-def test_static_preload_zero_fills_inactive_slots(tmp_path, monkeypatch):
+def test_initial_layout_zero_fills_inactive_slots(tmp_path, monkeypatch):
     key = "layers.0.mlp.experts"
     replay_path = tmp_path / "layout_with_empty.json"
     replay_path.write_text(
@@ -99,11 +99,11 @@ def test_static_preload_zero_fills_inactive_slots(tmp_path, monkeypatch):
             }
         )
     )
-    _hiermoe_static_preload_layouts.cache_clear()
-    monkeypatch.setenv("VEOMNI_HIERMOE_STATIC_PRELOAD_LAYOUT_PATH", str(replay_path))
+    _hiermoe_initial_layouts.cache_clear()
+    monkeypatch.setenv("VEOMNI_HIERMOE_INITIAL_LAYOUT", str(replay_path))
     tensor = torch.arange(8, dtype=torch.float32).view(4, 2)
 
-    shard = _hiermoe_static_preload_shard(
+    shard = _hiermoe_initial_layout_shard(
         tensor,
         f"{key}.down_proj",
         (4, 2),
@@ -113,6 +113,70 @@ def test_static_preload_zero_fills_inactive_slots(tmp_path, monkeypatch):
     torch.testing.assert_close(shard[0], tensor[3])
     torch.testing.assert_close(shard[1], torch.zeros_like(shard[1]))
     torch.testing.assert_close(shard[2:], tensor.index_select(0, torch.tensor([1, 2])))
+
+
+def test_static_placement_loads_without_fixed_pipeline(tmp_path, monkeypatch):
+    key = "layers.0.mlp.experts"
+    layout_path = tmp_path / "static_layout.json"
+    layout_path.write_text(
+        json.dumps(
+            {
+                "topology": {"ep_size": 2},
+                "replay": {
+                    "actions_by_step": {
+                        "1": [{"layer": key, "kind": "replica", "body": "2->2"}],
+                    }
+                },
+                "layers": {
+                    key: {
+                        "slot_to_logical": [0, 1, 2, 2, 3, 0],
+                        "owner_slots": [0, 1, 2, 4],
+                        "source_logical_to_physical": [
+                            [5, 1, 3, 4],
+                            [0, 1, 2, 4],
+                        ],
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(expert_swap_module, "_INITIAL_LAYOUT_PATH", str(layout_path))
+    monkeypatch.setattr(expert_swap_module, "_ABLATION_REPLAY_PATH", "")
+    monkeypatch.setattr(expert_swap_module, "_ABLATION_REPLAY_MODE", "off")
+    monkeypatch.setattr(expert_swap_module, "_ABLATION_GRAD_MODE", "blocking")
+    manager = expert_swap_module.ExpertSwapManager(
+        ep_group=None,
+        ep_size=2,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=0,
+        redundant_slot_increment_per_device=1,
+        max_replica_rounds=0,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=2, group_sizes=(2,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="step",
+        expert_swap_selector="hiermoe_greedy_cover_p1",
+        fixed_pipeline_overlap=False,
+    )
+    manager.register_layer(key, _FakeExperts())
+    manager._normalize_ablation_layer_keys()
+    manager._install_static_ablation_layout()
+
+    layer = manager.layers[key]
+    assert tuple(layer.slot_to_logical.tolist()) == (0, 1, 2, 2, 3, 0)
+    assert tuple(layer.logical_to_physical.tolist()) == (0, 1, 2, 4)
+    assert tuple(tuple(row) for row in layer.source_logical_to_physical.tolist()) == (
+        (5, 1, 3, 4),
+        (0, 1, 2, 4),
+    )
+    assert manager._forward_reuse_cover_patch_remap is False
+    torch.testing.assert_close(
+        manager._map_logical_to_slot(layer, torch.tensor([[0, 2]])),
+        torch.tensor([[5, 3]]),
+    )
+    assert manager.fixed_pipeline_overlap is False
+    assert manager.placement_planning_enabled() is False
 
 
 def _manager(monkeypatch, replay_path, *, migration_mode="blocking", grad_mode="blocking"):
@@ -343,7 +407,7 @@ def test_static_ablation_collapses_all_steps_into_one_plan_per_layer(tmp_path, m
     manager.shutdown_pipeline()
 
 
-def test_static_preload_installs_metadata_without_expert_transfer(tmp_path, monkeypatch):
+def test_initial_layout_installs_metadata_without_expert_transfer(tmp_path, monkeypatch):
     key = "layers.0.mlp.experts"
     replay_path = tmp_path / "preloaded.json"
     replay_path.write_text(
@@ -369,9 +433,9 @@ def test_static_preload_installs_metadata_without_expert_transfer(tmp_path, monk
             }
         )
     )
+    monkeypatch.setattr(expert_swap_module, "_INITIAL_LAYOUT_PATH", str(replay_path))
     manager = _manager(monkeypatch, replay_path)
     manager.register_layer(key, _FakeExperts())
-    monkeypatch.setattr(expert_swap_module, "_STATIC_PRELOAD_LAYOUT_PATH", str(replay_path))
     monkeypatch.setattr(
         manager,
         "_execute_placement_plan",
@@ -425,7 +489,8 @@ def test_ablation_replay_resolves_model_wrapper_prefix(tmp_path, monkeypatch):
 
 def test_dedicated_gradient_group_does_not_wait_before_dispatch():
     manager = object.__new__(expert_swap_module.ExpertSwapManager)
-    manager.fixed_pipeline_overlap = True
+    manager.fixed_pipeline_overlap = False
+    manager.gradient_overlap_enabled = True
     manager._ablation_grad_mode = "hidden"
     manager._pipeline_micro_step = 1
     manager._pipeline_num_micro_steps = 2

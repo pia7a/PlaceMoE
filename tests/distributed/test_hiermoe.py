@@ -92,11 +92,11 @@ def test_hiermoe_config_defaults_and_cli_override(tmp_path, monkeypatch):
 model:
   config_path: Qwen/Qwen3-VL-30B-A3B-Instruct
   ops_implementation:
-    moe_implementation: fused_npu
-    cross_entropy_loss_implementation: npu
-    rms_norm_implementation: npu
-    rotary_pos_emb_implementation: npu
-    rotary_pos_emb_vision_implementation: npu
+    moe_implementation: fused_triton
+    cross_entropy_loss_implementation: eager
+    rms_norm_implementation: eager
+    rotary_pos_emb_implementation: eager
+    rotary_pos_emb_vision_implementation: eager
     swiglu_mlp_implementation: eager
     load_balancing_loss_implementation: eager
 train:
@@ -320,7 +320,17 @@ def test_placement_metrics_report_configured_capacity_and_effective_replica_roun
 
     manager._begin_metrics_step(1)
 
-    assert manager.placement_metrics() == {
+    metrics = manager.placement_metrics()
+    assert {
+        key: metrics[key]
+        for key in (
+            "hiermoe/placement_replica_rounds_configured",
+            "hiermoe/placement_replica_slot_capacity",
+            "hiermoe/placement_replica_rounds_effective",
+            "hiermoe/placement_route_sample_size",
+            "hiermoe/placement_runtime_cost_model",
+        )
+    } == {
         "hiermoe/placement_replica_rounds_configured": "auto",
         "hiermoe/placement_replica_slot_capacity": 4,
         "hiermoe/placement_replica_rounds_effective": 4,
@@ -2090,7 +2100,7 @@ def test_redundant_slot_mapping_prefers_duplicate_copy_that_reuses_token_groups(
     torch.testing.assert_close(mapped, torch.tensor([[2, 0], [0, 2]], dtype=torch.long))
 
 
-def test_redundant_slot_mapping_uses_parallel_owner_rank_priority():
+def test_redundant_slot_mapping_minimizes_remote_rank_groups():
     manager = expert_swap_module.ExpertSwapManager(
         ep_group=None,
         ep_size=2,
@@ -2112,7 +2122,7 @@ def test_redundant_slot_mapping_uses_parallel_owner_rank_priority():
 
     mapped = manager.map_logical_to_physical("layers.0.mlp.experts", torch.tensor([[3, 0]], dtype=torch.long))
 
-    torch.testing.assert_close(mapped, torch.tensor([[2, 5]], dtype=torch.long))
+    torch.testing.assert_close(mapped, torch.tensor([[2, 0]], dtype=torch.long))
 
 
 @pytest.mark.parametrize("mode", ("layer", "step"))
@@ -2798,7 +2808,7 @@ def test_periodic_absolute_layout_moves_parameter_and_optimizer_state():
         optimizer.state[param]["exp_avg"].copy_(param.detach() + 1000)
         optimizer.state[param]["exp_avg_sq"].copy_(param.detach() + 2000)
 
-    moved = manager._install_periodic_absolute_layer_layout(
+    moved = manager._install_hot_update_layout(
         manager.layers[key],
         {
             "slot_to_logical": [1, 0, 2],
@@ -3351,6 +3361,8 @@ def _fixed_r2_parameter_initialization_worker():
     state = get_hiermoe_state()
     assert state is not None and state.expert_swap_manager is not None
     manager = state.expert_swap_manager
+    assert manager.fixed_pipeline_overlap is False
+    assert manager.gradient_overlap_enabled is True
     module = _FakeExperts(num_experts=4, local_start=rank * 2, local_experts=4, hidden_size=2)
     with torch.no_grad():
         module.gate_up_proj[2:].zero_()
@@ -3411,7 +3423,9 @@ def _fixed_r2_grad_sync_batches_all_experts_worker():
     layer = manager.layers["layers.0.mlp.experts"]
     layer.slot_to_logical = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3], dtype=torch.long)
     manager._refresh_layer_mapping_from_slots(layer, (0, 1, 6, 7))
-    module2 = _FakeExperts(num_experts=4, local_start=rank * 2, local_experts=4, hidden_size=2)
+    # Vary the payload size to ensure the pool retains only the largest
+    # allocation per peer instead of one allocation per layer.
+    module2 = _FakeExperts(num_experts=4, local_start=rank * 2, local_experts=4, hidden_size=3)
     manager.register_layer("layers.1.mlp.experts", module2)
     layer2 = manager.layers["layers.1.mlp.experts"]
     layer2.slot_to_logical = layer.slot_to_logical.clone()
@@ -3488,9 +3502,7 @@ def _arbitrary_pair_graph_grad_sync_uses_one_all_to_all_worker():
 
     module.gate_up_proj.grad = torch.zeros_like(module.gate_up_proj)
     module.down_proj.grad = torch.zeros_like(module.down_proj)
-    for local_slot, logical_expert in enumerate(
-        layer.slot_to_logical[rank * 2 : (rank + 1) * 2].tolist()
-    ):
+    for local_slot, logical_expert in enumerate(layer.slot_to_logical[rank * 2 : (rank + 1) * 2].tolist()):
         module.gate_up_proj.grad[local_slot].fill_(10 * (rank + 1) + logical_expert)
         module.down_proj.grad[local_slot].fill_(100 * (rank + 1) + logical_expert)
 
@@ -3515,9 +3527,7 @@ def _arbitrary_pair_graph_grad_sync_uses_one_all_to_all_worker():
         2: (64.0, 604.0),
         3: (76.0, 706.0),
     }
-    for local_slot, logical_expert in enumerate(
-        layer.slot_to_logical[rank * 2 : (rank + 1) * 2].tolist()
-    ):
+    for local_slot, logical_expert in enumerate(layer.slot_to_logical[rank * 2 : (rank + 1) * 2].tolist()):
         gate_expected, down_expected = expected_by_expert[logical_expert]
         torch.testing.assert_close(
             module.gate_up_proj.grad[local_slot],
@@ -5736,7 +5746,8 @@ def test_pipeline_prepare_substage_timing_separates_device_host_and_thread_cpu(m
     assert thread_cpu_ms == pytest.approx({"route_hash": 1.0, "occupancy": 2.0})
 
 
-def test_fixed_pipeline_reuses_ep_group_with_one_ordered_collective_executor():
+def test_fixed_pipeline_reuses_ep_group_for_ordered_planner_and_migration(monkeypatch):
+    monkeypatch.setattr(expert_swap_module, "_ABLATION_GRAD_MODE", "blocking")
     background_group = object()
     manager = expert_swap_module.ExpertSwapManager(
         ep_group=background_group,
@@ -5759,10 +5770,14 @@ def test_fixed_pipeline_reuses_ep_group_with_one_ordered_collective_executor():
     assert manager._pipeline_migration_group is background_group
     assert manager._pipeline_grad_group is background_group
     assert manager._pipeline_collective_executor is not None
+    assert manager._pipeline_grad_executor is None
     manager.shutdown_pipeline()
 
 
-def _fixed_pipeline_gradient_overlap_worker():
+def _gradient_overlap_without_fixed_pipeline_worker():
+    expert_swap_module._ABLATION_REPLAY_MODE = "off"
+    expert_swap_module._INITIAL_LAYOUT_PATH = ""
+    expert_swap_module._ABLATION_GRAD_MODE = "hidden"
     rank = dist.get_rank()
     configure_hiermoe(
         _profiled_hiermoe_config(
@@ -5772,7 +5787,7 @@ def _fixed_pipeline_gradient_overlap_worker():
             expert_swap_interval=1,
             expert_swap_selector="hiermoe_greedy_cover_p1",
             expert_swap_mode="step",
-            fixed_pipeline_overlap=True,
+            fixed_pipeline_overlap=False,
             hierarchy_group_sizes=[2],
             redundant_slot_increment_per_device=2,
         ),
@@ -5782,6 +5797,9 @@ def _fixed_pipeline_gradient_overlap_worker():
     state = get_hiermoe_state()
     assert state is not None and state.expert_swap_manager is not None
     manager = state.expert_swap_manager
+    assert manager.fixed_pipeline_overlap is False
+    assert manager.gradient_overlap_enabled is True
+    assert manager._pipeline_grad_executor is None
     module = _FakeExperts(num_experts=4, local_start=rank * 2, local_experts=4, hidden_size=2)
     manager.register_layer("layers.0.mlp.experts", module)
     layer = manager.layers["layers.0.mlp.experts"]
@@ -5803,18 +5821,19 @@ def _fixed_pipeline_gradient_overlap_worker():
     manager.shutdown_pipeline()
 
 
-def test_fixed_pipeline_gradient_sync_waits_for_dispatch_backward_boundary():
-    torchrun(_fixed_pipeline_gradient_overlap_worker, world_size=2, backend="gloo")
+def test_gradient_overlap_without_fixed_pipeline_waits_for_dispatch_backward_boundary():
+    torchrun(_gradient_overlap_without_fixed_pipeline_worker, world_size=2, backend="gloo")
 
 
-def test_fixed_pipeline_autograd_markers_bracket_dispatch_backward(monkeypatch):
+def test_gradient_overlap_autograd_markers_without_fixed_pipeline(monkeypatch):
     events = []
     manager = SimpleNamespace(
         close_pipeline_planner_collective_window=lambda key: events.append(("collective_close", key)),
         close_pipeline_gradient_window_before_dispatch=lambda key: events.append(("close", key)),
         open_pipeline_gradient_window_after_dispatch=lambda key: events.append(("open", key)),
     )
-    monkeypatch.setattr(hiermoe_all_to_all, "_fixed_pipeline_manager", lambda _key: manager)
+    monkeypatch.setattr(hiermoe_all_to_all, "_fixed_pipeline_manager", lambda _key: None)
+    monkeypatch.setattr(hiermoe_all_to_all, "_gradient_overlap_manager", lambda _key: manager)
     key = "layers.0.mlp.experts"
     source = torch.ones((2, 3), requires_grad=True)
     dispatch_input = hiermoe_all_to_all._mark_fixed_pipeline_dispatch_input(source, key)
@@ -5826,7 +5845,7 @@ def test_fixed_pipeline_autograd_markers_bracket_dispatch_backward(monkeypatch):
 
     marked.sum().backward()
 
-    assert events == [("collective_close", key), ("close", key), ("open", key)]
+    assert events == [("close", key), ("open", key)]
     torch.testing.assert_close(source.grad, torch.full_like(source, 2.0))
 
 
@@ -5885,9 +5904,9 @@ def test_fixed_pipeline_planner_uses_explicit_compute_and_communication_windows(
     torchrun(_fixed_pipeline_planner_window_worker, world_size=2, backend="gloo")
 
 
-def test_fixed_pipeline_gradient_hooks_submit_in_reverse_layer_order(monkeypatch):
+def test_gradient_hooks_submit_in_reverse_layer_order_without_fixed_pipeline(monkeypatch):
     manager = expert_swap_module.ExpertSwapManager(
-        ep_group=None,
+        ep_group=object(),
         ep_size=1,
         ep_rank=0,
         expert_swap_interval=1,
@@ -5899,7 +5918,7 @@ def test_fixed_pipeline_gradient_hooks_submit_in_reverse_layer_order(monkeypatch
         perf_model=HierMoEPerfModel.default(),
         expert_swap_mode="step",
         expert_swap_selector="hiermoe_greedy_cover_p1",
-        fixed_pipeline_overlap=True,
+        fixed_pipeline_overlap=False,
     )
     keys = []
     for layer_index in range(3):
@@ -5927,9 +5946,9 @@ def test_fixed_pipeline_gradient_hooks_submit_in_reverse_layer_order(monkeypatch
     manager.shutdown_pipeline()
 
 
-def test_fixed_pipeline_concurrent_gradient_queue_keeps_reverse_order_once(monkeypatch):
+def test_concurrent_gradient_queue_keeps_reverse_order_without_fixed_pipeline(monkeypatch):
     manager = expert_swap_module.ExpertSwapManager(
-        ep_group=None,
+        ep_group=object(),
         ep_size=1,
         ep_rank=0,
         expert_swap_interval=1,
@@ -5941,7 +5960,7 @@ def test_fixed_pipeline_concurrent_gradient_queue_keeps_reverse_order_once(monke
         perf_model=HierMoEPerfModel.default(),
         expert_swap_mode="step",
         expert_swap_selector="hiermoe_greedy_cover_p1",
-        fixed_pipeline_overlap=True,
+        fixed_pipeline_overlap=False,
     )
     keys = []
     for layer_index in range(3):

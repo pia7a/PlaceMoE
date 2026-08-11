@@ -41,6 +41,8 @@ class PlacementConfig:
     seed: int = 0
     seed_load_weight: float | None = None
     calibrated_partition_refinement: bool = True
+    hierarchy_group_sizes: tuple[int, ...] = ()
+    level_omegas: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         if self.ep_size <= 0 or self.ranks_per_node <= 0 or self.slots_per_rank <= 0:
@@ -53,6 +55,7 @@ class PlacementConfig:
             raise ValueError("Capacity-assignment iterations must be positive.")
         if self.node_exchange_limit < 0 or self.rank_exchange_limit < 0:
             raise ValueError("Placement exchange limits must be non-negative.")
+        _placement_hierarchy(self)
 
     @property
     def num_nodes(self) -> int:
@@ -63,6 +66,27 @@ class PlacementConfig:
         return self.ep_size * self.slots_per_rank
 
 
+def _placement_hierarchy(config: PlacementConfig) -> tuple[tuple[int, ...], tuple[float, ...]]:
+    """Return coarse-to-fine physical group sizes and their paper weights."""
+
+    if not config.hierarchy_group_sizes:
+        return (config.ranks_per_node, 1), (config.node_omega, config.rank_omega)
+    runtime_sizes = tuple(int(size) for size in config.hierarchy_group_sizes)
+    if runtime_sizes[-1] != config.ep_size:
+        raise ValueError("The final hierarchy group size must equal ep_size.")
+    if any(lhs <= 0 or rhs % lhs for lhs, rhs in zip(runtime_sizes, runtime_sizes[1:], strict=False)):
+        raise ValueError("Hierarchy group sizes must form an increasing divisibility chain.")
+    level_sizes = (*reversed(runtime_sizes[:-1]), 1)
+    if level_sizes[0] != config.ranks_per_node:
+        raise ValueError("The coarsest proper hierarchy group must match ranks_per_node.")
+    omegas = tuple(float(value) for value in config.level_omegas)
+    if len(omegas) != len(level_sizes):
+        raise ValueError("One calibrated placement coefficient is required per hierarchy stage.")
+    if any(value < 0.0 for value in omegas):
+        raise ValueError("Hierarchy placement coefficients must be non-negative.")
+    return level_sizes, omegas
+
+
 @dataclass(frozen=True)
 class PlacementResult:
     """Physical rank of every copy and whether rank feasibility was repaired."""
@@ -71,6 +95,7 @@ class PlacementResult:
     repaired: bool
     node_objective: float
     rank_objective: float
+    level_objectives: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         instance_ranks = np.asarray(self.instance_ranks, dtype=np.int64).copy()
@@ -130,9 +155,7 @@ def community_node_placements(
         return ()
     node_capacity = config.ranks_per_node * config.slots_per_rank
 
-    instances_by_expert = [
-        np.flatnonzero(logical_instances == expert).tolist() for expert in range(num_experts)
-    ]
+    instances_by_expert = [np.flatnonzero(logical_instances == expert).tolist() for expert in range(num_experts)]
     empty_instances = np.flatnonzero(logical_instances < 0).tolist()
     if len(empty_instances) != config.total_slots - int(copy_counts.sum()):
         return ()
@@ -148,10 +171,7 @@ def community_node_placements(
         copy_node_tables.append(identity[None, :])
     elif max_copies == 2:
         if config.num_nodes <= 6:
-            permutations = (
-                np.asarray(row, dtype=np.int64)
-                for row in itertools.permutations(range(config.num_nodes))
-            )
+            permutations = (np.asarray(row, dtype=np.int64) for row in itertools.permutations(range(config.num_nodes)))
         else:
             rows = [np.roll(identity, -shift) for shift in range(1, config.num_nodes)]
             rng = np.random.default_rng(config.seed)
@@ -174,9 +194,7 @@ def community_node_placements(
             max_copies - 1,
         ):
             shifts = (0, *additional)
-            copy_node_tables.append(
-                np.stack([np.roll(identity, -shift) for shift in shifts])
-            )
+            copy_node_tables.append(np.stack([np.roll(identity, -shift) for shift in shifts]))
     rows: list[tuple[float, bytes, np.ndarray]] = []
     seen_abstract: set[bytes] = set()
     for copy_nodes in copy_node_tables:
@@ -308,6 +326,96 @@ def repair_rank_placement(
     return result
 
 
+def _place_instances_multilevel(
+    demand_by_source: np.ndarray,
+    affinity_by_source: np.ndarray,
+    logical_instances: np.ndarray,
+    config: PlacementConfig,
+) -> PlacementResult:
+    """Apply the paper partition-and-map update recursively at every link level."""
+
+    demand = demand_by_source.sum(axis=0)
+    affinity = affinity_by_source.sum(axis=0)
+    level_sizes, level_omegas = _placement_hierarchy(config)
+    parents: list[tuple[np.ndarray, np.ndarray]] = [
+        (
+            np.arange(config.total_slots, dtype=np.int64),
+            np.arange(config.ep_size, dtype=np.int64),
+        )
+    ]
+    instance_ranks = np.full((config.total_slots,), -1, dtype=np.int64)
+    objectives: list[float] = []
+    for level_index, (group_size, omega) in enumerate(zip(level_sizes, level_omegas, strict=True)):
+        next_parents: list[tuple[np.ndarray, np.ndarray]] = []
+        level_objective = 0.0
+        for parent_index, (members, parent_ranks) in enumerate(parents):
+            if len(parent_ranks) % group_size:
+                raise RuntimeError("A hierarchy level does not divide its parent group.")
+            child_count = len(parent_ranks) // group_size
+            child_capacity = group_size * config.slots_per_rank
+            partition = partition_items(
+                affinity[np.ix_(members, members)],
+                demand[members],
+                PartitionConfig(
+                    capacities=(child_capacity,) * child_count,
+                    ranks_per_group=(group_size,) * child_count,
+                    omega=omega,
+                    gamma=config.gamma,
+                    restarts=1,
+                    assignment_iterations=config.assignment_iterations,
+                    exchange_limit=(config.node_exchange_limit if level_index == 0 else config.rank_exchange_limit),
+                    seed=(config.seed + 104729 * (level_index + 1) + 1009 * (parent_index + 1)),
+                    seed_load_weight=config.seed_load_weight,
+                    calibrated_refinement=config.calibrated_partition_refinement,
+                ),
+            )[0]
+            child_sources = tuple(
+                parent_ranks[offset : offset + group_size] for offset in range(0, len(parent_ranks), group_size)
+            )
+            locations = map_groups_to_locations(
+                partition.labels,
+                demand_by_source[:, members],
+                sources_by_location=child_sources,
+            )
+            level_objective += float(partition.objective)
+            if group_size == 1:
+                instance_ranks[members] = parent_ranks[locations]
+            else:
+                for child in range(child_count):
+                    next_parents.append(
+                        (
+                            members[locations == child],
+                            child_sources[child],
+                        )
+                    )
+        objectives.append(level_objective)
+        parents = next_parents
+
+    repaired = False
+    if not rank_placement_is_unique(instance_ranks, logical_instances, ep_size=config.ep_size):
+        instance_nodes = instance_ranks // config.ranks_per_node
+        instance_ranks = repair_rank_placement(
+            instance_nodes,
+            demand,
+            affinity,
+            logical_instances,
+            config,
+        )
+        repaired = True
+    counts = np.bincount(instance_ranks, minlength=config.ep_size)
+    if not np.array_equal(counts, np.full((config.ep_size,), config.slots_per_rank)):
+        raise RuntimeError("Hierarchical placement violates rank capacity.")
+    if not rank_placement_is_unique(instance_ranks, logical_instances, ep_size=config.ep_size):
+        raise RuntimeError("Hierarchical placement retains duplicate expert copies on one rank.")
+    return PlacementResult(
+        instance_ranks=instance_ranks,
+        repaired=repaired,
+        node_objective=objectives[0],
+        rank_objective=sum(objectives[1:]),
+        level_objectives=tuple(objectives),
+    )
+
+
 def place_instances(
     demand_by_source: np.ndarray,
     affinity_by_source: np.ndarray,
@@ -325,6 +433,8 @@ def place_instances(
         raise ValueError("Copy affinity must have shape [source_rank, instance, instance].")
     if logical_instances.shape != (config.total_slots,):
         raise ValueError("Logical instances must fill the physical slot capacity, including empty items.")
+    if len(_placement_hierarchy(config)[0]) > 2:
+        return _place_instances_multilevel(demand_by_source, affinity_by_source, logical_instances, config)
     demand = demand_by_source.sum(axis=0)
     affinity = affinity_by_source.sum(axis=0)
     node_capacity = config.ranks_per_node * config.slots_per_rank
@@ -399,4 +509,5 @@ def place_instances(
         repaired=repaired,
         node_objective=node_partition.objective,
         rank_objective=rank_objective,
+        level_objectives=(node_partition.objective, rank_objective),
     )

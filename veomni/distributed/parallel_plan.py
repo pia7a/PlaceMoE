@@ -31,46 +31,57 @@ from .utils import check_fqn_match, get_module_from_path, set_module_from_path
 logger = logging.get_logger(__name__)
 
 
-@lru_cache(maxsize=1)
-def _hiermoe_static_preload_layout_path() -> str:
-    """Resolve the canonical PlaceMoE artifact before model sharding."""
-    if os.environ.get("VEOMNI_PLACEMOE_CONFIG", "").strip():
+@lru_cache(maxsize=4)
+def _resolve_hiermoe_initial_layout_path(config_path: str, hiermoe_path: str) -> str:
+    if config_path:
         # Import lazily so generic parallel plans do not load HierMoE unless
         # PlaceMoE is explicitly configured.
         from .moe.hiermoe.placemoe.runtime import PlaceMoERuntimeConfig
 
-        config = PlaceMoERuntimeConfig.from_environment()
+        config = PlaceMoERuntimeConfig.from_file(config_path)
         if config.initial_artifact:
             return config.initial_artifact
-    return os.environ.get("VEOMNI_HIERMOE_STATIC_PRELOAD_LAYOUT_PATH", "").strip()
+    return hiermoe_path
+
+
+def _hiermoe_initial_layout_path() -> str:
+    """Resolve the canonical PlaceMoE artifact before model sharding."""
+    config_path = os.environ.get("VEOMNI_PLACEMOE_CONFIG", "").strip()
+    hiermoe_path = os.environ.get("VEOMNI_HIERMOE_INITIAL_LAYOUT", "").strip()
+    return _resolve_hiermoe_initial_layout_path(config_path, hiermoe_path)
+
+
+_hiermoe_initial_layout_path.cache_clear = (  # type: ignore[attr-defined]
+    _resolve_hiermoe_initial_layout_path.cache_clear
+)
 
 
 @lru_cache(maxsize=4)
-def _hiermoe_static_preload_layouts(path: str) -> dict[str, tuple[int, ...]]:
+def _hiermoe_initial_layouts(path: str) -> dict[str, tuple[int, ...]]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     raw_layers = payload.get("layers")
     if not isinstance(raw_layers, dict) or not raw_layers:
-        raise ValueError(f"HierMoE static preload file {path!r} has no layer layouts.")
+        raise ValueError(f"HierMoE initial layout file {path!r} has no layer layouts.")
     layouts: dict[str, tuple[int, ...]] = {}
     for layer_key, raw_layer in raw_layers.items():
         if not isinstance(raw_layer, dict) or "slot_to_logical" not in raw_layer:
-            raise ValueError(f"HierMoE static preload layer {layer_key!r} has no slot_to_logical.")
+            raise ValueError(f"HierMoE initial layout layer {layer_key!r} has no slot_to_logical.")
         layouts[str(layer_key)] = tuple(int(value) for value in raw_layer["slot_to_logical"])
     return layouts
 
 
-def _hiermoe_static_preload_shard(
+def _hiermoe_initial_layout_shard(
     tensor: "torch.Tensor",
     parameter_name: str,
     target_shape: tuple,
     *,
     para_rank: int,
 ) -> "torch.Tensor | None":
-    path = _hiermoe_static_preload_layout_path()
+    path = _hiermoe_initial_layout_path()
     if not path:
         return None
     layer_key = parameter_name.rsplit(".", maxsplit=1)[0]
-    layouts = _hiermoe_static_preload_layouts(path)
+    layouts = _hiermoe_initial_layouts(path)
     if layer_key not in layouts:
         # Some Hugging Face checkpoint converters remove a wrapper such as
         # ``language_model`` from parameter names, while ``named_modules()``
@@ -81,7 +92,7 @@ def _hiermoe_static_preload_shard(
         matches = [key for key in layouts if suffix and key.endswith(suffix)]
         if len(matches) != 1:
             raise ValueError(
-                f"HierMoE static preload file {path!r} has no unambiguous layer for {layer_key!r}; "
+                f"HierMoE initial layout file {path!r} has no unambiguous layer for {layer_key!r}; "
                 f"suffix={suffix!r}, matches={matches}."
             )
         layer_key = matches[0]
@@ -91,13 +102,13 @@ def _hiermoe_static_preload_shard(
     layout = layouts[layer_key]
     if slot_end > len(layout):
         raise ValueError(
-            f"HierMoE static preload layer {layer_key!r} has {len(layout)} slots, "
+            f"HierMoE initial layout layer {layer_key!r} has {len(layout)} slots, "
             f"cannot load EP rank {para_rank} slots [{slot_start}, {slot_end})."
         )
     logical_experts = layout[slot_start:slot_end]
     if any(logical < -1 or logical >= int(tensor.shape[0]) for logical in logical_experts):
         raise ValueError(
-            f"HierMoE static preload layer {layer_key!r} contains an invalid expert "
+            f"HierMoE initial layout layer {layer_key!r} contains an invalid expert "
             f"for EP rank {para_rank}: {logical_experts}."
         )
     result = tensor.new_zeros(target_shape)
@@ -300,7 +311,7 @@ class ParallelPlan:
                         if parallel_state.extra_parallel_enabled(shard_group)
                         else 0
                     )
-                    preloaded = _hiermoe_static_preload_shard(
+                    preloaded = _hiermoe_initial_layout_shard(
                         tensor,
                         parameter_name,
                         target_shape,

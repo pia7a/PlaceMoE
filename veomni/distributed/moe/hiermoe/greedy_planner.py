@@ -495,6 +495,122 @@ class GreedyCommunicationPlanner:
             "max_active_peers": torch.maximum(active_send_peers, active_receive_peers),
         }
 
+    def _hierarchical3d_traffic_features(
+        self,
+        source_unique_counts: torch.Tensor,
+        source_assignment_counts: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        intra_size = int(self.hierarchy.group_sizes[0])
+        mid_size = int(self.hierarchy.group_sizes[1])
+        if intra_size <= 1 or mid_size <= intra_size or mid_size % intra_size or self.ep_size % mid_size:
+            raise ValueError(f"Invalid three-stage hierarchy {(intra_size, mid_size, self.ep_size)}.")
+        num_mid_groups = self.ep_size // mid_size
+        groups_per_mid = mid_size // intra_size
+        widths = self._count_widths()
+        expected_widths = (self.ep_size, self.ep_size // intra_size, num_mid_groups)
+        if widths[:3] != expected_widths:
+            raise ValueError(f"Unexpected three-stage packed widths {widths}.")
+        unique_rank, unique_intra, unique_mid = source_unique_counts.split(widths, dim=2)[:3]
+        assignment_rank, assignment_intra, assignment_mid = source_assignment_counts.split(widths, dim=2)[:3]
+        batch = int(source_unique_counts.shape[1])
+
+        def matrices(
+            rank_counts: torch.Tensor,
+            intra_counts: torch.Tensor,
+            mid_counts: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            stage1 = (
+                mid_counts.reshape(num_mid_groups, mid_size, batch, num_mid_groups).permute(2, 1, 0, 3).contiguous()
+            )
+            stage2 = (
+                intra_counts.reshape(
+                    num_mid_groups,
+                    groups_per_mid,
+                    intra_size,
+                    batch,
+                    num_mid_groups,
+                    groups_per_mid,
+                )
+                .sum(dim=0)
+                .permute(2, 3, 1, 0, 4)
+                .reshape(batch, num_mid_groups * intra_size, groups_per_mid, groups_per_mid)
+                .contiguous()
+            )
+            stage3 = (
+                rank_counts.reshape(
+                    num_mid_groups,
+                    groups_per_mid,
+                    intra_size,
+                    batch,
+                    num_mid_groups,
+                    groups_per_mid,
+                    intra_size,
+                )
+                .sum(dim=(0, 1))
+                .permute(1, 2, 3, 0, 4)
+                .reshape(batch, num_mid_groups * groups_per_mid, intra_size, intra_size)
+                .contiguous()
+            )
+            return stage1, stage2, stage3
+
+        unique_stages = matrices(unique_rank, unique_intra, unique_mid)
+        assignment_stages = matrices(assignment_rank, assignment_intra, assignment_mid)
+        hidden_bytes = int(self.payload_bytes)
+        stages = tuple(
+            self._stage_traffic_features(
+                unique,
+                assignments,
+                hidden_bytes=hidden_bytes,
+                metadata_bytes=(3 * 4 if index == 0 else 2 * 4),
+            )
+            for index, (unique, assignments) in enumerate(zip(unique_stages, assignment_stages, strict=True))
+        )
+        stage1_node = self._stage_traffic_features(
+            unique_stages[0].sum(dim=1, keepdim=True),
+            assignment_stages[0].sum(dim=1, keepdim=True),
+            hidden_bytes=hidden_bytes,
+            metadata_bytes=3 * 4,
+        )
+        inter_links = self.perf_model.inter
+        links = (
+            inter_links[0],
+            inter_links[1] if len(inter_links) > 1 else inter_links[0],
+            self.perf_model.intra,
+        )
+
+        def weighted(feature: str) -> torch.Tensor:
+            return sum(float(link.beta) * stage[feature] for link, stage in zip(links, stages, strict=True))
+
+        result = {
+            "stage_unique_endpoint_link_units": sum(
+                2.0 * float(link.beta) * float(hidden_bytes) * stage["unique_endpoint_tokens"]
+                for link, stage in zip(links, stages, strict=True)
+            ),
+            "stage_payload_endpoint_link_units": weighted("full_endpoint_bytes"),
+            "stage_payload_edge_link_units": weighted("full_edge_bytes"),
+            "stage_shared_node_endpoint_link_units": (
+                float(links[0].beta) * stage1_node["full_endpoint_bytes"]
+                + sum(
+                    float(link.beta) * stage["full_endpoint_bytes"]
+                    for link, stage in zip(links[1:], stages[1:], strict=True)
+                )
+            ),
+            "stage_remote_payload_endpoint_link_units": weighted("remote_full_endpoint_bytes"),
+            "stage_remote_payload_edge_link_units": weighted("remote_full_edge_bytes"),
+            "stage_self_payload_link_units": weighted("self_endpoint_bytes"),
+        }
+        for index, stage in enumerate(stages, start=1):
+            result.update(
+                {
+                    f"stage{index}_payload_endpoint_bytes": stage["full_endpoint_bytes"],
+                    f"stage{index}_remote_payload_endpoint_bytes": stage["remote_full_endpoint_bytes"],
+                    f"stage{index}_payload_edge_bytes": stage["full_edge_bytes"],
+                    f"stage{index}_payload_total_bytes": stage["full_total_bytes"],
+                    f"stage{index}_max_active_peers": stage["max_active_peers"],
+                }
+            )
+        return result
+
     def _hierarchical_traffic_features(
         self,
         source_unique_counts: torch.Tensor,
@@ -515,6 +631,8 @@ class GreedyCommunicationPlanner:
                 "Hierarchical source counts must have shape "
                 f"[{self.ep_size}, batch, packed_width], got {tuple(source_unique_counts.shape)}."
             )
+        if int(self.hierarchy.selected_dim) == 3:
+            return self._hierarchical3d_traffic_features(source_unique_counts, source_assignment_counts)
         if int(self.hierarchy.selected_dim) != 2 or len(self.hierarchy.group_sizes) < 2:
             raise ValueError("Traffic-matrix diagnostics currently require a two-stage hierarchy.")
         intra_size = int(self.hierarchy.group_sizes[0])
@@ -616,6 +734,8 @@ class GreedyCommunicationPlanner:
             "stage_self_payload_link_units": self_payload_link_units,
             "stage1_payload_endpoint_bytes": stage1["full_endpoint_bytes"],
             "stage2_payload_endpoint_bytes": stage2["full_endpoint_bytes"],
+            "stage1_remote_payload_endpoint_bytes": stage1["remote_full_endpoint_bytes"],
+            "stage2_remote_payload_endpoint_bytes": stage2["remote_full_endpoint_bytes"],
             "stage1_payload_edge_bytes": stage1["full_edge_bytes"],
             "stage2_payload_edge_bytes": stage2["full_edge_bytes"],
             "stage1_payload_total_bytes": stage1["full_total_bytes"],
@@ -664,8 +784,7 @@ class GreedyCommunicationPlanner:
             assignment_rank, assignment_node = assignment_counts.split(widths, dim=1)[:2]
         else:
             raise ValueError(
-                f"Expected assignment width {self.ep_size} or {sum(widths)}, "
-                f"got {int(assignment_counts.shape[1])}."
+                f"Expected assignment width {self.ep_size} or {sum(widths)}, got {int(assignment_counts.shape[1])}."
             )
         batch = int(unique_counts.shape[0])
         lane = int(source_rank) % intra_size

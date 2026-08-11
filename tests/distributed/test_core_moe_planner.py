@@ -726,7 +726,7 @@ def test_fused_path_skips_eager_scoring_reduces_once_and_reuses_physical_routes(
 
     assert len(reduce_calls) == 1
     assert len(quota_calls) == 1
-    assert reduce_calls[0].shape == (2, 7)
+    assert reduce_calls[0].shape == (2, 2)
     assert plan.actions == (PlacementAction("swap", 0, 1, 0, 1),)
     assert plan.final_layout == (1, 0)
     assert torch.equal(plan.local_physical_routes, torch.tensor([[1, 0], [0, 1]]))

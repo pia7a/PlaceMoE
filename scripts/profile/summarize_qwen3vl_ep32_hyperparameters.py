@@ -13,13 +13,8 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_FIGURES_DIR = Path(
-    os.environ.get("HIERMOE_PAPER_FIGURES_DIR", "/home/tzq/infocom2027-paper/figures")
-)
-BASELINE_FILE = (
-    "paper32_qwen3vl30b_sharegpt4v_baseline_full_"
-    "20260729_anchor10_r2_summary.json"
-)
+DEFAULT_FIGURES_DIR = Path(os.environ.get("HIERMOE_PAPER_FIGURES_DIR", "/home/tzq/infocom2027-paper/figures"))
+BASELINE_FILE = "paper32_qwen3vl30b_sharegpt4v_baseline_full_20260729_anchor10_r2_summary.json"
 RHO_CASES = (
     (0.00, 0, "paper32_qwen3vl30b_sharegpt4v_hyper_rho000_full_20260729_anchor10_r2_summary.json"),
     (0.25, 1, "paper32_qwen3vl30b_sharegpt4v_hyper_rho025_full_20260729_anchor10_r2_summary.json"),
@@ -54,10 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-prefix",
         type=Path,
-        default=(
-            DEFAULT_FIGURES_DIR
-            / "paper32_qwen3vl30b_sharegpt4v_hyperparameter_table"
-        ),
+        default=(DEFAULT_FIGURES_DIR / "paper32_qwen3vl30b_sharegpt4v_hyperparameter_table"),
         help="Output path without an extension.",
     )
     return parser.parse_args()
@@ -131,8 +123,8 @@ def make_row(
         "expert_compute_std_ms": metric(payload, "expert_compute_ms", "std"),
         "dedup_ratio": optional_metric(payload, "dedup_ratio_dispatch"),
         "dedup_ratio_std": optional_metric(payload, "dedup_ratio_dispatch", "std"),
-        "peak_npu_allocated_gib": payload.get("peak_npu_allocated_gib"),
-        "peak_npu_reserved_gib": payload.get("peak_npu_reserved_gib"),
+        "peak_accelerator_allocated_gib": payload.get("peak_accelerator_allocated_gib"),
+        "peak_accelerator_reserved_gib": payload.get("peak_accelerator_reserved_gib"),
         "gradient_sync_mode": payload.get("hiermoe_ablation_grad_mode"),
         "run_name": payload.get("run_name"),
         "summary_path": str(summary_path.resolve()),
@@ -202,10 +194,7 @@ def markdown(report: dict[str, Any]) -> str:
     lines = [
         "# Qwen3-VL EP32 Hyperparameter Results",
         "",
-        (
-            "All values use optimizer steps 11--20. E2E and A2A speedups are "
-            "normalized to the VeOmni row."
-        ),
+        ("All values use optimizer steps 11--20. E2E and A2A speedups are normalized to the VeOmni row."),
         "",
         (
             "| Configuration | $\\rho$ | Redundant slots/rank | Capacity | "

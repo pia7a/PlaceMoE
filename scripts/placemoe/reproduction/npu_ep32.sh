@@ -12,7 +12,7 @@ model=$2
 dataset=$3
 mode=${4:-full}
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-source_root=$(cd "${script_dir}/../.." && pwd)
+source_root=$(cd "${script_dir}/../../.." && pwd)
 config=$(realpath "${config}")
 case "${config}" in
   "${source_root}"/*) ;;
@@ -23,7 +23,7 @@ case "${config}" in
 esac
 
 relative_config=${config#"${source_root}"/}
-initial_artifact=$(python "${script_dir}/config_path.py" "${config}" initial_artifact)
+initial_artifact=$(python "${script_dir}/../config_path.py" "${config}" initial_artifact)
 case "${initial_artifact}" in
   "${source_root}"/*) ;;
   *)
@@ -33,8 +33,7 @@ case "${initial_artifact}" in
 esac
 relative_artifact=${initial_artifact#"${source_root}"/}
 container_source_root=${PLACEMOE_CONTAINER_SOURCE_ROOT:-/workspace/output/hiermoe_greedy_swap_cover_20260722/src}
-export PAPER32_PLACEMOE_CONFIG=${container_source_root}/${relative_config}
-export PAPER32_PLACEMOE_INITIAL_ARTIFACT=${container_source_root}/${relative_artifact}
+export VEOMNI_PLACEMOE_CONFIG=${container_source_root}/${relative_config}
 container_name=${PAPER32_CONTAINER_NAME:-tzq_hiermoe_paper32_warmcache_20260729}
 
 export PAPER32_WORLD_SIZE=32
@@ -71,7 +70,7 @@ for host in "${hosts[@]}"; do
     ssh -i "${PAPER32_SSH_KEY:-/root/.ssh/KeyPair-3bce.pem}" \
       -o BatchMode=yes -o StrictHostKeyChecking=no "root@${host}" \
       docker exec -w "${container_source_root}" "${container_name}" \
-      python scripts/placemoe/validate_config.py "${PAPER32_PLACEMOE_CONFIG}"
+      python scripts/placemoe/validate_config.py "${VEOMNI_PLACEMOE_CONFIG}"
   ) &
   validation_pids+=("$!")
 done

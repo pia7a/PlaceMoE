@@ -19,12 +19,21 @@ def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--profile-root", type=Path, default=Path("profile/runs/pretrain"))
-    parser.add_argument("--start-step", type=int, default=11)
-    parser.add_argument("--end-step", type=int, default=20)
+    parser.add_argument("--start-step", type=int, default=3)
+    parser.add_argument("--end-step", type=int, default=5)
     parser.add_argument("--expected-ranks", type=int, default=32)
+    parser.add_argument("--skip-moe-timing", action="store_true")
     parser.add_argument("--grad-mode")
     parser.add_argument("--layout-report", type=Path)
     parser.add_argument("--layout-path", type=Path)
+    parser.add_argument("--layout-bundle", type=Path)
+    parser.add_argument("--cost-model", type=Path)
+    parser.add_argument("--communication-calibration", type=Path)
+    parser.add_argument("--preflight-report", type=Path)
+    parser.add_argument("--communication-source-sha256")
+    parser.add_argument("--repeat-index", type=int)
+    parser.add_argument("--execution-index", type=int)
+    parser.add_argument("--execution-policy")
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -91,8 +100,10 @@ def _layout_seconds(path: Path | None) -> float | None:
 
 
 def _sha256(path: Path | None) -> str | None:
-    if path is None or not path.is_file():
+    if path is None:
         return None
+    if not path.is_file():
+        raise FileNotFoundError(path)
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -104,19 +115,16 @@ def _e2e_from_env(
     rows_by_step: dict[int, dict[str, Any]],
     selected_steps: list[int],
 ) -> list[float]:
-    """Recover step wall time from the lightweight throughput counters."""
+    """Read synchronized critical-rank step wall time from environment metrics."""
 
     values: list[float] = []
     for step in selected_steps:
         row = rows_by_step.get(step)
-        previous = rows_by_step.get(step - 1)
-        if row is None or previous is None:
+        if row is None:
             continue
-        consumed = float(row["consume_tokens(M)"]) - float(previous["consume_tokens(M)"])
-        throughput = float(row["tokens_per_second(M)"])
-        if consumed <= 0 or throughput <= 0:
-            continue
-        values.append(consumed / throughput * 1000.0)
+        step_time_s = float(row["step_time_s"])
+        if step_time_s > 0:
+            values.append(step_time_s * 1000.0)
     return values
 
 
@@ -138,9 +146,9 @@ def main() -> None:
 
     component_by_step: dict[tuple[int, str, str], list[float]] = defaultdict(list)
     rank_assignments_by_step: dict[int, list[float]] = defaultdict(list)
-    timing_files = sorted((run_root / "moe_timing").glob("moe_timing_rank*.jsonl"))
+    timing_files = [] if args.skip_moe_timing else sorted((run_root / "moe_timing").glob("moe_timing_rank*.jsonl"))
     expected_steps = args.end_step - args.start_step + 1
-    if len(timing_files) != args.expected_ranks:
+    if not args.skip_moe_timing and len(timing_files) != args.expected_ranks:
         raise RuntimeError(
             f"{args.run_name}: expected {args.expected_ranks} MoE timing ranks, found {len(timing_files)}."
         )
@@ -164,7 +172,7 @@ def main() -> None:
                 f"{args.run_name}: lightweight E2E recovery found "
                 f"{len(e2e_step_ms)} of {expected_steps} steady records."
             )
-        e2e_source = "env_token_delta_over_throughput"
+        e2e_source = "env_step_time_s"
     for path in timing_files:
         for row in _latest_by_step(_jsonl(path)):
             step = int(row.get("step", -1))
@@ -219,11 +227,24 @@ def main() -> None:
         load_cv.append(statistics.pstdev(values) / mean if mean else math.nan)
         load_max_ratio.append(max(values) / mean if mean else math.nan)
 
+    source_sha256 = args.communication_source_sha256
+    if source_sha256 is not None and (
+        len(source_sha256) != 64 or any(character not in "0123456789abcdef" for character in source_sha256.lower())
+    ):
+        raise ValueError("communication source SHA-256 is invalid")
+    execution_values = (args.repeat_index, args.execution_index, args.execution_policy)
+    if any(value is not None for value in execution_values) and any(value is None for value in execution_values):
+        raise ValueError("repeat-index, execution-index, and execution-policy must be provided together")
+
+    peak_accelerator_allocated_gib = max(_metric(env_rows, "max_memory_allocated(GB)"), default=None)
+    peak_accelerator_reserved_gib = max(_metric(env_rows, "max_memory_reserved(GB)"), default=None)
     summary: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_name": args.run_name,
         "steady_steps": [args.start_step, args.end_step],
+        "expected_moe_ranks": args.expected_ranks,
         "observed_moe_ranks": len(timing_files),
+        "moe_timing_enabled": not args.skip_moe_timing,
         "e2e_step_ms": _mean_std(e2e_step_ms),
         "e2e_source": e2e_source,
         "tokens_per_second_millions": _mean_std(_metric(env_rows, "tokens_per_second(M)")),
@@ -235,11 +256,19 @@ def main() -> None:
         "physical_assignment_rank_max_over_mean": _mean_std(load_max_ratio),
         "dedup_ratio_dispatch": _mean_std(_metric(env_rows, "hiermoe/dedup_ratio_dispatch")),
         "hiermoe_ablation_grad_mode": (_constant_text(env_rows, "hiermoe/ablation_grad_mode") or args.grad_mode),
-        "peak_npu_allocated_gib": max(_metric(env_rows, "max_memory_allocated(GB)"), default=None),
-        "peak_npu_reserved_gib": max(_metric(env_rows, "max_memory_reserved(GB)"), default=None),
+        "peak_accelerator_allocated_gib": peak_accelerator_allocated_gib,
+        "peak_accelerator_reserved_gib": peak_accelerator_reserved_gib,
         "offline_layout_seconds": _layout_seconds(args.layout_report),
         "layout_sha256": _sha256(args.layout_path),
         "layout_report_sha256": _sha256(args.layout_report),
+        "layout_bundle_sha256": _sha256(args.layout_bundle),
+        "cost_model_sha256": _sha256(args.cost_model),
+        "communication_calibration_sha256": _sha256(args.communication_calibration),
+        "preflight_report_sha256": _sha256(args.preflight_report),
+        "communication_source_sha256": source_sha256.lower() if source_sha256 is not None else None,
+        "repeat_index": args.repeat_index,
+        "execution_index": args.execution_index,
+        "execution_policy": args.execution_policy,
     }
     output = args.output or run_root / "paper_summary.json"
     output.parent.mkdir(parents=True, exist_ok=True)

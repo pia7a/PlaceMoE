@@ -58,7 +58,7 @@ debug_copy_groups=${HIERMOE_DEBUG_COPY_GROUPS_OVERRIDE:-2}
 hccl_if_base_port=${HCCL_IF_BASE_PORT:-55000}
 hccl_buffsize=${HCCL_BUFFSIZE_OVERRIDE:-16}
 ablation_replay_path=${HIERMOE_ABLATION_REPLAY_PATH_OVERRIDE:-${source_root}/results/qwen3vl_greedy_ep32_mb4_gbs128_r2_pipeline_6step_hccl_serial_nonblocking_score_20260726_r3_committed_layout.json}
-static_preload_layout_path=${HIERMOE_STATIC_PRELOAD_LAYOUT_PATH_OVERRIDE:-}
+initial_layout_path=${HIERMOE_INITIAL_LAYOUT_OVERRIDE:-}
 key=/home/tzq/KeyPair-3bce.pem
 key=${SSH_KEY_OVERRIDE:-${key}}
 rank0_host=${RANK0_HOST_OVERRIDE:-}
@@ -109,22 +109,7 @@ cost_model_verify=0
 online_lut_update=0
 online_lut_start_step=${HIERMOE_ONLINE_LUT_START_STEP_OVERRIDE:-1}
 online_lut_min_gain=${HIERMOE_ONLINE_LUT_MIN_GAIN_OVERRIDE:-0.0}
-periodic_full_replan=0
-periodic_full_replan_last_step=${HIERMOE_PERIODIC_FULL_REPLAN_LAST_STEP_OVERRIDE:-2147483647}
-periodic_full_replan_workers=${HIERMOE_PERIODIC_FULL_REPLAN_WORKERS_OVERRIDE:-48}
-periodic_full_replan_candidate_workers=${HIERMOE_PERIODIC_FULL_REPLAN_CANDIDATE_WORKERS_OVERRIDE:-4}
-periodic_full_replan_worker_threads=${HIERMOE_PERIODIC_FULL_REPLAN_WORKER_THREADS_OVERRIDE:-1}
-periodic_full_replan_cpu_ids=${HIERMOE_PERIODIC_FULL_REPLAN_CPU_IDS_OVERRIDE:-144-191}
-periodic_full_replan_train_cpu_ids=${HIERMOE_PERIODIC_FULL_REPLAN_TRAIN_CPU_IDS_OVERRIDE:-0-143}
-layout_refresh_interval=${HIERMOE_LAYOUT_REFRESH_INTERVAL_OVERRIDE:-${swap_interval}}
-mapping_refresh_interval=${HIERMOE_MAPPING_REFRESH_INTERVAL_OVERRIDE:-0}
-placemoe_inter_ms_per_byte=${HIERMOE_PLACEMOE_INTER_MS_PER_BYTE_OVERRIDE:-6.765449326279194e-08}
-placemoe_intra_ms_per_byte=${HIERMOE_PLACEMOE_INTRA_MS_PER_BYTE_OVERRIDE:-5.02482606728045e-09}
-placemoe_route_ms_per_assignment=${HIERMOE_PLACEMOE_ROUTE_MS_PER_ASSIGNMENT_OVERRIDE:-8.746548178958447e-05}
-placemoe_communication_multiplier=${HIERMOE_PLACEMOE_COMMUNICATION_MULTIPLIER_OVERRIDE:-3.1}
-placemoe_compute_ms_per_assignment=${HIERMOE_PLACEMOE_COMPUTE_MS_PER_ASSIGNMENT_OVERRIDE:-2.82807e-05}
-placemoe_compute_multiplier=${HIERMOE_PLACEMOE_COMPUTE_MULTIPLIER_OVERRIDE:-4.19}
-placemoe_config_path=${HIERMOE_PLACEMOE_CONFIG_PATH_OVERRIDE:-${VEOMNI_PLACEMOE_CONFIG:-}}
+placemoe_config_path=${PLACEMOE_CONFIG_OVERRIDE:-${VEOMNI_PLACEMOE_CONFIG:-}}
 forward_reuse_cover=0
 forward_reuse_cover_patch_remap=0
 forward_reuse_cover_fast=0
@@ -431,8 +416,8 @@ case "${variant}" in
     forward_reuse_cover=1
     forward_reuse_cover_patch_remap=1
     forward_reuse_cover_empty_seeding=1
-    if [[ "${variant}" == "hierarchical_full_static" && -z "${static_preload_layout_path}" ]]; then
-      static_preload_layout_path=${ablation_replay_path}
+    if [[ "${variant}" == "hierarchical_full_static" && -z "${initial_layout_path}" ]]; then
+      initial_layout_path=${ablation_replay_path}
     fi
     ;;
   hierarchical_full_static_online_lut)
@@ -453,8 +438,8 @@ case "${variant}" in
     forward_reuse_cover_patch_remap=1
     forward_reuse_cover_empty_seeding=1
     online_lut_update=1
-    if [[ -z "${static_preload_layout_path}" ]]; then
-      static_preload_layout_path=${ablation_replay_path}
+    if [[ -z "${initial_layout_path}" ]]; then
+      initial_layout_path=${ablation_replay_path}
     fi
     ;;
   hierarchical_full_static_periodic_replan)
@@ -474,9 +459,8 @@ case "${variant}" in
     forward_reuse_cover=1
     forward_reuse_cover_patch_remap=1
     forward_reuse_cover_empty_seeding=1
-    periodic_full_replan=1
-    if [[ -z "${static_preload_layout_path}" ]]; then
-      static_preload_layout_path=${ablation_replay_path}
+    if [[ -z "${initial_layout_path}" ]]; then
+      initial_layout_path=${ablation_replay_path}
     fi
     ;;
   forward_reuse_cover_patch_multiround)
@@ -569,7 +553,6 @@ fi
 ablation_grad_mode=${HIERMOE_ABLATION_GRAD_MODE_OVERRIDE:-${ablation_grad_mode}}
 
 run_name=${RUN_NAME_OVERRIDE:-qwen3vl_greedy_ep32_mb${micro_batch_size}_gbs${global_batch_size}_${variant}_${max_steps}step_${run_suffix}}
-periodic_full_replan_work_root=${HIERMOE_PERIODIC_FULL_REPLAN_WORK_ROOT_OVERRIDE:-${source_root}/profile/runs/pretrain/${run_name}/periodic_full_replan}
 convergence_metrics_dir=
 if [[ "${convergence_metrics_enable}" == "1" ]]; then
   convergence_metrics_dir=${source_root}/profile/runs/pretrain/${run_name}/convergence_metrics
@@ -626,7 +609,7 @@ common_env=(
   -e "VEOMNI_HIERMOE_ABLATION_REPLAY_MODE=${ablation_replay_mode}"
   -e "VEOMNI_HIERMOE_ABLATION_MIGRATION_MODE=${ablation_migration_mode}"
   -e "VEOMNI_HIERMOE_ABLATION_GRAD_MODE=${ablation_grad_mode}"
-  -e "VEOMNI_HIERMOE_STATIC_PRELOAD_LAYOUT_PATH=${static_preload_layout_path}"
+  -e "VEOMNI_HIERMOE_INITIAL_LAYOUT=${initial_layout_path}"
   -e "VEOMNI_HIERMOE_CPU_PLANNER_MODE=${cpu_planner_mode}"
   -e "VEOMNI_HIERMOE_CPU_TRAIN_CORES_PER_RANK=${cpu_train_cores_per_rank}"
   -e "VEOMNI_HIERMOE_NPU_LAYER_OWNER_BLOCKING=${npu_layer_owner_blocking}"
@@ -645,22 +628,6 @@ common_env=(
   -e "VEOMNI_HIERMOE_ONLINE_LUT_UPDATE=${online_lut_update}"
   -e "VEOMNI_HIERMOE_ONLINE_LUT_START_STEP=${online_lut_start_step}"
   -e "VEOMNI_HIERMOE_ONLINE_LUT_MIN_GAIN=${online_lut_min_gain}"
-  -e "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN=${periodic_full_replan}"
-  -e "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_WORK_ROOT=${periodic_full_replan_work_root}"
-  -e "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_WORKERS=${periodic_full_replan_workers}"
-  -e "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_CANDIDATE_WORKERS=${periodic_full_replan_candidate_workers}"
-  -e "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_WORKER_THREADS=${periodic_full_replan_worker_threads}"
-  -e "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_LAST_STEP=${periodic_full_replan_last_step}"
-  -e "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_CPU_IDS=${periodic_full_replan_cpu_ids}"
-  -e "VEOMNI_HIERMOE_PERIODIC_FULL_REPLAN_TRAIN_CPU_IDS=${periodic_full_replan_train_cpu_ids}"
-  -e "VEOMNI_HIERMOE_LAYOUT_REFRESH_INTERVAL=${layout_refresh_interval}"
-  -e "VEOMNI_HIERMOE_MAPPING_REFRESH_INTERVAL=${mapping_refresh_interval}"
-  -e "VEOMNI_HIERMOE_PLACEMOE_INTER_MS_PER_BYTE=${placemoe_inter_ms_per_byte}"
-  -e "VEOMNI_HIERMOE_PLACEMOE_INTRA_MS_PER_BYTE=${placemoe_intra_ms_per_byte}"
-  -e "VEOMNI_HIERMOE_PLACEMOE_ROUTE_MS_PER_ASSIGNMENT=${placemoe_route_ms_per_assignment}"
-  -e "VEOMNI_HIERMOE_PLACEMOE_COMMUNICATION_MULTIPLIER=${placemoe_communication_multiplier}"
-  -e "VEOMNI_HIERMOE_PLACEMOE_COMPUTE_MS_PER_ASSIGNMENT=${placemoe_compute_ms_per_assignment}"
-  -e "VEOMNI_HIERMOE_PLACEMOE_COMPUTE_MULTIPLIER=${placemoe_compute_multiplier}"
   -e "VEOMNI_PLACEMOE_CONFIG=${placemoe_config_path}"
   -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER=${forward_reuse_cover}"
   -e "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_PATCH_REMAP=${forward_reuse_cover_patch_remap}"

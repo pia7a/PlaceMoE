@@ -207,10 +207,10 @@ def _fit_peer_link(
             if peer is None:
                 return
             requests = dist.batch_isend_irecv(
-                (
+                [
                     dist.P2POp(dist.isend, send_buffer, peer, group=group),
                     dist.P2POp(dist.irecv, receive_buffer, peer, group=group),
-                )
+                ]
             )
             for request in requests:
                 request.wait()

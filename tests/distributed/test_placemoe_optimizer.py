@@ -510,6 +510,158 @@ def test_hierarchical_placement_respects_rank_capacity_and_copy_uniqueness():
         assert len(members) == len(np.unique(members))
 
 
+def test_explicit_two_level_hierarchy_is_bitwise_legacy_compatible():
+    rng = np.random.default_rng(20260806)
+    logical_instances = np.array([0, 1, 2, 3, 0, 1, 2, 3], dtype=np.int64)
+    copy_demand = rng.integers(0, 11, size=(4, 8)).astype(np.float64)
+    raw_copy_affinity = rng.integers(0, 7, size=(4, 8, 8)).astype(np.float64)
+    copy_affinity = raw_copy_affinity + raw_copy_affinity.transpose(0, 2, 1)
+    for matrix in copy_affinity:
+        np.fill_diagonal(matrix, 0.0)
+    common = dict(
+        ep_size=4,
+        ranks_per_node=2,
+        slots_per_rank=2,
+        node_omega=1.25,
+        rank_omega=0.2,
+        gamma=0.7,
+        node_exchange_limit=4,
+        rank_exchange_limit=2,
+        seed=23,
+    )
+
+    legacy_placement = place_instances(
+        copy_demand,
+        copy_affinity,
+        logical_instances,
+        PlacementConfig(**common),
+    )
+    explicit_placement = place_instances(
+        copy_demand,
+        copy_affinity,
+        logical_instances,
+        PlacementConfig(
+            **common,
+            hierarchy_group_sizes=(2, 4),
+            level_omegas=(1.25, 0.2),
+        ),
+    )
+
+    np.testing.assert_array_equal(explicit_placement.instance_ranks, legacy_placement.instance_ranks)
+    assert explicit_placement.repaired == legacy_placement.repaired
+    assert explicit_placement.node_objective == legacy_placement.node_objective
+    assert explicit_placement.rank_objective == legacy_placement.rank_objective
+    assert explicit_placement.level_objectives == legacy_placement.level_objectives
+
+    demand = rng.integers(0, 13, size=(4, 4)).astype(np.float64)
+    raw_affinity = rng.integers(0, 9, size=(4, 4, 4)).astype(np.float64)
+    affinity = raw_affinity + raw_affinity.transpose(0, 2, 1)
+    for matrix in affinity:
+        np.fill_diagonal(matrix, 0.0)
+    statistics = ProfileStatistics(demand=demand, affinity=affinity)
+    legacy_initial = initialize_mapping(
+        logical_instances,
+        legacy_placement.instance_ranks,
+        demand,
+        ranks_per_node=2,
+    )
+    explicit_initial = initialize_mapping(
+        logical_instances,
+        legacy_placement.instance_ranks,
+        demand,
+        ranks_per_node=2,
+        hierarchy_group_sizes=(2, 4),
+    )
+    np.testing.assert_array_equal(explicit_initial, legacy_initial)
+
+    legacy_mapping = optimize_mapping(
+        logical_instances,
+        legacy_placement.instance_ranks,
+        legacy_initial,
+        statistics,
+        MappingConfig(ranks_per_node=2, node_omega=1.25, rank_omega=0.2, gamma=0.7, sweep_limit=4),
+    )
+    explicit_mapping = optimize_mapping(
+        logical_instances,
+        legacy_placement.instance_ranks,
+        explicit_initial,
+        statistics,
+        MappingConfig(
+            ranks_per_node=2,
+            node_omega=1.25,
+            rank_omega=0.2,
+            gamma=0.7,
+            sweep_limit=4,
+            hierarchy_group_sizes=(2, 4),
+            level_omegas=(1.25, 0.2),
+        ),
+    )
+    np.testing.assert_array_equal(explicit_mapping.mapping, legacy_mapping.mapping)
+    assert explicit_mapping.sweeps == legacy_mapping.sweeps
+    assert explicit_mapping.changes == legacy_mapping.changes
+    assert explicit_mapping.peak_rank_load == legacy_mapping.peak_rank_load
+
+
+def test_three_level_placement_and_mapping_preserve_capacity_and_copy_identity():
+    config = PlacementConfig(
+        ep_size=8,
+        ranks_per_node=4,
+        slots_per_rank=2,
+        node_omega=1.0,
+        rank_omega=0.1,
+        gamma=1.0,
+        node_exchange_limit=4,
+        rank_exchange_limit=2,
+        seed=19,
+        hierarchy_group_sizes=(2, 4, 8),
+        level_omegas=(1.0, 0.3, 0.1),
+    )
+    logical_instances = np.tile(np.arange(8, dtype=np.int64), 2)
+    copy_demand = np.ones((8, 16), dtype=np.float64)
+    copy_affinity = np.zeros((8, 16, 16), dtype=np.float64)
+
+    placement = place_instances(copy_demand, copy_affinity, logical_instances, config)
+
+    assert len(placement.level_objectives) == 3
+    np.testing.assert_array_equal(
+        np.bincount(placement.instance_ranks, minlength=8),
+        np.full((8,), 2),
+    )
+    for rank in range(8):
+        members = logical_instances[placement.instance_ranks == rank]
+        assert len(members) == len(np.unique(members))
+
+    statistics = ProfileStatistics(
+        demand=np.ones((8, 8), dtype=np.float64),
+        affinity=np.zeros((8, 8, 8), dtype=np.float64),
+    )
+    initial = initialize_mapping(
+        logical_instances,
+        placement.instance_ranks,
+        statistics.demand,
+        ranks_per_node=4,
+        hierarchy_group_sizes=(2, 4, 8),
+    )
+    refined = optimize_mapping(
+        logical_instances,
+        placement.instance_ranks,
+        initial,
+        statistics,
+        MappingConfig(
+            ranks_per_node=4,
+            node_omega=1.0,
+            rank_omega=0.1,
+            gamma=1.0,
+            hierarchy_group_sizes=(2, 4, 8),
+            level_omegas=(1.0, 0.3, 0.1),
+        ),
+    )
+    np.testing.assert_array_equal(
+        logical_instances[refined.mapping],
+        np.broadcast_to(np.arange(8), (8, 8)),
+    )
+
+
 def test_materialize_plan_rewrites_mapping_to_relocated_slots():
     topology = PlaceMoETopology(ep_size=2, ranks_per_node=1, num_experts=4, slots_per_rank=3)
     statistics = ProfileStatistics(

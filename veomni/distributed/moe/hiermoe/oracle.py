@@ -257,6 +257,24 @@ def _layer_index(layer_key: str) -> int:
     return int(matches[-1]) if matches else -1
 
 
+def _capture_layer_key(step: int, layer_key: str | None) -> str:
+    if layer_key is not None:
+        return layer_key
+
+    layer_ordinal = _CAPTURE_LAYER_ORDINALS.get(int(step), 0)
+    _CAPTURE_LAYER_ORDINALS[int(step)] = layer_ordinal + 1
+    raw_num_layers = os.environ.get("VEOMNI_HIERMOE_ORACLE_CAPTURE_NUM_LAYERS", "").strip()
+    if raw_num_layers:
+        try:
+            num_layers = int(raw_num_layers)
+        except ValueError as exc:
+            raise ValueError("VEOMNI_HIERMOE_ORACLE_CAPTURE_NUM_LAYERS must be a positive integer.") from exc
+        if num_layers < 1:
+            raise ValueError("VEOMNI_HIERMOE_ORACLE_CAPTURE_NUM_LAYERS must be a positive integer.")
+        layer_ordinal %= num_layers
+    return f"model.layers.{layer_ordinal}.mlp.experts"
+
+
 def _capture_output_path(
     raw_path: str,
     *,
@@ -351,10 +369,7 @@ def maybe_capture_route_snapshot(
     target_step = int(os.environ.get("VEOMNI_HIERMOE_ORACLE_CAPTURE_STEP", "-1"))
     target_layer = os.environ.get("VEOMNI_HIERMOE_ORACLE_CAPTURE_LAYER", "")
     target_call = int(os.environ.get("VEOMNI_HIERMOE_ORACLE_CAPTURE_CALL", "0"))
-    if layer_key is None:
-        layer_ordinal = _CAPTURE_LAYER_ORDINALS.get(int(step), 0)
-        _CAPTURE_LAYER_ORDINALS[int(step)] = layer_ordinal + 1
-        layer_key = f"model.layers.{layer_ordinal}.mlp.experts"
+    layer_key = _capture_layer_key(step, layer_key)
     if (target_step >= 0 and int(step) != target_step) or not _layer_matches(layer_key, target_layer):
         return None
 

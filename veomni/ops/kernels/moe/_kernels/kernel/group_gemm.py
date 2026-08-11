@@ -37,6 +37,19 @@ from .triton_utils.utils import (
 )
 
 
+def _empty_with_cuda_oom_retry(shape, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """Allocate an output tensor, reclaiming CUDA cache once on fragmentation OOM."""
+    try:
+        return torch.empty(shape, dtype=dtype, device=device)
+    except torch.OutOfMemoryError:
+        if device.type != "cuda":
+            raise
+        accelerator = get_torch_device()
+        with accelerator.device(device):
+            accelerator.empty_cache()
+        return torch.empty(shape, dtype=dtype, device=device)
+
+
 def _get_cuda_autotune_config():
     return [
         triton.Config(
@@ -199,10 +212,10 @@ def group_gemm_same_nk(
 
     c_is_none = c is None
     if c_is_none:
-        c = torch.empty((a.shape[1] if transpose_a else a.shape[0], N), dtype=a.dtype, device=a.device)
+        c = _empty_with_cuda_oom_retry((a.shape[1] if transpose_a else a.shape[0], N), dtype=a.dtype, device=a.device)
 
     if save_activation:
-        act = torch.empty_like(c)
+        act = _empty_with_cuda_oom_retry(c.shape, dtype=c.dtype, device=c.device)
 
     with get_torch_device().device(a.device):
         group_gemm_same_nk_kernel[

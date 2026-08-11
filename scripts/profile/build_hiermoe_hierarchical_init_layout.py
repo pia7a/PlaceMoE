@@ -218,11 +218,7 @@ def _load_routes(
         for repeat in range(forward_repeats):
             capture_layer = layer + repeat * layer_stride
             for call_index in call_indices:
-                bundle_path = (
-                    root
-                    / f"step{step:04d}"
-                    / f"layer{capture_layer:02d}_call{call_index}_all_ranks.pt"
-                )
+                bundle_path = root / f"step{step:04d}" / f"layer{capture_layer:02d}_call{call_index}_all_ranks.pt"
                 if bundle_path.is_file():
                     payload = torch.load(bundle_path, map_location="cpu", weights_only=False)
                     routes_by_rank = payload.get("routes_by_rank") if isinstance(payload, dict) else None
@@ -243,11 +239,7 @@ def _load_routes(
                     continue
                 rows: list[torch.Tensor] = []
                 for rank in range(ep_size):
-                    path = (
-                        root
-                        / f"step{step:04d}"
-                        / f"layer{capture_layer:02d}_call{call_index}_rank{rank:02d}.pt"
-                    )
+                    path = root / f"step{step:04d}" / f"layer{capture_layer:02d}_call{call_index}_rank{rank:02d}.pt"
                     payload = torch.load(path, map_location="cpu", weights_only=False)
                     route = payload.get("routes") if isinstance(payload, dict) else None
                     if not torch.is_tensor(route) or route.ndim != 2:
@@ -522,11 +514,28 @@ def _mirrored_r2(
 
 class _HybridEvaluator:
     def __init__(self, args: argparse.Namespace) -> None:
+        hierarchy_group_sizes = tuple(
+            int(size) for size in (getattr(args, "hierarchy_group_sizes", ()) or (args.ranks_per_node, args.ep_size))
+        )
+        if hierarchy_group_sizes[-1] != args.ep_size or len(hierarchy_group_sizes) not in {2, 3}:
+            raise ValueError("Hybrid evaluator requires a two- or three-stage EP hierarchy.")
         hierarchy = Hierarchy(
             ep_size=args.ep_size,
-            group_sizes=(args.ranks_per_node, args.ep_size),
+            group_sizes=hierarchy_group_sizes,
             source="hierarchical-init",
         )
+        mid_ms_per_byte = getattr(args, "mid_ms_per_byte", None)
+        if len(hierarchy_group_sizes) == 3:
+            self.level_ms_per_byte = (
+                float(args.inter_ms_per_byte),
+                float(args.inter_ms_per_byte if mid_ms_per_byte is None else mid_ms_per_byte),
+                float(args.intra_ms_per_byte),
+            )
+        else:
+            self.level_ms_per_byte = (
+                float(args.inter_ms_per_byte),
+                float(args.intra_ms_per_byte),
+            )
         self.planner = GreedyCommunicationPlanner(
             hierarchy=hierarchy,
             perf_model=HierMoEPerfModel.default(),
@@ -556,18 +565,31 @@ class _HybridEvaluator:
         peak_communication_rank = -1
         peak_compute_rank = -1
         lut = torch.from_numpy(np.array(source_lut, dtype=np.int64, copy=True))
+        three_stage = len(self.level_ms_per_byte) == 3
+        packed_width = sum(self.planner._count_widths())
         for sample in samples:
-            endpoint = torch.zeros((1, 8 * self.args.ep_size), dtype=torch.float32)
+            if three_stage:
+                unique_by_source = torch.zeros(
+                    (self.args.ep_size, 1, packed_width),
+                    dtype=torch.float32,
+                )
+                assignments_by_source = torch.zeros_like(unique_by_source)
+            else:
+                endpoint = torch.zeros((1, 8 * self.args.ep_size), dtype=torch.float32)
             assignment_totals = torch.zeros((self.args.ep_size,), dtype=torch.float32)
             for source_rank, logical in enumerate(sample):
                 physical = lut[source_rank].index_select(0, logical.reshape(-1)).view_as(logical)
                 unique = self.planner._local_packed_counts(physical)
                 assignments = self.planner._local_packed_assignment_counts(physical)
-                endpoint += self.planner._local_traffic_endpoint_statistics(
-                    unique,
-                    assignments,
-                    source_rank=source_rank,
-                )
+                if three_stage:
+                    unique_by_source[source_rank, 0] = unique[0]
+                    assignments_by_source[source_rank, 0] = assignments[0]
+                else:
+                    endpoint += self.planner._local_traffic_endpoint_statistics(
+                        unique,
+                        assignments,
+                        source_rank=source_rank,
+                    )
                 assignment_totals += assignments[0, : self.args.ep_size]
                 ranks = torch.div(physical, self.args.slots_per_rank, rounding_mode="floor")
                 rank_hits = torch.zeros((logical.shape[0], self.args.ep_size), dtype=torch.bool)
@@ -581,12 +603,38 @@ class _HybridEvaluator:
                 rank_destinations += float(rank_hits.sum().item())
                 node_destinations += float(node_hits.sum().item())
                 tokens += int(logical.shape[0])
-            details = self.planner._traffic_endpoint_cost_details(endpoint)
-            communication += float(details[0].item())
-            compute += float(details[1].item())
-            peak_communication_rank = int(details[3].item())
-            peak_compute_rank = int(details[4].item())
-            peak_assignments = max(peak_assignments, float(assignment_totals.max().item()))
+
+            sample_peak, sample_peak_rank = assignment_totals.max(dim=0)
+            sample_peak_assignments = float(sample_peak.item())
+            if three_stage:
+                traffic = self.planner._hierarchical_traffic_features(
+                    unique_by_source,
+                    assignments_by_source,
+                )
+                network_ms = sum(
+                    coefficient * float(traffic[f"stage{index}_payload_endpoint_bytes"].item())
+                    for index, coefficient in enumerate(self.level_ms_per_byte, start=1)
+                )
+                sample_communication = float(self.args.communication_phase_multiplier) * (
+                    network_ms + float(self.args.route_ms_per_assignment) * sample_peak_assignments
+                )
+                sample_compute = float(self.args.compute_phase_multiplier) * (
+                    float(self.args.compute_ms_per_assignment) * sample_peak_assignments
+                    + float(getattr(self.planner, "forward_compute_constant", 0.0))
+                )
+                communication += sample_communication
+                compute += sample_compute
+                if sample_peak_assignments >= peak_assignments:
+                    peak_assignments = sample_peak_assignments
+                    peak_communication_rank = int(sample_peak_rank.item())
+                    peak_compute_rank = int(sample_peak_rank.item())
+            else:
+                details = self.planner._traffic_endpoint_cost_details(endpoint)
+                communication += float(details[0].item())
+                compute += float(details[1].item())
+                peak_communication_rank = int(details[3].item())
+                peak_compute_rank = int(details[4].item())
+                peak_assignments = max(peak_assignments, sample_peak_assignments)
         return HybridCost(
             communication_ms=communication,
             compute_ms=compute,

@@ -73,6 +73,52 @@ def _samples() -> list[list[torch.Tensor]]:
     return [[torch.tensor(rows[index:] + rows[:index], dtype=torch.long) for index in range(4)]]
 
 
+def test_explicit_two_stage_hybrid_evaluator_matches_legacy_exactly():
+    legacy_args = _args()
+    explicit_args = _args()
+    explicit_args.hierarchy_group_sizes = (2, 4)
+    state = _state()
+    samples = _samples()
+
+    legacy = _HybridEvaluator(legacy_args).evaluate(samples, state.lut)
+    explicit = _HybridEvaluator(explicit_args).evaluate(samples, state.lut)
+
+    assert explicit == legacy
+
+
+def test_three_stage_hybrid_evaluator_scores_the_middle_link():
+    args = Namespace(
+        ep_size=8,
+        ranks_per_node=4,
+        hierarchy_group_sizes=(2, 4, 8),
+        num_experts=8,
+        slots_per_rank=2,
+        hidden_size=16,
+        bytes_per_element=2,
+        inter_ms_per_byte=0.0,
+        mid_ms_per_byte=1.0e-6,
+        intra_ms_per_byte=0.0,
+        route_ms_per_assignment=0.0,
+        communication_phase_multiplier=1.0,
+        compute_ms_per_assignment=0.0,
+        compute_phase_multiplier=1.0,
+    )
+    source_lut = np.broadcast_to(np.arange(8, dtype=np.int64), (8, 8)).copy()
+    routes = torch.tensor(
+        [[0, 1], [2, 3], [4, 5], [6, 7]],
+        dtype=torch.long,
+    )
+    samples = [[routes.roll(shifts=rank, dims=0) for rank in range(8)]]
+
+    baseline = _HybridEvaluator(args).evaluate(samples, source_lut)
+    args.mid_ms_per_byte = 2.0e-6
+    doubled = _HybridEvaluator(args).evaluate(samples, source_lut)
+
+    assert baseline.communication_ms > 0.0
+    assert doubled.communication_ms == 2.0 * baseline.communication_ms
+    assert baseline.compute_ms == 0.0
+
+
 def test_group_cover_affected_replay_matches_full_hybrid_cost():
     args = _args()
     state = _state()
