@@ -3,13 +3,13 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project.urls]
-"Homepage" = "https://github.com/ByteDance-Seed/VeOmni"
-"Source Code" = "https://github.com/ByteDance-Seed/VeOmni"
+"Homepage" = "https://github.com/pia7a/PlaceMoE"
+"Source Code" = "https://github.com/pia7a/PlaceMoE"
 
 [project]
 name = "veomni"
 dynamic = ["version"]
-description = "VeOmni: Scaling any Modality Model Training to any Accelerators with PyTorch native Training Framework"
+description = "PlaceMoE: profile-guided expert replica placement and mapping for VeOmni"
 readme = "README.md"
 requires-python = ">=3.11, <3.13"
 license = { file = "LICENSE" }
@@ -39,6 +39,9 @@ dependencies = [
   # metrics only if matplotlib is missing.
   "matplotlib>=3.7",
 ]
+
+[project.scripts]
+placemoe = "veomni.distributed.moe.hiermoe.placemoe.cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -72,21 +75,17 @@ dit = [
   "ftfy",
 ]
 npu_aarch64 = [
-  "torch==2.7.1",
-  "torch-npu==2.7.1",
-  "torchvision==0.22.1",
-  "torchaudio==2.7.1",
   "decorator>=5.2.1",
   "scipy>=1.16.2"
 ]
 npu = [
-  "torch==2.7.1+cpu",
-  "torch-npu==2.7.1",
-  "torchvision==0.22.1+cpu",
-  "torchaudio==2.7.1+cpu",
+  "torch==2.9.0+cpu",
+  "torch-npu==2.9.0.post2",
+  "torchvision==0.24.0+cpu",
+  "torchaudio==2.9.0+cpu",
   "decorator>=5.2.1",
   "scipy>=1.16.2",
-  "torchcodec>=0.4.0,<0.6.0"
+  "torchcodec==0.8.1"
 ]
 gpu = [
   "torch==2.9.1+cu129",
@@ -183,16 +182,11 @@ override-dependencies = [
     "torchaudio==2.9.1+cu129; (extra == 'gpu')",
     "torchvision==0.24.1+cu129; (extra == 'gpu')",
     "torchcodec==0.8.1; (extra == 'gpu')",
-    # Adding explicit override for NPU backends - aarch64 variant
-    "torch==2.7.1; (extra == 'npu_aarch64')",
-    "torchaudio==2.7.1; (extra == 'npu_aarch64')",
-    "torchvision==0.22.1; (extra == 'npu_aarch64')",
-    "torchcodec>=0.4.0,<0.6.0; (extra == 'npu_aarch64')",
     # Adding explicit override for NPU backends - x86 variant (default npu)
-    "torch==2.7.1+cpu; (extra == 'npu')",
-    "torchaudio==2.7.1+cpu; (extra == 'npu')",
-    "torchvision==0.22.1+cpu; (extra == 'npu')",
-    "torchcodec>=0.4.0,<0.6.0; (extra == 'npu')",
+    "torch==2.9.0+cpu; (extra == 'npu')",
+    "torchaudio==2.9.0+cpu; (extra == 'npu')",
+    "torchvision==0.24.0+cpu; (extra == 'npu')",
+    "torchcodec==0.8.1; (extra == 'npu')",
 
     # Force to use 9.15+ cudnn to avoid torch 2.9 conv3d performance regression issue:
     # https://github.com/pytorch/pytorch/releases/tag/v2.9.1
@@ -210,9 +204,8 @@ conflicts = [
 
 [tool.uv.sources]
 # To support override-dependencies for multiple extras, one package can only have one index.
-# Using pytorch index for all variants since it has both regular and +cpu versions
 torch = [
-  { index = "pytorch", marker = "(extra == 'npu' or extra == 'npu_aarch64')" },
+  { index = "pytorch-cpu", marker = "extra == 'npu'" },
   # Due to some unknown bugs, uv might resolve to a wheel from https://download.pytorch.org/whl/cu128_full which does
   # not include the proper dependencies on nvidia packages like nvidia-cublas and nvidia-nccl. This confuses uv to uninstall
   # those nvidia packages.
@@ -220,11 +213,17 @@ torch = [
   # By forcing it to the proper package here, we avoid the problem that uv could randomly resolve to other packages.
   #
   # NOTE: WHEN UPDATE TORCH VERSIONS, PLEASE UPDATE THIS TO THE CORRESPONDING WHEEL URL.
-  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.11'" },
-  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.12'" },
+  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "extra != 'npu' and extra != 'npu_aarch64' and python_version == '3.11'" },
+  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "extra != 'npu' and extra != 'npu_aarch64' and python_version == '3.12'" },
 ]
-torchvision = { index = "pytorch" }
-torchaudio = { index = "pytorch" }
+torchvision = [
+  { index = "pytorch-cpu", marker = "extra == 'npu'" },
+  { index = "pytorch", marker = "extra != 'npu' and extra != 'npu_aarch64' and extra == 'gpu'" },
+]
+torchaudio = [
+  { index = "pytorch-cpu", marker = "extra == 'npu'" },
+  { index = "pytorch", marker = "extra != 'npu' and extra != 'npu_aarch64' and extra == 'gpu'" },
+]
 # Download fa2 and fa3 wheels directly to avoid build issues.
 # Both wheels are built against torch 2.9+cu129. From
 # https://github.com/Luosuu/flash-attention-prebuild-wheels since there is no official
@@ -310,8 +309,8 @@ select = ["B", "C", "E", "F", "I", "W"]
 # Patch gen configs reference names from add_post_import_block (e.g. OpSlot
 # instances, rotate_half) that ruff can't resolve because they only exist as
 # string literals until patchgen materializes them into the generated file.
-"veomni/models/transformers/**/generated/*.py" = ["E402", "B007", "I001"]
-"veomni/models/transformers/**/*_patch_gen_config.py" = ["F821"]
+"veomni/models/transformers/**/generated/*.py" = ["E402", "B007", "F401", "I001", "W292"]
+"veomni/models/transformers/**/*_patch_gen_config.py" = ["F401", "F821"]
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2

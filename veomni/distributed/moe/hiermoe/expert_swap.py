@@ -63,6 +63,7 @@ from .greedy_planner import GreedyCommunicationPlanner, assign_tokens_to_copies_
 from .online_lut_planner import propose_online_lut_move
 from .perf_model import HierMoEPerfModel
 from .placemoe.artifacts import build_placemoe_artifact, validate_placemoe_artifact
+from .placemoe.model_adapter import MoEModelAdapter, resolve_moe_model_adapter
 from .placemoe.runtime import (
     HotUpdateController,
     HotUpdateJob,
@@ -71,7 +72,9 @@ from .placemoe.runtime import (
     PlannerCommandSpec,
     UpdateKind,
     build_planner_command,
+    launch_planner_process,
     planner_environment,
+    terminate_planner_process,
 )
 from .placemoe.runtime.cpu_affinity import resolve_cpu_affinity
 from .placemoe.types import LayerPlan, PlaceMoETopology
@@ -229,6 +232,41 @@ _HOT_UPDATE_ROUTE_MS_PER_ASSIGNMENT = _PLACEMOE_RUNTIME_CONFIG.calibration.route
 _HOT_UPDATE_COMMUNICATION_MULTIPLIER = _PLACEMOE_RUNTIME_CONFIG.calibration.communication_multiplier
 _HOT_UPDATE_COMPUTE_MS_PER_ASSIGNMENT = _PLACEMOE_RUNTIME_CONFIG.calibration.compute_ms_per_assignment
 _HOT_UPDATE_COMPUTE_MULTIPLIER = _PLACEMOE_RUNTIME_CONFIG.calibration.compute_multiplier
+
+
+def configure_placemoe_runtime(config: PlaceMoERuntimeConfig) -> None:
+    """Install the canonical runtime config before creating a manager.
+
+    Environment variables remain a compatibility input at import time, but
+    production training passes the nested VeOmni configuration explicitly.
+    """
+
+    global _PLACEMOE_RUNTIME_CONFIG
+    global _INITIAL_LAYOUT_PATH, _ABLATION_REPLAY_PATH
+    global _HOT_UPDATE, _HOT_UPDATE_WORK_ROOT, _HOT_UPDATE_BUILDER, _HOT_UPDATE_RESOURCES
+    global _HOT_UPDATE_LAST_STEP, _HOT_UPDATE_LAYOUT_INTERVAL, _HOT_UPDATE_MAPPING_INTERVAL
+    global _HOT_UPDATE_INTER_MS_PER_BYTE, _HOT_UPDATE_INTRA_MS_PER_BYTE
+    global _HOT_UPDATE_ROUTE_MS_PER_ASSIGNMENT, _HOT_UPDATE_COMMUNICATION_MULTIPLIER
+    global _HOT_UPDATE_COMPUTE_MS_PER_ASSIGNMENT, _HOT_UPDATE_COMPUTE_MULTIPLIER
+
+    config.validate()
+    _PLACEMOE_RUNTIME_CONFIG = config
+    _INITIAL_LAYOUT_PATH = config.initial_artifact
+    if config.initial_artifact:
+        _ABLATION_REPLAY_PATH = config.initial_artifact
+    _HOT_UPDATE = config.hot_update.enabled
+    _HOT_UPDATE_WORK_ROOT = config.hot_update.work_root
+    _HOT_UPDATE_BUILDER = config.hot_update.planner_path
+    _HOT_UPDATE_RESOURCES = config.resources
+    _HOT_UPDATE_LAST_STEP = config.hot_update.last_update_step
+    _HOT_UPDATE_LAYOUT_INTERVAL = config.hot_update.layout_interval_steps
+    _HOT_UPDATE_MAPPING_INTERVAL = config.hot_update.mapping_interval_steps
+    _HOT_UPDATE_INTER_MS_PER_BYTE = config.calibration.inter_ms_per_byte
+    _HOT_UPDATE_INTRA_MS_PER_BYTE = config.calibration.intra_ms_per_byte
+    _HOT_UPDATE_ROUTE_MS_PER_ASSIGNMENT = config.calibration.route_ms_per_assignment
+    _HOT_UPDATE_COMMUNICATION_MULTIPLIER = config.calibration.communication_multiplier
+    _HOT_UPDATE_COMPUTE_MS_PER_ASSIGNMENT = config.calibration.compute_ms_per_assignment
+    _HOT_UPDATE_COMPUTE_MULTIPLIER = config.calibration.compute_multiplier
 
 
 def _expert_swap_diag_phase(phase: str) -> None:
@@ -436,8 +474,9 @@ class ExpertLayerState:
     num_experts: int
     base_num_local_experts: int
     num_local_experts: int
-    gate_up_proj: torch.nn.Parameter
-    down_proj: torch.nn.Parameter
+    expert_parameter_names: tuple[str, ...]
+    expert_parameters: tuple[torch.nn.Parameter, ...]
+    model_adapter: MoEModelAdapter
     logical_to_physical: torch.Tensor
     slot_to_logical: torch.Tensor | None = None
     canonical_physical_slots: torch.Tensor | None = None
@@ -470,6 +509,13 @@ class ExpertLayerState:
     pending_route_data_ptr: int = 0
     active_quota_policy: tuple[QuotaPolicyEntry, ...] = ()
     fixed_r2_layout: bool = False
+
+    @property
+    def primary_parameter(self) -> torch.nn.Parameter:
+        return self.expert_parameters[0]
+
+    def named_expert_parameters(self) -> tuple[tuple[str, torch.nn.Parameter], ...]:
+        return tuple(zip(self.expert_parameter_names, self.expert_parameters, strict=True))
 
     def invalidate_cache(self) -> None:
         self._device_mapping_cache.clear()
@@ -908,33 +954,34 @@ def expand_redundant_expert_slots(model: nn.Module, *, ep_size: int, redundant_s
 
     expanded_layers = 0
     for _key, module in model.named_modules():
-        if not (
-            hasattr(module, "num_experts")
-            and hasattr(module, "gate_up_proj")
-            and hasattr(module, "down_proj")
-            and isinstance(module.gate_up_proj, torch.Tensor)
-            and isinstance(module.down_proj, torch.Tensor)
-        ):
+        adapter = resolve_moe_model_adapter(module)
+        if adapter is None:
             continue
-        num_experts = int(module.num_experts)
+        num_experts = adapter.num_experts(module)
         if num_experts % int(ep_size) != 0:
             raise ValueError(
                 f"HierMoE redundant slots require num_experts={num_experts} divisible by ep_size={ep_size}."
             )
         base_slots = num_experts // int(ep_size)
         target_slots = base_slots + increment
-        gate_local = _local_tensor_view(module.gate_up_proj)
-        down_local = _local_tensor_view(module.down_proj)
-        if int(gate_local.shape[0]) == target_slots and int(down_local.shape[0]) == target_slots:
+        expert_parameters = adapter.expert_parameters(module)
+        local_parameters = tuple(_local_tensor_view(item.parameter) for item in expert_parameters)
+        if all(int(parameter.shape[0]) == target_slots for parameter in local_parameters):
             continue
-        if int(gate_local.shape[0]) != base_slots or int(down_local.shape[0]) != base_slots:
+        invalid = [
+            f"{item.name}={tuple(parameter.shape)}"
+            for item, parameter in zip(expert_parameters, local_parameters, strict=True)
+            if int(parameter.shape[0]) != base_slots
+        ]
+        if invalid:
             raise ValueError(
                 "HierMoE redundant slot expansion must run immediately after EP slicing. "
-                f"Expected {base_slots} local experts, got gate_up_proj={tuple(gate_local.shape)} "
-                f"down_proj={tuple(down_local.shape)}."
+                f"Expected {base_slots} local experts, got {', '.join(invalid)}."
             )
-        module.gate_up_proj = _expanded_local_parameter(module.gate_up_proj, target_slots)
-        module.down_proj = _expanded_local_parameter(module.down_proj, target_slots)
+        for item in expert_parameters:
+            adapter.replace_expert_parameter(
+                module, item.name, _expanded_local_parameter(item.parameter, target_slots)
+            )
         expanded_layers += 1
     return expanded_layers
 
@@ -2954,10 +3001,7 @@ class ExpertSwapManager:
             not self.fixed_pipeline_overlap
             or self.expert_swap_mode != "step"
             or self.expert_swap_selector != "hiermoe_greedy_cover_p1"
-            or _ABLATION_REPLAY_MODE != "static"
-            or not _INITIAL_LAYOUT_PATH
-            or not _FORWARD_REUSE_COVER
-            or not _FORWARD_REUSE_COVER_PATCH_REMAP
+            or _ABLATION_REPLAY_MODE not in {"off", "static"}
             or _ONLINE_LUT_UPDATE
             or _CPU_PLANNER_MODE != "off"
             or _NPU_LAYER_OWNER_BLOCKING
@@ -2965,8 +3009,7 @@ class ExpertSwapManager:
             or _COST_MODEL_VERIFY
         ):
             raise ValueError(
-                "PlaceMoE hot updates require a preloaded static layout, fixed-pipeline "
-                "step mode, source-LUT Forward routing, and all other online planners disabled."
+                "PlaceMoE hot updates require fixed-pipeline step mode and all other online planners disabled."
             )
         if _HOT_UPDATE and not _HOT_UPDATE_WORK_ROOT:
             raise ValueError("PlaceMoE hot-update work root must not be empty.")
@@ -3050,10 +3093,8 @@ class ExpertSwapManager:
         self._forward_reuse_cover_empty_seeding = _FORWARD_REUSE_COVER_EMPTY_SEEDING
         self._forward_reuse_cover_pending: dict[str, tuple[PlacementAction, int]] = {}
         self._hot_update = _HOT_UPDATE
-        self._hot_update_layout_interval = (
-            self.expert_swap_interval if _HOT_UPDATE_LAYOUT_INTERVAL is None else _HOT_UPDATE_LAYOUT_INTERVAL
-        )
-        self._hot_update_mapping_interval = 0 if _HOT_UPDATE_MAPPING_INTERVAL is None else _HOT_UPDATE_MAPPING_INTERVAL
+        self._hot_update_layout_interval = int(_HOT_UPDATE_LAYOUT_INTERVAL)
+        self._hot_update_mapping_interval = int(_HOT_UPDATE_MAPPING_INTERVAL)
         self._hot_update_controller = HotUpdateController(
             layout_interval_steps=self._hot_update_layout_interval,
             mapping_interval_steps=self._hot_update_mapping_interval,
@@ -3689,7 +3730,7 @@ class ExpertSwapManager:
             self._placement_metrics[key] = float(self._placement_metrics.get(key, 0.0)) + float(value)
 
     def _pipeline_device(self, layer: ExpertLayerState) -> torch.device:
-        return _local_tensor_view(layer.gate_up_proj).device
+        return _local_tensor_view(layer.primary_parameter).device
 
     def _pipeline_stream(self, kind: str, device: torch.device) -> Any | None:
         if device.type == "cpu":
@@ -5147,7 +5188,7 @@ class ExpertSwapManager:
     def _register_pipeline_gradient_hooks(self, layer: ExpertLayerState) -> None:
         if not self.gradient_overlap_enabled:
             return
-        for param_index, param in enumerate((layer.gate_up_proj, layer.down_proj)):
+        for param_index, param in enumerate(layer.expert_parameters):
             if id(param) in self._pipeline_grad_hook_params:
                 continue
             register = getattr(param, "register_post_accumulate_grad_hook", None)
@@ -5398,21 +5439,14 @@ class ExpertSwapManager:
         self._clear_accumulated_token_counts()
 
     def shutdown_pipeline(self) -> None:
-        if (not self.fixed_pipeline_overlap and not self.gradient_overlap_enabled) or self._pipeline_shutdown:
+        if (
+            not self.fixed_pipeline_overlap and not self.gradient_overlap_enabled and not self._hot_update
+        ) or self._pipeline_shutdown:
             return
         self._pipeline_shutdown = True
         hot_update_state = self._hot_update_controller.active_job
-        if (
-            hot_update_state is not None
-            and hot_update_state.process is not None
-            and hot_update_state.process.poll() is None
-        ):
-            hot_update_state.process.terminate()
-            try:
-                hot_update_state.process.wait(timeout=10.0)
-            except subprocess.TimeoutExpired:
-                hot_update_state.process.kill()
-                hot_update_state.process.wait()
+        if hot_update_state is not None and hot_update_state.process is not None:
+            terminate_planner_process(hot_update_state.process)
             self._hot_update_event(
                 "terminated_on_shutdown",
                 update_mode=hot_update_state.update_mode,
@@ -5518,7 +5552,7 @@ class ExpertSwapManager:
         return max_delta
 
     def _debug_global_accumulated_counts(self, layer: ExpertLayerState) -> torch.Tensor:
-        local_device = _local_tensor_view(layer.gate_up_proj).device
+        local_device = _local_tensor_view(layer.primary_parameter).device
         counts = layer.accumulated_tokens_per_local_expert
         if counts is None or counts.ndim != 1 or int(counts.numel()) != int(layer.num_local_experts):
             local_counts = torch.zeros((layer.num_local_experts,), dtype=torch.float32, device=local_device)
@@ -5565,10 +5599,7 @@ class ExpertSwapManager:
             worst_grad_slots: tuple[int, ...] = ()
             worst_grad_counts: tuple[float, ...] = ()
             for _logical_expert, slots in groups:
-                for _param_name, param in (
-                    ("gate_up_proj", candidate.gate_up_proj),
-                    ("down_proj", candidate.down_proj),
-                ):
+                for _param_name, param in candidate.named_expert_parameters():
                     param_delta = max(param_delta, self._debug_copy_group_stat_delta(param, candidate, slots))
                     grad = getattr(param, "grad", None)
                     if not include_grads or not torch.is_tensor(grad):
@@ -5662,7 +5693,7 @@ class ExpertSwapManager:
                 continue
 
             state_tensors = (
-                [layer.gate_up_proj, layer.down_proj] if self.optimizer is None else self._slot_op_state_tensors(layer)
+                list(layer.expert_parameters) if self.optimizer is None else self._slot_op_state_tensors(layer)
             )
             grouped_entries: dict[tuple[int, int], list[_CoverTensorEntry]] = defaultdict(list)
             for dst_slot, logical_expert in enumerate(target_layout.tolist()):
@@ -5705,22 +5736,25 @@ class ExpertSwapManager:
         logger.info_rank0("HierMoE installed the fixed R2 layout for %s layer(s).", len(self.layers))
 
     def _is_expert_module(self, module: nn.Module) -> bool:
-        return (
-            hasattr(module, "num_experts")
-            and hasattr(module, "gate_up_proj")
-            and hasattr(module, "down_proj")
-            and isinstance(module.gate_up_proj, torch.Tensor)
-            and isinstance(module.down_proj, torch.Tensor)
-        )
+        return resolve_moe_model_adapter(module) is not None
 
     def register_layer(self, key: str, module: nn.Module) -> None:
-        gate_up_proj = module.gate_up_proj
-        down_proj = module.down_proj
-        local_gate_up_proj = _local_tensor_view(gate_up_proj)
-        _local_tensor_view(down_proj)
+        adapter = resolve_moe_model_adapter(module)
+        if adapter is None:
+            raise TypeError(f"No PlaceMoE model adapter supports expert layer {key!r}.")
+        named_parameters = adapter.expert_parameters(module)
+        if not named_parameters:
+            raise ValueError(f"PlaceMoE model adapter {adapter.name!r} exposes no parameters for {key!r}.")
+        local_parameters = tuple(_local_tensor_view(item.parameter) for item in named_parameters)
+        num_local_experts = int(local_parameters[0].shape[0])
+        if any(int(parameter.shape[0]) != num_local_experts for parameter in local_parameters):
+            shapes = {
+                item.name: tuple(parameter.shape)
+                for item, parameter in zip(named_parameters, local_parameters, strict=True)
+            }
+            raise ValueError(f"PlaceMoE expert parameters for {key!r} have inconsistent slot dimensions: {shapes}.")
 
-        num_experts = int(module.num_experts)
-        num_local_experts = int(local_gate_up_proj.shape[0])
+        num_experts = adapter.num_experts(module)
         if num_experts % self.ep_size != 0:
             raise ValueError(
                 f"HierMoE layer {key} has {num_local_experts=} and {num_experts=} with ep_size={self.ep_size}."
@@ -5768,26 +5802,26 @@ class ExpertSwapManager:
             num_experts=num_experts,
             base_num_local_experts=base_num_local_experts,
             num_local_experts=num_local_experts,
-            gate_up_proj=gate_up_proj,
-            down_proj=down_proj,
+            expert_parameter_names=tuple(item.name for item in named_parameters),
+            expert_parameters=tuple(item.parameter for item in named_parameters),
+            model_adapter=adapter,
             logical_to_physical=mapping,
             slot_to_logical=slot_to_logical,
             canonical_physical_slots=canonical_slots,
             is_identity=bool(is_identity),
         )
-        if self._forward_reuse_cover_patch_remap and slot_layout_enabled:
+        if (self._hot_update or self._forward_reuse_cover_patch_remap) and slot_layout_enabled:
             if previous_source_lut is not None and tuple(previous_source_lut.shape) == (self.ep_size, num_experts):
                 registered_layer.source_logical_to_physical = previous_source_lut.detach().cpu().clone()
             else:
-                # The initial no-replica layout routes every source rank to
-                # the canonical owner.  Seed the LUT before the first empty
-                # Cover so its winner can be patched without rebuilding any
-                # token routes or requiring a preinstalled R2 layout.
+                # Before the first planner result, every source rank routes to
+                # the canonical owner. This gives hot updates a valid M even
+                # when training starts without a precomputed PlaceMoE artifact.
                 registered_layer.source_logical_to_physical = mapping.view(1, -1).expand(self.ep_size, -1).clone()
         self.layers[key] = registered_layer
         self.module_id_to_key[id(module)] = key
-        self.param_id_to_key[id(gate_up_proj)] = key
-        self.param_id_to_key[id(down_proj)] = key
+        for parameter in registered_layer.expert_parameters:
+            self.param_id_to_key[id(parameter)] = key
         self._register_pipeline_gradient_hooks(self.layers[key])
 
     def get_layer_key(self, module: nn.Module) -> str | None:
@@ -6258,8 +6292,8 @@ class ExpertSwapManager:
         zero_slots = counts <= 0
         # NPU grouped-matmul backward may leave undefined weight gradients
         # for zero-token groups. Those slots are mathematically inactive.
-        self._zero_grad_slots(layer.gate_up_proj, zero_slots)
-        self._zero_grad_slots(layer.down_proj, zero_slots)
+        for parameter in layer.expert_parameters:
+            self._zero_grad_slots(parameter, zero_slots)
 
     def _clear_accumulated_token_counts(self) -> None:
         for layer in self.layers.values():
@@ -6433,7 +6467,7 @@ class ExpertSwapManager:
         layer: ExpertLayerState,
     ) -> list[tuple[torch.nn.Parameter, list[_SlotStateItem]]]:
         rows: list[tuple[torch.nn.Parameter, list[_SlotStateItem]]] = []
-        for param in (layer.gate_up_proj, layer.down_proj):
+        for param in layer.expert_parameters:
             items: list[_SlotStateItem] = [("parameter", param)]
             grad = getattr(param, "grad", None)
             if torch.is_tensor(grad):
@@ -6841,7 +6875,7 @@ class ExpertSwapManager:
         layer: ExpertLayerState,
         schedule: _ReplicaGradSchedule,
     ) -> dict[tuple[torch.device, torch.dtype], dict[tuple[int, int], _ReplicaGradContribution]]:
-        params = (layer.gate_up_proj, layer.down_proj)
+        params = layer.expert_parameters
         local_grads = tuple(self._local_grad_for_redundant_sync(param) for param in params)
         contributions: dict[
             tuple[torch.device, torch.dtype],
@@ -7261,7 +7295,7 @@ class ExpertSwapManager:
                 rank, local_slot = divmod(int(physical_slot), layer.num_local_experts)
                 if rank == self.ep_rank:
                     mask[local_slot] = True
-            for param in (layer.gate_up_proj, layer.down_proj):
+            for param in layer.expert_parameters:
                 masks[id(param)] = mask
         return masks
 
@@ -7306,7 +7340,7 @@ class ExpertSwapManager:
     def _expert_payload_bytes(self, layer: ExpertLayerState) -> tuple[tuple[int, ...], tuple[int, ...]]:
         state_bytes = 0
         gradient_bytes = 0
-        for param in (layer.gate_up_proj, layer.down_proj):
+        for param in layer.expert_parameters:
             local = _local_tensor_view(param)
             slot_numel = int(local[0].numel())
             state_bytes += slot_numel * int(local.element_size())
@@ -7567,7 +7601,7 @@ class ExpertSwapManager:
         ordered_layers = sorted(layers, key=lambda value: value.key)
         if not ordered_layers:
             raise RuntimeError("Cost-model verification requires registered expert layers.")
-        common_device = _local_tensor_view(ordered_layers[0].gate_up_proj).device
+        common_device = _local_tensor_view(ordered_layers[0].primary_parameter).device
         local_sample_counts = torch.tensor(
             [sum(int(timing.step) == int(step) for timing in layer.cost_model_timings) for layer in ordered_layers],
             dtype=torch.int64,
@@ -8426,7 +8460,7 @@ class ExpertSwapManager:
             uncalibrated = [layer for layer in self.layers.values() if layer.planner_calibration is None]
             if not self.layers:
                 return
-            consensus_device = _local_tensor_view(next(iter(self.layers.values())).gate_up_proj).device
+            consensus_device = _local_tensor_view(next(iter(self.layers.values())).primary_parameter).device
             all_need_calibration, need_state_agrees = _placement_group_boolean_consensus(
                 bool(uncalibrated),
                 device=consensus_device,
@@ -8729,7 +8763,7 @@ class ExpertSwapManager:
             raise RuntimeError(f"HierMoE placement plan both copies into and clears physical slot {slot}.")
 
         originally_missing_grads = tuple(
-            param for param in (layer.gate_up_proj, layer.down_proj) if getattr(param, "grad", None) is None
+            param for param in layer.expert_parameters if getattr(param, "grad", None) is None
         )
         swap_actions = tuple(action for action in plan.actions if action.kind == "swap")
         for action in swap_actions:
@@ -8955,7 +8989,7 @@ class ExpertSwapManager:
                 layer_device = (
                     selected.device
                     if selected is not None and selected.numel() > 0
-                    else _local_tensor_view(layer.gate_up_proj).device
+                    else _local_tensor_view(layer.primary_parameter).device
                 )
                 if common_device is None:
                     common_device = layer_device
@@ -9161,7 +9195,7 @@ class ExpertSwapManager:
 
         if not layers:
             return []
-        consensus_device = _local_tensor_view(layers[0].gate_up_proj).device
+        consensus_device = _local_tensor_view(layers[0].primary_parameter).device
         globally_ready = _placement_group_all_true_mask(
             [layer.latest_selected_experts is not None for layer in layers],
             device=consensus_device,
@@ -9254,7 +9288,7 @@ class ExpertSwapManager:
             return []
         if self.ep_group is None or self.ep_size <= 1:
             raise RuntimeError("NPU layer-owner planning requires a distributed EP process group.")
-        consensus_device = _local_tensor_view(layers[0].gate_up_proj).device
+        consensus_device = _local_tensor_view(layers[0].primary_parameter).device
         globally_ready = _placement_group_all_true_mask(
             [layer.latest_selected_experts is not None for layer in layers],
             device=consensus_device,
@@ -9678,7 +9712,7 @@ class ExpertSwapManager:
 
         if not layers:
             return []
-        common_device = _local_tensor_view(layers[0].gate_up_proj).device
+        common_device = _local_tensor_view(layers[0].primary_parameter).device
         synchronize()
         planning_started = time.perf_counter()
         decision_rows = torch.zeros(
@@ -10746,7 +10780,7 @@ class ExpertSwapManager:
             environment = planner_environment(resources)
             os.makedirs(job_dir, exist_ok=True)
             with open(planner_log_path, "wb") as planner_log:
-                process = subprocess.Popen(command, stdout=planner_log, stderr=subprocess.STDOUT, env=environment)
+                process = launch_planner_process(command, stdout=planner_log, environment=environment)
         self._hot_update_controller.start(
             HotUpdateJob(
                 kind=update_kind,
@@ -10788,6 +10822,14 @@ class ExpertSwapManager:
             status = int(status_tensor.item())
         return status
 
+    def _finish_hot_update_job(self, state: HotUpdateJob) -> None:
+        """Reap the complete planner process group before releasing the job."""
+
+        process = getattr(state, "process", None)
+        if self.ep_rank == 0 and process is not None:
+            terminate_planner_process(process)
+        self._hot_update_controller.finish()
+
     def _broadcast_hot_update_payload(
         self,
         state: HotUpdateJob,
@@ -10814,12 +10856,14 @@ class ExpertSwapManager:
             raise RuntimeError("PlaceMoE hot update produced an invalid PlaceMoE artifact.") from error
         return payload
 
-    @torch.no_grad()
-    def _install_hot_update_layout(
+    def _prepare_hot_update_layer(
         self,
         layer: ExpertLayerState,
         raw_layer: dict[str, Any],
-    ) -> int:
+        update_mode: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Validate and materialize one layer update without mutating runtime state."""
+
         target, owners = self._validate_placement_layout(
             layer,
             raw_layer.get("slot_to_logical", ()),
@@ -10835,19 +10879,47 @@ class ExpertSwapManager:
             .detach()
             .cpu()
         )
-        expected_lut_shape = (self.ep_size, layer.num_experts)
-        if tuple(source_lut.shape) != expected_lut_shape:
+        expected_shape = (self.ep_size, layer.num_experts)
+        if tuple(source_lut.shape) != expected_shape:
             raise RuntimeError(
-                f"PlaceMoE layout source LUT for {layer.key} has shape {tuple(source_lut.shape)}, "
-                f"expected {expected_lut_shape}."
+                f"PlaceMoE mapping for {layer.key} has shape {tuple(source_lut.shape)}, expected {expected_shape}."
             )
         if bool(((source_lut < 0) | (source_lut >= layer.num_physical_slots)).any().item()):
-            raise RuntimeError(f"PlaceMoE layout source LUT for {layer.key} references an invalid slot.")
+            raise RuntimeError(f"PlaceMoE mapping for {layer.key} references an invalid slot.")
+
+        current = self._layer_layout(layer)
+        if update_mode == "mapping":
+            if not torch.equal(target, current) or not torch.equal(
+                owners,
+                layer.logical_to_physical.detach().cpu(),
+            ):
+                raise RuntimeError(f"PlaceMoE mapping update attempted to change layout L for {layer.key}.")
+            lookup_layout = current
+        elif update_mode == "full":
+            desired_experts = {int(value) for value in target.tolist() if int(value) >= 0}
+            available_experts = {int(value) for value in current.tolist() if int(value) >= 0}
+            missing = sorted(desired_experts - available_experts)
+            if missing:
+                raise RuntimeError(f"PlaceMoE layout cannot find current state for experts {missing} in {layer.key}.")
+            lookup_layout = target
+        else:
+            raise RuntimeError(f"Unknown PlaceMoE update mode: {update_mode}.")
+
         logical = torch.arange(layer.num_experts, dtype=torch.long).view(1, -1)
         if not torch.equal(
-            target.index_select(0, source_lut.reshape(-1)).view_as(source_lut), logical.expand_as(source_lut)
+            lookup_layout.index_select(0, source_lut.reshape(-1)).view_as(source_lut),
+            logical.expand_as(source_lut),
         ):
-            raise RuntimeError(f"PlaceMoE layout source LUT for {layer.key} references the wrong expert.")
+            raise RuntimeError(f"PlaceMoE mapping for {layer.key} references the wrong expert.")
+        return target, owners, source_lut
+
+    @torch.no_grad()
+    def _install_hot_update_layout(
+        self,
+        layer: ExpertLayerState,
+        raw_layer: dict[str, Any],
+    ) -> int:
+        target, owners, source_lut = self._prepare_hot_update_layer(layer, raw_layer, "full")
 
         current = self._layer_layout(layer)
         changed_slots = [slot for slot in range(layer.num_physical_slots) if current[slot] != target[slot]]
@@ -10922,42 +10994,7 @@ class ExpertSwapManager:
         layer: ExpertLayerState,
         raw_layer: dict[str, Any],
     ) -> int:
-        target, owners = self._validate_placement_layout(
-            layer,
-            raw_layer.get("slot_to_logical", ()),
-            raw_layer.get("owner_slots"),
-        )
-        current = self._layer_layout(layer)
-        if (
-            owners is None
-            or not torch.equal(target, current)
-            or not torch.equal(
-                owners,
-                layer.logical_to_physical.detach().cpu(),
-            )
-        ):
-            raise RuntimeError(f"PlaceMoE mapping update attempted to change layout L for {layer.key}.")
-        source_lut = (
-            torch.as_tensor(
-                raw_layer.get("source_logical_to_physical", ()),
-                dtype=torch.long,
-            )
-            .detach()
-            .cpu()
-        )
-        expected_shape = (self.ep_size, layer.num_experts)
-        if tuple(source_lut.shape) != expected_shape:
-            raise RuntimeError(
-                f"PlaceMoE mapping for {layer.key} has shape {tuple(source_lut.shape)}, expected {expected_shape}."
-            )
-        if bool(((source_lut < 0) | (source_lut >= layer.num_physical_slots)).any().item()):
-            raise RuntimeError(f"PlaceMoE mapping for {layer.key} references an invalid slot.")
-        logical = torch.arange(layer.num_experts, dtype=torch.long).view(1, -1)
-        if not torch.equal(
-            current.index_select(0, source_lut.reshape(-1)).view_as(source_lut),
-            logical.expand_as(source_lut),
-        ):
-            raise RuntimeError(f"PlaceMoE mapping for {layer.key} references the wrong expert.")
+        _target, _owners, source_lut = self._prepare_hot_update_layer(layer, raw_layer, "mapping")
         changed = layer.source_logical_to_physical is None or not torch.equal(
             layer.source_logical_to_physical,
             source_lut,
@@ -10985,12 +11022,16 @@ class ExpertSwapManager:
         raw_layers = payload.get("layers")
         if not isinstance(raw_layers, dict) or set(raw_layers) != set(self.layers):
             raise RuntimeError("PlaceMoE layout layer keys do not match the registered model.")
-        migration_started = time.perf_counter()
-        moved_slots = 0
         for layer in layers:
             raw_layer = raw_layers[layer.key]
             if not isinstance(raw_layer, dict):
                 raise RuntimeError(f"PlaceMoE layout for {layer.key} is not a mapping.")
+            self._prepare_hot_update_layer(layer, raw_layer, state.update_mode)
+
+        migration_started = time.perf_counter()
+        moved_slots = 0
+        for layer in layers:
+            raw_layer = raw_layers[layer.key]
             if state.update_mode == "full":
                 moved_slots += self._install_hot_update_layout(layer, raw_layer)
             else:
@@ -11045,14 +11086,16 @@ class ExpertSwapManager:
                     planner_log_path=state.planner_log_path,
                 )
                 message = f"PlaceMoE planner failed for source step {state.source_step}; see {state.planner_log_path}."
-                self._hot_update_controller.finish()
+                self._finish_hot_update_job(state)
                 if self._hot_update_controller.failure_policy == "continue":
                     logger.error("%s Keeping the current layout and mapping.", message)
                     self.latest_pair = f"placemoe_hot_update_failed:{state.source_step}"
                     return self.latest_pair
                 raise RuntimeError(message)
-            self.latest_pair = self._apply_hot_update(state, training_step)
-            self._hot_update_controller.finish()
+            try:
+                self.latest_pair = self._apply_hot_update(state, training_step)
+            finally:
+                self._finish_hot_update_job(state)
             return self.latest_pair
 
         update_kind = self._hot_update_controller.next_update()

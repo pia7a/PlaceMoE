@@ -379,6 +379,13 @@ def test_capacity_validation_supports_model_and_ep_matrix(num_experts: int, ep_s
         redundant_slots_per_rank=2,
         primary_slots_per_rank=None,
         active_redundant_slots=ep_size + 1,
+        hidden_size=1024,
+        bytes_per_element=2,
+        inter_ms_per_byte=1.0e-8,
+        intra_ms_per_byte=1.0e-9,
+        communication_phase_multiplier=1.0,
+        compute_ms_per_assignment=1.0e-5,
+        compute_phase_multiplier=1.0,
     )
 
     capacity = _validate_configuration(args)

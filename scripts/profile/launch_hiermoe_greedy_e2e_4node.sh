@@ -609,6 +609,7 @@ common_env=(
   -e "VEOMNI_HIERMOE_ABLATION_REPLAY_MODE=${ablation_replay_mode}"
   -e "VEOMNI_HIERMOE_ABLATION_MIGRATION_MODE=${ablation_migration_mode}"
   -e "VEOMNI_HIERMOE_ABLATION_GRAD_MODE=${ablation_grad_mode}"
+  -e "VEOMNI_PLACEMOE_USE_LEGACY_CONFIG=1"
   -e "VEOMNI_HIERMOE_INITIAL_LAYOUT=${initial_layout_path}"
   -e "VEOMNI_HIERMOE_CPU_PLANNER_MODE=${cpu_planner_mode}"
   -e "VEOMNI_HIERMOE_CPU_TRAIN_CORES_PER_RANK=${cpu_train_cores_per_rank}"

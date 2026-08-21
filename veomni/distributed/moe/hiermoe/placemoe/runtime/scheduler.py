@@ -24,14 +24,10 @@ class HotUpdateScheduler:
     def observe_step(self, training_step: int) -> None:
         within_window = 0 < training_step <= self.last_update_step
         layout_due = bool(
-            within_window
-            and self.layout_interval_steps > 0
-            and training_step % self.layout_interval_steps == 0
+            within_window and self.layout_interval_steps > 0 and training_step % self.layout_interval_steps == 0
         )
         mapping_due = bool(
-            within_window
-            and self.mapping_interval_steps > 0
-            and training_step % self.mapping_interval_steps == 0
+            within_window and self.mapping_interval_steps > 0 and training_step % self.mapping_interval_steps == 0
         )
         if layout_due:
             self.pending_full = True

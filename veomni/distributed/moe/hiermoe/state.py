@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -20,10 +21,10 @@ import torch
 import torch.distributed as dist
 
 from ....utils import logging
-from .expert_swap import ExpertSwapManager, expand_redundant_expert_slots
+from .expert_swap import ExpertSwapManager, configure_placemoe_runtime, expand_redundant_expert_slots
 from .metrics import peek_hiermoe_metrics
 from .perf_model import HierMoEPerfModel, fit_perf_model_on_startup
-from .placemoe.runtime import PlaceMoERuntimeConfig
+from .placemoe.runtime import PlaceMoERuntimeConfig, set_current_runtime_config, training_config_is_explicit
 from .topology import Hierarchy, infer_hierarchy
 
 
@@ -93,6 +94,24 @@ def _resolve_max_replica_rounds(configured: int | None, redundant_slots_per_rank
     return min(max(0, int(configured)), capacity)
 
 
+def _resolve_placemoe_runtime_config(inline_placemoe: Any) -> PlaceMoERuntimeConfig:
+    """Prefer the canonical training block unless legacy input is explicitly enabled."""
+
+    inline_is_explicit = training_config_is_explicit(inline_placemoe)
+    legacy_config_path = os.environ.get("VEOMNI_PLACEMOE_CONFIG", "").strip()
+    legacy_config_enabled = os.environ.get("VEOMNI_PLACEMOE_USE_LEGACY_CONFIG", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if legacy_config_enabled and legacy_config_path and not inline_is_explicit:
+        return PlaceMoERuntimeConfig.from_environment()
+    if not inline_is_explicit:
+        return PlaceMoERuntimeConfig()
+    return PlaceMoERuntimeConfig.from_training_config(inline_placemoe)
+
+
 def configure_hiermoe(
     config: Any,
     ep_group: dist.ProcessGroup | None,
@@ -116,7 +135,10 @@ def configure_hiermoe(
         topology=str(config.topology),
         hierarchy_group_sizes=tuple(config.hierarchy_group_sizes),
     )
-    placemoe_config = PlaceMoERuntimeConfig.from_environment()
+    inline_placemoe = getattr(config, "placemoe", None)
+    placemoe_config = _resolve_placemoe_runtime_config(inline_placemoe)
+    set_current_runtime_config(placemoe_config)
+    configure_placemoe_runtime(placemoe_config)
     perf_model_path = (
         placemoe_config.runtime_perf_model
         if placemoe_config.source_path and placemoe_config.runtime_perf_model

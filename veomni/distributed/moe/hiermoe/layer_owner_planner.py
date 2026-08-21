@@ -350,10 +350,7 @@ class AcceleratorLayerOwnerPlanner:
             input_splits.append(int(chunk.numel()))
         send_buffer = torch.cat(send_chunks)
         output_splits = [
-            sum(
-                int(metadata_host[source][index][0]) * int(metadata_host[source][index][1])
-                for index in owned_indices
-            )
+            sum(int(metadata_host[source][index][0]) * int(metadata_host[source][index][1]) for index in owned_indices)
             for source in range(world_size)
         ]
         recv_buffer = torch.empty((sum(output_splits),), dtype=torch.int32, device=device)
@@ -382,9 +379,7 @@ class AcceleratorLayerOwnerPlanner:
                 selected_chunks[layer_index].append(
                     recv_buffer[offset : offset + flat_size].view(token_count, top_k).to(torch.long)
                 )
-                source_chunks[layer_index].append(
-                    torch.full((token_count,), source, dtype=torch.long, device=device)
-                )
+                source_chunks[layer_index].append(torch.full((token_count,), source, dtype=torch.long, device=device))
                 ordinal_chunks[layer_index].append(torch.arange(token_count, dtype=torch.long, device=device))
                 offset += flat_size
         if offset != int(recv_buffer.numel()):

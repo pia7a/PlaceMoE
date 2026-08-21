@@ -136,11 +136,7 @@ class NPULayerOwnerPlanner:
                     destinations = all_slots[(~owner_mask) & (host_layout >= 0)]
                     row_blocks.append(self.planner._cover_rows(host_layout, host_owners, destinations))
                 nonempty = [block for block in row_blocks if block.numel()]
-                host_rows = (
-                    torch.cat(nonempty, dim=0)
-                    if nonempty
-                    else torch.empty((0, 5), dtype=torch.long)
-                )
+                host_rows = torch.cat(nonempty, dim=0) if nonempty else torch.empty((0, 5), dtype=torch.long)
                 host_copy_slots = self.planner._copy_table(host_layout, int(host_owners.numel()))
                 metadata = {
                     "host_layout": host_layout,
@@ -437,10 +433,7 @@ class NPULayerOwnerPlanner:
             )
             communication_width = int(communication.shape[1])
             if include_assignments:
-                if (
-                    layer_counts.baseline_assignment_local is None
-                    or layer_counts.candidate_assignment_local is None
-                ):
+                if layer_counts.baseline_assignment_local is None or layer_counts.candidate_assignment_local is None:
                     raise RuntimeError("NPU layer-owner planning requested missing assignment statistics.")
                 assignments = torch.cat(
                     (
@@ -498,9 +491,7 @@ class NPULayerOwnerPlanner:
             )
             input_splits = None
         else:
-            input_splits = [
-                sum(prepared[index].flat_size for index in indices) for indices in layers_by_owner
-            ]
+            input_splits = [sum(prepared[index].flat_size for index in indices) for indices in layers_by_owner]
             send_chunks = [
                 torch.cat([prepared[index].packed_local.reshape(-1) for index in indices])
                 if indices
@@ -543,9 +534,7 @@ class NPULayerOwnerPlanner:
         offset = 0
         for layer_index in owned_indices:
             size = prepared[layer_index].flat_size
-            global_by_layer[layer_index] = reduced[offset : offset + size].view_as(
-                prepared[layer_index].packed_local
-            )
+            global_by_layer[layer_index] = reduced[offset : offset + size].view_as(prepared[layer_index].packed_local)
             offset += flat_size if self.statistic_collective == "reduce_scatter" else size
         if self.statistic_collective == "all_to_all" and offset != owned_flat_size:
             raise RuntimeError("NPU layer-owner statistic unpack consumed an unexpected number of values.")

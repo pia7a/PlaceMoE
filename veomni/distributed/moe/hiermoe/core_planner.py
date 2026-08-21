@@ -965,9 +965,7 @@ class CoReMoEPlanner(CurrentRoutePlanner):
         step: int,
         layer_seed: int,
         fused_capable: int | bool | torch.Tensor,
-        required_fused_capabilities: int = (
-            _FUSED_CAP_COLLECTIVE | _FUSED_CAP_QUOTA_MAP | _FUSED_CAP_QUOTA_POLICY
-        ),
+        required_fused_capabilities: int = (_FUSED_CAP_COLLECTIVE | _FUSED_CAP_QUOTA_MAP | _FUSED_CAP_QUOTA_POLICY),
     ) -> _DevicePlanningSummary:
         """Build the integer first-collective payload and sampled swap statistics."""
 
@@ -2380,9 +2378,7 @@ class CoReMoEPlanner(CurrentRoutePlanner):
                 )
                 if fused_swap is None:
                     raise RuntimeError("The group enabled fused CoRe-MoE planning without a swap selector.")
-                candidate_layout, candidate_owners, action_rows, swap_metadata, replica_seed_base_counts = (
-                    fused_swap
-                )
+                candidate_layout, candidate_owners, action_rows, swap_metadata, replica_seed_base_counts = fused_swap
                 accepted = int(swap_metadata[0].item())
                 if accepted < 0 or accepted > min(max(0, int(max_swaps)), int(action_rows.shape[0])):
                     raise RuntimeError(f"Fused CoRe-MoE swap selector returned invalid action count {accepted}.")

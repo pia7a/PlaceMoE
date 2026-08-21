@@ -91,10 +91,7 @@ def forward_cover_patch_source_rank_relevant(
     if int(service_group_size) <= 0:
         raise ValueError("service_group_size must be positive.")
     destination_rank = int(action.dst_slot) // int(slots_per_rank)
-    inserted_relevant = (
-        int(source_rank) // int(service_group_size)
-        == destination_rank // int(service_group_size)
-    )
+    inserted_relevant = int(source_rank) // int(service_group_size) == destination_rank // int(service_group_size)
     victim = int(action.dst_logical)
     if victim < 0:
         return inserted_relevant
@@ -301,9 +298,7 @@ def forward_cover_local_heuristic_statistics_batched(
 
     weights = tuple(float(value) for value in level_weights) if level_weights is not None else ()
     active_group_sizes = [
-        int(size)
-        for size in hierarchy_group_sizes
-        if 1 < int(size) < int(ep_size) and int(ep_size) % int(size) == 0
+        int(size) for size in hierarchy_group_sizes if 1 < int(size) < int(ep_size) and int(ep_size) % int(size) == 0
     ]
     expected_levels = 1 + len(active_group_sizes)
     if weights and len(weights) != expected_levels:
@@ -385,9 +380,7 @@ def forward_cover_local_heuristic_statistics(
 
     weights = tuple(float(value) for value in level_weights) if level_weights is not None else ()
     active_group_sizes = [
-        int(size)
-        for size in hierarchy_group_sizes
-        if 1 < int(size) < int(ep_size) and int(ep_size) % int(size) == 0
+        int(size) for size in hierarchy_group_sizes if 1 < int(size) < int(ep_size) and int(ep_size) % int(size) == 0
     ]
     expected_levels = 1 + len(active_group_sizes)
     if weights and len(weights) != expected_levels:
@@ -511,12 +504,8 @@ def _batched_presence_delta(
         dim=-1,
     )
 
-    removed = valid & ~(
-        after_groups.unsqueeze(-2) == old_groups.unsqueeze(-1)
-    ).any(dim=-1)
-    added = valid & ~(
-        before_groups.unsqueeze(-2) == new_groups.unsqueeze(-1)
-    ).any(dim=-1)
+    removed = valid & ~(after_groups.unsqueeze(-2) == old_groups.unsqueeze(-1)).any(dim=-1)
+    added = valid & ~(before_groups.unsqueeze(-2) == new_groups.unsqueeze(-1)).any(dim=-1)
 
     # If both changed experts leave or enter the same group for one token,
     # count the set transition once rather than once per expert.
@@ -611,9 +600,7 @@ def forward_cover_patch_validation_stats_batched(
     )
 
     valid_sizes = tuple(
-        int(size)
-        for size in hierarchy_group_sizes
-        if 1 < int(size) < int(ep_size) and int(ep_size) % int(size) == 0
+        int(size) for size in hierarchy_group_sizes if 1 < int(size) < int(ep_size) and int(ep_size) % int(size) == 0
     )
     group_deltas = [rank_delta]
     for size in valid_sizes:
@@ -927,11 +914,7 @@ def propose_forward_reuse_covers(
     copy_counts = torch.bincount(active_layout, minlength=num_experts)
     # Any slot whose logical expert has another physical copy can be covered.
     # Canonical ownership is promoted by the executor when such a slot wins.
-    empty_slots = [
-        slot
-        for slot in range(target_start, target_end)
-        if int(layout[slot].item()) < 0
-    ]
+    empty_slots = [slot for slot in range(target_start, target_end) if int(layout[slot].item()) < 0]
     occupied_cover_slots = [
         slot
         for slot in range(target_start, target_end)
@@ -1044,9 +1027,7 @@ def propose_forward_reuse_covers(
         # its assignment penalty is only a ranking signal and can be
         # pessimistic before the first replicas exist.  Occupied Cover keeps
         # the normal positive-estimated-gain filter.
-        if not bool(torch.isfinite(gain_tensor).item()) or (
-            victim_logical >= 0 and gain <= float(minimum_gain)
-        ):
+        if not bool(torch.isfinite(gain_tensor).item()) or (victim_logical >= 0 and gain <= float(minimum_gain)):
             continue
         expert = int(expert_tensor.item())
         proposals.append(

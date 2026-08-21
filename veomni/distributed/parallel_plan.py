@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 from torch.distributed._tensor import DeviceMesh, DTensor, Replicate, Shard
 
+from ..models.moe_parameter import is_stacked_expert_parameter_name
 from ..utils import logging
 from .utils import check_fqn_match, get_module_from_path, set_module_from_path
 
@@ -46,6 +47,22 @@ def _resolve_hiermoe_initial_layout_path(config_path: str, hiermoe_path: str) ->
 
 def _hiermoe_initial_layout_path() -> str:
     """Resolve the canonical PlaceMoE artifact before model sharding."""
+    # ``configure_hiermoe`` runs before model construction and installs the
+    # nested training configuration here.  Environment lookup is retained for
+    # old launchers that have not migrated to ``train.hiermoe.placemoe``.
+    from .moe.hiermoe.placemoe.runtime import get_current_runtime_config
+
+    current = get_current_runtime_config()
+    if current.source_path:
+        return current.initial_artifact
+    legacy_config_enabled = os.environ.get("VEOMNI_PLACEMOE_USE_LEGACY_CONFIG", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not legacy_config_enabled:
+        return ""
     config_path = os.environ.get("VEOMNI_PLACEMOE_CONFIG", "").strip()
     hiermoe_path = os.environ.get("VEOMNI_HIERMOE_INITIAL_LAYOUT", "").strip()
     return _resolve_hiermoe_initial_layout_path(config_path, hiermoe_path)
@@ -133,7 +150,7 @@ def _is_hiermoe_redundant_slot_expert_param(
 ) -> bool:
     if shard_group != "ep" or len(tensor_shape) < 1 or len(target_shape) < 1:
         return False
-    if not parameter_name.endswith((".experts.gate_up_proj", ".experts.down_proj")):
+    if not is_stacked_expert_parameter_name(parameter_name):
         return False
     if tensor_shape[0] % int(para_size) != 0:
         return False

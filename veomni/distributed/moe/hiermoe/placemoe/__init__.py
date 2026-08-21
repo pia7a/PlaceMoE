@@ -30,6 +30,14 @@ from .mapping import (
     validate_instance_mapping,
 )
 from .materialize import materialize_plan
+from .model_adapter import (
+    ExpertParameter,
+    MoEKernelWeights,
+    MoEModelAdapter,
+    register_moe_model_adapter,
+    require_moe_model_adapter,
+    resolve_moe_model_adapter,
+)
 from .optimizer import (
     OptimizationResult,
     OptimizerCandidate,
@@ -53,11 +61,14 @@ from .types import EMPTY_EXPERT, LayerPlan, PlaceMoETopology, ProfileStatistics
 
 __all__ = [
     "EMPTY_EXPERT",
+    "ExpertParameter",
     "LayerPlan",
     "CommunityMappingConfig",
     "CommunityMappingResult",
     "MappingConfig",
     "MappingResult",
+    "MoEKernelWeights",
+    "MoEModelAdapter",
     "OptimizationResult",
     "OptimizerCandidate",
     "OptimizerConfig",
@@ -90,6 +101,9 @@ __all__ = [
     "project_statistics_to_copies",
     "rank_placement_is_unique",
     "repair_rank_placement",
+    "register_moe_model_adapter",
+    "require_moe_model_adapter",
+    "resolve_moe_model_adapter",
     "uniform_copy_statistics",
     "validate_instance_mapping",
     "validate_placemoe_artifact",

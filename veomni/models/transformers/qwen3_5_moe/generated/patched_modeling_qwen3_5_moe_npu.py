@@ -757,17 +757,14 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                     sequence_boundaries = (0, int(mixed_qkv.shape[1]))
                 else:
                     sequence_boundaries = tuple(
-                        int(value)
-                        for value in cu_seq_lens_q.detach().to(device="cpu", dtype=torch.long).tolist()
+                        int(value) for value in cu_seq_lens_q.detach().to(device="cpu", dtype=torch.long).tolist()
                     )
                     if (
                         len(sequence_boundaries) < 2
                         or sequence_boundaries[0] != 0
                         or sequence_boundaries[-1] != int(mixed_qkv.shape[1])
                     ):
-                        raise ValueError(
-                            "cu_seq_lens_q must start at zero and end at the packed sequence length."
-                        )
+                        raise ValueError("cu_seq_lens_q must start at zero and end at the packed sequence length.")
                 if ulysses_enabled:
                     conv_weight = self._get_local_conv1d_weight(
                         ulysses_rank=ulysses_rank,
@@ -829,8 +826,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                     sequence_boundaries = (0, int(query.shape[1]))
                 else:
                     sequence_boundaries = tuple(
-                        int(value)
-                        for value in cu_seq_lens_q.detach().to(device="cpu", dtype=torch.long).tolist()
+                        int(value) for value in cu_seq_lens_q.detach().to(device="cpu", dtype=torch.long).tolist()
                     )
                 if cache_params is not None and len(sequence_boundaries) != 2:
                     raise NotImplementedError(

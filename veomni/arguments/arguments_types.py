@@ -17,7 +17,7 @@ import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from ..utils import logging
 from ..utils.env import get_env
@@ -434,6 +434,77 @@ class CheckpointConfig:
 
 
 @dataclass
+class PlaceMoEHotUpdateArguments:
+    """train.hiermoe.placemoe.hot_update.* — Periodic PlaceMoE updates."""
+
+    enabled: bool = False
+    layout_interval_steps: int = 0
+    mapping_interval_steps: int = 0
+    last_update_step: int = 2**31 - 1
+    work_root: str = "/tmp/veomni_placemoe_hot_update"
+    planner_path: str = ""
+    failure_policy: Literal["continue", "raise"] = "continue"
+
+
+@dataclass
+class PlaceMoECalibrationArguments:
+    """train.hiermoe.placemoe.calibration.* — Planner cost coefficients."""
+
+    inter_ms_per_byte: Optional[float] = None
+    intra_ms_per_byte: Optional[float] = None
+    route_ms_per_assignment: Optional[float] = None
+    communication_multiplier: Optional[float] = None
+    compute_ms_per_assignment: Optional[float] = None
+    compute_multiplier: Optional[float] = None
+    artifact: str = ""
+    require_scope: bool = False
+    expected_scope: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PlaceMoEPlannerResourceArguments:
+    """train.hiermoe.placemoe.resources.* — CPU planner resources."""
+
+    workers: int = 48
+    candidate_workers: int = 4
+    worker_threads: int = 1
+    planner_cpu_ids: str = ""
+    training_cpu_ids: str = ""
+
+
+@dataclass
+class PlaceMoEArguments:
+    """train.hiermoe.placemoe.* — Canonical PlaceMoE runtime configuration."""
+
+    enabled: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable the canonical PlaceMoE runtime preset. This selects hierarchical token deduplication, "
+                "source-aware dispatch, step-boundary updates, and replica-gradient overlap without enabling "
+                "the legacy swap/cover planners."
+            )
+        },
+    )
+    config_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional legacy PlaceMoE YAML/JSON file. Inline fields are preferred."},
+    )
+    base_directory: str = field(
+        default="",
+        metadata={"help": "Base directory for relative PlaceMoE paths. Empty uses the launch directory."},
+    )
+    initial_artifact: str = field(
+        default="",
+        metadata={"help": "Optional initial PlaceMoE layout artifact. Empty starts from the default layout."},
+    )
+    runtime_perf_model: str = ""
+    hot_update: PlaceMoEHotUpdateArguments = field(default_factory=PlaceMoEHotUpdateArguments)
+    calibration: PlaceMoECalibrationArguments = field(default_factory=PlaceMoECalibrationArguments)
+    resources: PlaceMoEPlannerResourceArguments = field(default_factory=PlaceMoEPlannerResourceArguments)
+
+
+@dataclass
 class HierMoEConfig:
     """train.hiermoe.* — Hierarchical MoE communication controls."""
 
@@ -582,8 +653,19 @@ class HierMoEConfig:
         default=False,
         metadata={"help": "Run additional baseline timing/validation for HierMoE debugging."},
     )
+    placemoe: PlaceMoEArguments = field(default_factory=PlaceMoEArguments)
 
     def __post_init__(self):
+        if self.placemoe.enabled:
+            self.enable = True
+            self.token_dedup = True
+            self.communication_mode = "hierarchical"
+            self.expert_swap = True
+            self.expert_swap_max_pairs_per_layer = 0
+            self.expert_swap_selector = "hiermoe_greedy_cover_p1"
+            self.expert_swap_mode = "step"
+            self.fixed_pipeline_overlap = True
+            self.max_slot_op_search_rounds = 0
         if self.communication_mode not in {"auto", "direct", "hierarchical"}:
             raise ValueError("train.hiermoe.communication_mode must be auto, direct, or hierarchical.")
         if self.expert_swap_interval < 1:

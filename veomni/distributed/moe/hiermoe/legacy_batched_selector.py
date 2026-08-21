@@ -817,7 +817,6 @@ class LegacyBatchedSelector:
         ]
         | None
     ):
-
         with _full_timing_range("hiermoe_expert_swap_select_local"):
             layer_stats: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
             num_group_rows: list[int] = []

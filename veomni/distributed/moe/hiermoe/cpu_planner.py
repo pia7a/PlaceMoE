@@ -40,6 +40,7 @@ from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from threading import Lock
 
 import torch
@@ -612,9 +613,7 @@ class CPULayerOwnerPlanner:
             [index for index, owner in enumerate(owner_ranks) if owner == destination]
             for destination in range(world_size)
         ]
-        send_splits = [
-            sum(prepared[layer_index].flat_size for layer_index in indices) for indices in layers_by_owner
-        ]
+        send_splits = [sum(prepared[layer_index].flat_size for layer_index in indices) for indices in layers_by_owner]
         send_chunks = [
             torch.cat([prepared[index].packed_local.reshape(-1) for index in indices])
             if indices
@@ -661,14 +660,14 @@ class CPULayerOwnerPlanner:
         offset = 0
         for layer_index in owned_indices:
             size = prepared[layer_index].flat_size
-            global_by_layer[layer_index] = reduced[offset : offset + size].view_as(
-                prepared[layer_index].packed_local
-            )
+            global_by_layer[layer_index] = reduced[offset : offset + size].view_as(prepared[layer_index].packed_local)
             offset += size
         if offset != owned_flat_size:
             raise RuntimeError("CPU layer-owner statistic unpack consumed an unexpected number of values.")
-        return global_by_layer, int(packed.send_buffer.numel() * packed.send_buffer.element_size()), int(
-            world_size * owned_flat_size * packed.send_buffer.element_size()
+        return (
+            global_by_layer,
+            int(packed.send_buffer.numel() * packed.send_buffer.element_size()),
+            int(world_size * owned_flat_size * packed.send_buffer.element_size()),
         )
 
     def _owner_decisions(
@@ -838,9 +837,7 @@ class CPULayerOwnerPlanner:
         )
         if not (len(scales) == len(compute_slopes) == len(compute_constants) == layer_count):
             raise ValueError("CPU layer-owner cost-model arrays must match the number of layers.")
-        source_values = (
-            [int(source_ranks)] * layer_count if isinstance(source_ranks, int) else list(source_ranks)
-        )
+        source_values = [int(source_ranks)] * layer_count if isinstance(source_ranks, int) else list(source_ranks)
         if len(source_values) != layer_count:
             raise ValueError("CPU layer-owner source_ranks must match the number of layers.")
 
@@ -1062,9 +1059,7 @@ class CPUHCCLBatchedPlanner:
         )
         if not (len(scales) == len(compute_slopes) == len(compute_constants) == layer_count):
             raise ValueError("CPU HCCL batched cost-model arrays must match the number of layers.")
-        source_values = (
-            [int(source_ranks)] * layer_count if isinstance(source_ranks, int) else list(source_ranks)
-        )
+        source_values = [int(source_ranks)] * layer_count if isinstance(source_ranks, int) else list(source_ranks)
         if len(source_values) != layer_count:
             raise ValueError("CPU HCCL batched source_ranks must match the number of layers.")
 
@@ -1199,8 +1194,8 @@ def _shared_memory_cpu_planner_main(
         try:
             planner = CPUHCCLBatchedPlanner(
                 command["planner"],
-                reducer=lambda tensor: _shared_memory_collective_exchange(
-                    tensor,
+                reducer=partial(
+                    _shared_memory_collective_exchange,
                     slot=slot,
                     source_step=source_step,
                     collective_queue=collective_queue,
@@ -1466,9 +1461,7 @@ class AsyncCPULayerOwnerPlanner:
             raise ValueError("Asynchronous CPU planning requires owned CPU route buffers.")
         requested_step = kwargs.get("step")
         if requested_step is not None and int(requested_step) != int(source_step):
-            raise ValueError(
-                f"Planner step={requested_step} must match the asynchronous source_step={source_step}."
-            )
+            raise ValueError(f"Planner step={requested_step} must match the asynchronous source_step={source_step}.")
         kwargs["step"] = int(source_step)
         digest = _layout_digest(slot_to_logical, owner_slots)
         with self._lock:

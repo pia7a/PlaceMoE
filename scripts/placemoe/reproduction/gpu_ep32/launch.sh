@@ -195,6 +195,7 @@ common_env=(
   "VEOMNI_HIERMOE_ABLATION_REPLAY_MODE=${replay_mode}"
   "VEOMNI_HIERMOE_ABLATION_REPLAY_PATH=${replay_path}"
   "VEOMNI_HIERMOE_INITIAL_LAYOUT=${initial_layout_path}"
+  "VEOMNI_PLACEMOE_USE_LEGACY_CONFIG=1"
   "VEOMNI_PLACEMOE_CONFIG=${placemoe_config}"
   "VEOMNI_HIERMOE_FORWARD_REUSE_COVER=${forward_reuse_cover}"
   "VEOMNI_HIERMOE_FORWARD_REUSE_COVER_PATCH_REMAP=${forward_reuse_cover_patch_remap}"

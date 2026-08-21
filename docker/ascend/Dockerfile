@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1.7
+
+# This image is the software stack used by the validated Ascend testbed.  A
+# deployment may override BASE_IMAGE with an equivalent validated CANN 9.0 /
+# Python 3.11 / PyTorch 2.9 / torch-npu 2.9 image.
+ARG BASE_IMAGE=ascendai/veomni:qwen35-main-triton321-torch290-warmcache
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.9.8
+FROM ${UV_IMAGE} AS uv
+FROM ${BASE_IMAGE}
+
+ENV UV_LINK_MODE=copy \
+    UV_CACHE_DIR=/opt/placemoe/.uv-cache \
+    UV_PROJECT_ENVIRONMENT=/opt/placemoe/.venv \
+    PYTHONPATH=/opt/placemoe:${PYTHONPATH} \
+    PATH=/opt/placemoe/.venv/bin:${PATH}
+
+WORKDIR /opt/placemoe
+COPY --from=uv /uv /uvx /bin/
+
+COPY pyproject.toml uv.lock README.md LICENSE ./
+# CANN, torch, torch-npu, and VeOmni's general runtime dependencies come from
+# the validated base image.  Keep that stack visible, but install this source
+# tree ahead of the base image's /app checkout.
+RUN python -m venv --system-site-packages "${UV_PROJECT_ENVIRONMENT}"
+
+COPY . .
+RUN uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" \
+      --no-deps --no-build-isolation . \
+    && test -x "${UV_PROJECT_ENVIRONMENT}/bin/placemoe" \
+    && uv cache clean
+
+CMD ["bash"]

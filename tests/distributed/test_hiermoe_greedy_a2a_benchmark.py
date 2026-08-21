@@ -28,9 +28,7 @@ def test_shifted_initial_replicas_preserve_owners_and_fill_one_slot_per_rank():
 
 
 def test_empty_initial_layout_preserves_capacity_for_planner_initialization():
-    layout, owners, _slots_per_rank = benchmark._initial_layout(
-        8, 4, 1, torch.device("cpu"), fill_replicas=False
-    )
+    layout, owners, _slots_per_rank = benchmark._initial_layout(8, 4, 1, torch.device("cpu"), fill_replicas=False)
 
     torch.testing.assert_close(layout, torch.tensor([0, 1, -1, 2, 3, -1, 4, 5, -1, 6, 7, -1]))
     torch.testing.assert_close(layout.index_select(0, owners), torch.arange(8))
@@ -62,9 +60,7 @@ def test_communication_score_separates_assignment_and_rank_dedup_counts():
 
 
 def test_summary_uses_median_and_upper_rank_p90():
-    summary = benchmark._summary(
-        [(10.0, 6.0, 4.0, 10.0), (8.0, 5.0, 3.0, 8.0), (12.0, 7.0, 5.0, 12.0)]
-    )
+    summary = benchmark._summary([(10.0, 6.0, 4.0, 10.0), (8.0, 5.0, 3.0, 8.0), (12.0, 7.0, 5.0, 12.0)])
 
     assert summary["wall_ms"]["median"] == pytest.approx(10.0)
     assert summary["a2a_ms"]["p90"] == pytest.approx(12.0)

@@ -37,7 +37,7 @@ def bind_physical_moe_layer_keys(model: Any) -> int:
     for name, module in model.named_modules():
         if _LAYER_PATTERN.search(name) is None or not name.endswith(".mlp.experts"):
             continue
-        setattr(module, "_veomni_physical_load_layer_key", name)
+        module._veomni_physical_load_layer_key = name
         attached += 1
     return attached
 
@@ -109,10 +109,7 @@ def flush_physical_moe_load(
         gathered_ranks = local_rank
 
     rank_ids = [int(value) for value in gathered_ranks.cpu().tolist()]
-    by_layer = [
-        [int(value) for value in row]
-        for row in gathered_counts.transpose(0, 1).contiguous().cpu().tolist()
-    ]
+    by_layer = [[int(value) for value in row] for row in gathered_counts.transpose(0, 1).contiguous().cpu().tolist()]
     layer_ratios = [_max_over_mean(row) for row in by_layer]
     rank_totals = [sum(by_layer[layer][rank] for layer in range(expected_num_layers)) for rank in range(group_size)]
     layer_keys = [_LAYER_KEYS.get(index, f"layer_{index}") for index in range(expected_num_layers)]

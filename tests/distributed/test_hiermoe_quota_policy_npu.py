@@ -56,11 +56,7 @@ def _destinations(
     mask: int,
     slots_per_rank: int,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    pairs = sorted(
-        (slot // slots_per_rank, copy)
-        for copy, slot in enumerate(copies[logical])
-        if mask & (1 << copy)
-    )
+    pairs = sorted((slot // slots_per_rank, copy) for copy, slot in enumerate(copies[logical]) if mask & (1 << copy))
     return tuple(rank for rank, _ in pairs), tuple(copy for _, copy in pairs)
 
 
@@ -77,10 +73,7 @@ def _tie_mask(
     visited = (source, *(owner_slots[other] // slots_per_rank for other in route if other != logical))
 
     def score(destination: int) -> tuple[int, ...]:
-        values = [
-            int(all(destination // size != rank // size for rank in visited))
-            for size in reversed(level_sizes)
-        ]
+        values = [int(all(destination // size != rank // size for rank in visited)) for size in reversed(level_sizes)]
         values.append(int(destination not in visited))
         return tuple(values)
 

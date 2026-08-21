@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
+import sys
+import time
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from .config import PlaceMoECalibration, PlaceMoEPlannerResources
 from .scheduler import UpdateKind
@@ -144,9 +147,80 @@ def planner_environment(
     return environment
 
 
+def launch_planner_process(
+    command: Sequence[str],
+    *,
+    stdout: Any,
+    environment: Mapping[str, str],
+) -> subprocess.Popen[bytes]:
+    """Launch the planner in a supervised session shared by all workers."""
+
+    supervised_command = [
+        sys.executable,
+        "-m",
+        "veomni.distributed.moe.hiermoe.placemoe.runtime.planner_supervisor",
+        "--",
+        *command,
+    ]
+    supervisor_environment = dict(environment)
+    supervisor_environment["PLACEMOE_SUPERVISOR_PARENT_PID"] = str(os.getpid())
+    return subprocess.Popen(
+        supervised_command,
+        stdout=stdout,
+        stderr=subprocess.STDOUT,
+        env=supervisor_environment,
+        start_new_session=True,
+    )
+
+
+def terminate_planner_process(process: subprocess.Popen[bytes], *, timeout: float = 10.0) -> None:
+    """Terminate the complete planner session and reap its leader.
+
+    A planner worker can outlive a leader that failed or exited first.  The
+    process group must therefore be signalled even when ``Popen.poll()``
+    already reports completion.
+    """
+
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        if process.poll() is None:
+            process.wait()
+        return
+    except OSError:
+        if process.poll() is None:
+            process.terminate()
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            if process.poll() is None:
+                process.kill()
+
+    if process.poll() is not None:
+        process.wait()
+        return
+    try:
+        process.wait(timeout=max(0.0, timeout))
+    except subprocess.TimeoutExpired:
+        process.wait()
+
+
 __all__ = [
     "HotUpdateJob",
     "PlannerCommandSpec",
     "build_planner_command",
+    "launch_planner_process",
     "planner_environment",
+    "terminate_planner_process",
 ]

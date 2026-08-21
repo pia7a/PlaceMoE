@@ -76,12 +76,7 @@ def test_tokenizer_config_enables_transformers_v5_regex_fix(tmp_path: Path) -> N
 
 def test_generated_deepseek_experts_use_opslot_layer_registration() -> None:
     generated_root = (
-        Path(__file__).resolve().parents[2]
-        / "veomni"
-        / "models"
-        / "transformers"
-        / "deepseek_v3"
-        / "generated"
+        Path(__file__).resolve().parents[2] / "veomni" / "models" / "transformers" / "deepseek_v3" / "generated"
     )
     for backend in ("gpu", "npu"):
         source = (generated_root / f"patched_modeling_deepseek_v3_{backend}.py").read_text()

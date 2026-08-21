@@ -359,9 +359,7 @@ def _assign_tokens_to_copies_exact_vectorized(
     num_combinations = int(choices.shape[0])
     valid = torch.ones((num_tokens, num_combinations), dtype=torch.bool, device=selected.device)
     for route_index in range(top_k):
-        valid.logical_and_(
-            selected_copy_valid[:, route_index].index_select(1, choices[:, route_index])
-        )
+        valid.logical_and_(selected_copy_valid[:, route_index].index_select(1, choices[:, route_index]))
 
     sorted_selected = selected.sort(dim=-1).values
     if top_k > 1 and bool((sorted_selected[:, 1:] == sorted_selected[:, :-1]).any().item()):
@@ -379,11 +377,7 @@ def _assign_tokens_to_copies_exact_vectorized(
                     )
 
     hierarchy_levels = sorted(
-        {
-            max(1, int(group_size))
-            for group_size in hierarchy_group_sizes
-            if 1 < int(group_size) < int(num_ranks)
-        },
+        {max(1, int(group_size)) for group_size in hierarchy_group_sizes if 1 < int(group_size) < int(num_ranks)},
         reverse=True,
     )
     hierarchy_levels.append(1)

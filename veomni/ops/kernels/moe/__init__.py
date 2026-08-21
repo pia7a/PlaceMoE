@@ -117,6 +117,7 @@ def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
 # OpSlot kernel registrations
 
 from ....distributed.moe.hiermoe import get_hiermoe_expert_layer_key, get_hiermoe_expert_layer_key_from_params
+from ....distributed.moe.hiermoe.placemoe.model_adapter import require_moe_model_adapter
 from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
 
 
@@ -128,30 +129,28 @@ def _make_moe_experts_adapter(raw_forward):
 
         veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
 
-    The raw kernels (``group_gemm_fused_moe_forward`` /
-    ``quack_gemm_fused_moe_forward``) instead take the flat tensor-level
-    signature ``(num_experts, routing_weights, selected_experts,
-    hidden_states, fc1_1_weight, fc1_2_weight, fc2_weight,
-    fc1_1_2_weight)``. This adapter pulls ``num_experts``/``gate_up_proj``/
-    ``down_proj`` off ``self`` and forwards everything else positionally so
-    the OpSlot stays a drop-in replacement for the HF ``forward``.
+    The raw kernels instead take a flat tensor-level signature.  A registered
+    PlaceMoE model adapter normalizes fused and split expert projections to
+    that signature, keeping this OpSlot independent of model attribute names.
     """
 
     def adapter(self, hidden_states, top_k_index, top_k_weights):
+        model_adapter = require_moe_model_adapter(self)
+        weights = model_adapter.kernel_weights(self)
         layer_key = get_hiermoe_expert_layer_key(self) or getattr(
             self,
             "_veomni_physical_load_layer_key",
             None,
         )
         return raw_forward(
-            num_experts=self.num_experts,
+            num_experts=model_adapter.num_experts(self),
             routing_weights=top_k_weights.to(hidden_states.dtype),
             selected_experts=top_k_index,
             hidden_states=hidden_states,
-            fc1_1_weight=None,
-            fc1_2_weight=None,
-            fc2_weight=self.down_proj,
-            fc1_1_2_weight=self.gate_up_proj,
+            fc1_1_weight=weights.fc1_1_weight,
+            fc1_2_weight=weights.fc1_2_weight,
+            fc2_weight=weights.fc2_weight,
+            fc1_1_2_weight=weights.fc1_1_2_weight,
             layer_key=layer_key,
         )
 

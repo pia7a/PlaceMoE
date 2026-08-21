@@ -252,7 +252,7 @@ def _refine_normalized_seed(
         rows = np.arange(len(left))
         candidate_loads[rows, left_parts] += demand[right] - demand[left]
         candidate_loads[rows, right_parts] += demand[left] - demand[right]
-        candidate_imbalance = ((((candidate_loads / total_demand) - target) ** 2)).sum(axis=1)
+        candidate_imbalance = (((candidate_loads / total_demand) - target) ** 2).sum(axis=1)
         score_gain = affinity_gain / total_affinity - float(config.seed_load_weight) * (
             candidate_imbalance - current_imbalance
         )
@@ -307,9 +307,7 @@ def _refine_normalized_compatibility(
                     continue
                 old_affinity = affinity_to_part[lhs, lhs_part] + affinity_to_part[rhs, rhs_part]
                 new_affinity = (
-                    affinity_to_part[lhs, rhs_part]
-                    + affinity_to_part[rhs, lhs_part]
-                    - 2.0 * affinity[lhs, rhs]
+                    affinity_to_part[lhs, rhs_part] + affinity_to_part[rhs, lhs_part] - 2.0 * affinity[lhs, rhs]
                 )
                 affinity_delta = float(new_affinity - old_affinity) / total_affinity
 
@@ -325,9 +323,7 @@ def _refine_normalized_compatibility(
                     - (rhs_fraction - 1.0 / parts) ** 2
                 )
                 score_delta = affinity_delta - float(config.seed_load_weight) * imbalance_delta
-                if score_delta > float(config.improvement_tolerance) and (
-                    best is None or score_delta > best[0]
-                ):
+                if score_delta > float(config.improvement_tolerance) and (best is None or score_delta > best[0]):
                     best = (score_delta, lhs, rhs)
         if best is None:
             break

@@ -410,9 +410,7 @@ def test_swap_select_matches_eager_with_nonzero_runtime_costs(max_swaps):
     assert fused_actions[:accepted].cpu().tolist() == expected_actions
     assert torch.equal(fused_layout.cpu(), eager_layout.cpu())
     assert torch.equal(fused_owners.cpu(), eager_owners.cpu())
-    expected_final_base = torch.cat(
-        planner._initial_swap_stats(token_hits, selected, fused_owners).base_counts
-    )
+    expected_final_base = torch.cat(planner._initial_swap_stats(token_hits, selected, fused_owners).base_counts)
     assert torch.equal(final_base.cpu(), expected_final_base.cpu())
 
 
@@ -2128,9 +2126,7 @@ def test_replica_project_scores_multiple_expert_destination_edges_independently(
         layer_seed=29,
     )
     torch.npu.synchronize()
-    base_counts, assignment_loads, add_groups, add_assignments, _, _ = (
-        tensor.cpu() for tensor in projected
-    )
+    base_counts, assignment_loads, add_groups, add_assignments, _, _ = (tensor.cpu() for tensor in projected)
     baseline_mapping = assign_tokens_to_copies_with_quota(
         routes,
         layout,
@@ -2169,9 +2165,7 @@ def test_replica_project_scores_multiple_expert_destination_edges_independently(
                 layer_seed=29,
             )
             assert torch.equal(add_groups[logical, destination], candidate_counts - eager_counts)
-            assert torch.equal(
-                add_assignments[logical, destination], candidate_assignments - eager_assignments
-            )
+            assert torch.equal(add_assignments[logical, destination], candidate_assignments - eager_assignments)
     assert torch.count_nonzero(add_groups[2:]).item() == 0
     assert torch.count_nonzero(add_assignments[2:]).item() == 0
 
@@ -2198,9 +2192,7 @@ def test_replica_project_one_copy_keeps_exact_assignment_for_unsampled_expert():
     )
     torch.npu.synchronize()
 
-    base_counts, assignment_loads, add_groups, add_assignments, _, _ = (
-        tensor.cpu() for tensor in projected
-    )
+    base_counts, assignment_loads, add_groups, add_assignments, _, _ = (tensor.cpu() for tensor in projected)
     assert torch.equal(base_counts, torch.tensor([2.0, 0.0]))
     assert torch.equal(assignment_loads, torch.tensor([2.0, 7.0]))
     assert torch.count_nonzero(add_groups[1]).item() == 0

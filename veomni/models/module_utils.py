@@ -46,6 +46,7 @@ from ..utils.device import get_device_type, synchronize
 from ..utils.helper import empty_cache, get_cache_dir, get_dtype_size
 from ..utils.import_utils import is_diffusers_available
 from .checkpoint_tensor_loading import get_checkpoint_tensor_converter, maybe_convert_checkpoint_tensor
+from .moe_parameter import is_stacked_expert_parameter_name
 
 
 if TYPE_CHECKING:
@@ -68,7 +69,7 @@ def _is_hiermoe_redundant_slot_expert_param(
 ) -> bool:
     if para_group_name != "ep" or len(tensor_shape) < 1 or len(target_shape) < 1:
         return False
-    if not parameter_name.endswith((".experts.gate_up_proj", ".experts.down_proj")):
+    if not is_stacked_expert_parameter_name(parameter_name):
         return False
     if tensor_shape[0] % int(para_size) != 0:
         return False

@@ -65,6 +65,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+
 try:
     from transformers import initialization as init
 except ImportError:
@@ -72,6 +73,7 @@ except ImportError:
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
+
 try:
     from transformers.integrations import use_kernel_forward_from_hub
 except ImportError:
@@ -86,6 +88,7 @@ except ImportError:
 
     def use_kernelized_func(*args, **kwargs):
         return lambda cls: cls
+
 
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
@@ -103,12 +106,14 @@ from transformers.utils import (
     TransformersKwargs,
     can_return_tuple,
 )
+
 try:
     from transformers.utils import is_grouped_mm_available
 except ImportError:
 
     def is_grouped_mm_available():
         return False
+
 
 try:
     from transformers.utils.generic import is_flash_attention_requested, maybe_autocast, merge_with_config_defaults
@@ -124,6 +129,7 @@ except ImportError:
 
     def merge_with_config_defaults(func):
         return func
+
 
 try:
     from transformers.utils.output_capturing import OutputRecorder, capture_outputs
@@ -146,6 +152,7 @@ def auto_docstring(obj=None, **kwargs):
         return target
 
     return decorator
+
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
@@ -1428,7 +1435,9 @@ class Qwen3VLMoeTextRotaryEmbedding(nn.Module):
 
         self.config = config
 
-        rope_parameters = getattr(self.config, "rope_parameters", None) or getattr(self.config, "rope_scaling", None) or {}
+        rope_parameters = (
+            getattr(self.config, "rope_parameters", None) or getattr(self.config, "rope_scaling", None) or {}
+        )
         self.rope_type = rope_parameters.get("rope_type", "default")
         rope_init_fn: Callable = self.compute_default_rope_parameters
         if self.rope_type != "default":

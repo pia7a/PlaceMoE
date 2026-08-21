@@ -185,21 +185,53 @@ def test_hot_update_passes_calibration_coefficients_to_planner(monkeypatch, tmp_
         assert command[command.index(flag) + 1] == value
 
 
-def test_canonical_hot_update_keeps_current_pair_when_planner_fails() -> None:
+def test_canonical_hot_update_keeps_current_pair_when_planner_fails(monkeypatch) -> None:
     manager = _runtime_manager()
     manager._hot_update_controller = HotUpdateController(100, 20, 500)
+    process = object()
     manager._hot_update_controller.active_job = SimpleNamespace(
         update_mode="mapping",
         source_step=20,
         planner_log_path="planner.log",
+        process=process,
     )
     manager.layers = {"layer": object()}
     manager.latest_pair = ""
     manager._pipeline_device = lambda _layer: torch.device("cpu")
     manager._hot_update_status = lambda _state, _device: 2
     manager._hot_update_event = lambda *_args, **_kwargs: None
+    terminated = []
+    monkeypatch.setattr(expert_swap_module, "terminate_planner_process", terminated.append)
 
     result = manager._run_hot_update_step(20)
 
     assert result == "placemoe_hot_update_failed:20"
+    assert terminated == [process]
     assert manager._hot_update_controller.active_job is None
+
+
+def test_hot_update_validates_all_layers_before_migration() -> None:
+    manager = _runtime_manager()
+    manager.layers = {
+        "layer.0": SimpleNamespace(key="layer.0", placement_version=0),
+        "layer.1": SimpleNamespace(key="layer.1", placement_version=0),
+    }
+    manager._pipeline_device = lambda _layer: torch.device("cpu")
+    manager._broadcast_hot_update_payload = lambda _state, _device: {"layers": {"layer.0": {}, "layer.1": {}}}
+    prepared = []
+
+    def prepare(layer, _payload, _mode):
+        prepared.append(layer)
+        if layer is manager.layers["layer.1"]:
+            raise RuntimeError("invalid second layer")
+
+    installed = []
+    manager._prepare_hot_update_layer = prepare
+    manager._install_hot_update_layout = lambda layer, _payload: installed.append(layer)
+    state = SimpleNamespace(placement_versions=(0, 0), update_mode="full")
+
+    with pytest.raises(RuntimeError, match="invalid second layer"):
+        manager._apply_hot_update(state, training_step=10)
+
+    assert prepared == [manager.layers["layer.0"], manager.layers["layer.1"]]
+    assert installed == []

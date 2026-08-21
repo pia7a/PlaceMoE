@@ -45,7 +45,8 @@ multimodal training, and GPU/NPU backends.
   state, while a full `L,M` update migrates expert parameters and optimizer
   states at a training-step boundary.
 - **Asynchronous planning.** CPU planning overlaps with training. Completed
-  artifacts are validated before an atomic mapping or layout installation.
+  artifacts for all layers are validated before installation at a training-step
+  boundary.
 - **Replica-gradient overlap.** Gradients of physical copies are aggregated
   without changing logical model semantics, and synchronization is overlapped
   with same-layer attention backward.
@@ -83,84 +84,116 @@ where those assignments execute physically.
 
 ## Installation
 
-PlaceMoE uses [uv](https://docs.astral.sh/uv/) and targets the dependency
-versions pinned in `pyproject.toml` and `uv.lock`. Python 3.11 is the validated
-environment.
+PlaceMoE uses [uv](https://docs.astral.sh/uv/). Python 3.11 is the validated
+environment, and the production path layers PlaceMoE over the tested VeOmni,
+CANN, PyTorch, and torch-npu base stack.
 
 ```bash
 git clone https://github.com/pia7a/PlaceMoE.git
 cd PlaceMoE
 
-# Ascend NPU on x86
-uv sync --extra npu --dev
-
-# Or use exactly one alternative hardware extra:
-# uv sync --extra npu_aarch64 --dev
-# uv sync --extra gpu --dev
+# Ascend NPU on aarch64 (the validated production path)
+python -m venv --system-site-packages .venv
+uv pip install --python .venv/bin/python --no-deps --no-build-isolation .
 
 source .venv/bin/activate
 ```
 
-The `gpu`, `npu`, and `npu_aarch64` extras are mutually exclusive. Distributed
-training additionally requires a working NCCL or HCCL environment and shared
-access to the model, dataset, and checkpoint paths referenced by the VeOmni
-training configuration.
+The current aarch64 release intentionally requires the validated preinstalled
+CANN, PyTorch, torch-npu, and VeOmni runtime stack; it does not provision that
+accelerator stack into a clean host. The `npu_aarch64` extra contains only the
+additional Python development tools used on that stack. Distributed training
+also requires working HCCL and shared access to the configured model, dataset,
+and checkpoint paths. The production Dockerfile under `docker/ascend/`
+configures this boundary automatically.
+
+Build the validated production image with:
+
+```bash
+docker build -t placemoe:ascend -f docker/ascend/Dockerfile .
+```
+
+Override `BASE_IMAGE` only when the target cluster provides an equivalent
+Python 3.11 / CANN 9 / torch 2.9 / torch-npu 2.9 base image.
+
+On a new cluster, first calibrate the communication model with the same
+distributed topology as training. Run this on every node with its own
+`NODE_RANK`:
+
+```bash
+NNODES=2 NODE_RANK=0 NPROC_PER_NODE=8 \
+MASTER_ADDR=192.168.0.10 MASTER_PORT=29501 \
+  scripts/placemoe/calibrate_npu.sh calibration/runtime_perf_model.json \
+  --hierarchy-group-sizes-csv 8,16
+```
+
+See [PlaceMoE pre-training](docs/usage/placemoe_pretraining.md) for calibration
+and deployment details.
 
 ## Production configuration and launch
 
-The hardware-neutral production entry point is `VEOMNI_PLACEMOE_CONFIG`. It
-points to one PlaceMoE YAML file for startup placement, calibration, planner
-resources, and training-time updates, and can be used with the normal VeOmni
-launcher on either GPU or NPU:
+PlaceMoE is configured inside the normal VeOmni training YAML. The canonical
+preset selects hierarchical token deduplication, source-aware dispatch,
+step-boundary updates, and replica-gradient overlap; users do not configure the
+historical swap/cover planners.
 
-```bash
-export VEOMNI_PLACEMOE_CONFIG=$(realpath configs/placemoe/local.yaml)
-# Start the regular tasks/train_vlm.py command for the selected accelerator.
-```
-
-Before launching, create `configs/placemoe/local.yaml` from the following
-template and ensure that its artifact paths exist in your environment:
+Add the following block to a Qwen, DeepSeek, or another VeOmni MoE training
+configuration and replace the deployment-specific paths and topology:
 
 ```yaml
-placemoe:
-  initial_artifact: ../../results/placemoe_layout.json
-  runtime_perf_model: ../../results/placemoe_runtime_perf_model.json
-  calibration:
-    artifact: calibration/placemoe_calibration.json
-  hot_update:
-    enabled: true
-    layout_interval_steps: 100
-    mapping_interval_steps: 20
-    last_update_step: 500
-    work_root: ../../profile/runs/pretrain/placemoe_hot_update
-    failure_policy: continue
-  resources:
-    workers: 48
-    candidate_workers: 4
-    worker_threads: 1
+train:
+  accelerator:
+    ep_size: 16
+    dp_shard_size: 16
+  hiermoe:
+    redundant_slot_increment_per_device: 4
+    hierarchy_group_sizes: [8, 16]
+    placemoe:
+      enabled: true
+      base_directory: /shared/placemoe
+      initial_artifact: ""  # optional; empty starts from the default layout
+      runtime_perf_model: calibration/runtime_perf_model.json
+      calibration:
+        artifact: calibration/placemoe_calibration.json
+      hot_update:
+        enabled: true
+        layout_interval_steps: 100
+        mapping_interval_steps: 20
+        work_root: runs/placemoe_planner
+        failure_policy: continue
+      resources:
+        workers: 48
+        candidate_workers: 4
+        worker_threads: 1
 ```
 
-All paths are resolved relative to the PlaceMoE configuration file. The
-planner automatically reserves a NUMA-balanced subset of the CPUs visible to
-the training process and keeps complete SMT sibling groups together. Explicit
-`planner_cpu_ids` and `training_cpu_ids` remain available as a paired advanced
-override. Validate the initial artifact, topology, calibration metadata,
-runtime performance model, and CPU affinities before launching:
+`redundant_slot_increment_per_device`, `hierarchy_group_sizes`, and both
+calibration artifacts describe the target model and cluster. If
+`initial_artifact` is empty, configure a positive layout interval so PlaceMoE
+can create replicas after collecting routes. Validate the environment and all
+paths before reserving a distributed job:
 
 ```bash
-python scripts/placemoe/validate_config.py \
-  configs/placemoe/local.yaml
+.venv/bin/placemoe doctor --config configs/my_train.yaml
 ```
 
-The scripts under `scripts/placemoe/reproduction/` preserve the NPU and GPU
-EP32 paper testbeds. They are examples for their recorded cluster allocations,
-not additional runtime interfaces. The canonical optimizer and artifact schema
-are independent of a particular accelerator or EP size; the configuration,
-routing snapshots, slot capacities, and calibration artifacts must describe
-the target deployment consistently.
+Run the same checkout and configuration on every node. For a 2-node Ascend
+job, for example:
 
-See [PlaceMoE pre-training](docs/usage/placemoe_pretraining.md) for deployment,
-source synchronization, artifact distribution, and failure-policy details.
+```bash
+NNODES=2 NODE_RANK=0 NPROC_PER_NODE=8 \
+MASTER_ADDR=192.168.0.10 MASTER_PORT=29500 \
+  scripts/placemoe/launch_npu.sh tasks/train_vlm.py configs/my_train.yaml
+```
+
+Set `NODE_RANK=1` on the second node. The launcher is model agnostic: use
+`tasks/train_vlm.py` for multimodal models and `tasks/train_text.py` for text
+models. Model-specific expert tensors are exposed through
+`MoEModelAdapter`; stacked fused and split gate/up projections work without a
+model-name branch, and other layouts can register a small adapter.
+
+Scripts under `scripts/placemoe/reproduction/` preserve paper testbeds and are
+not production configuration interfaces.
 
 ## Controlling layout and mapping updates
 
@@ -185,7 +218,9 @@ are coalesced while training continues with the current pair. With
 | --- | --- |
 | `veomni/distributed/moe/hiermoe/placemoe/` | Routing statistics, allocation, placement, mapping, exact-cost optimization, and artifact validation. |
 | `veomni/distributed/moe/hiermoe/placemoe/runtime/` | Typed configuration, independent update scheduling, asynchronous planner control, and process construction. |
+| `veomni/distributed/moe/hiermoe/placemoe/model_adapter.py` | Stable model boundary for expert parameters and fused-kernel weights. |
 | `scripts/profile/plan_placemoe.py` | Canonical offline and runtime planner CLI. |
+| `scripts/placemoe/launch_npu.sh` | Thin, model-independent multi-node NPU launcher. |
 | `scripts/placemoe/reproduction/npu_ep32.sh` | Original NPU EP32 paper-reproduction launcher. |
 | `scripts/placemoe/reproduction/gpu_ep32/` | GPU EP32 calibration and paper-reproduction matrix. |
 | `configs/placemoe/` | Example runtime and calibration configurations. |
@@ -197,10 +232,13 @@ python scripts/profile/plan_placemoe.py --help
 ```
 
 The historical `build_hiermoe_recursive_classifier_layout.py` command is a
-deprecated compatibility wrapper. New integrations should use
-`plan_placemoe.py` or set `VEOMNI_PLACEMOE_CONFIG`; legacy
-`VEOMNI_HIERMOE_*` variables remain available only for older launchers and
-paper-reproduction workflows.
+deprecated compatibility wrapper. New integrations use `plan_placemoe.py` and
+the nested `train.hiermoe.placemoe` configuration. `VEOMNI_PLACEMOE_CONFIG`
+and legacy `VEOMNI_HIERMOE_*` variables remain only for older launchers and
+paper-reproduction workflows. Using `VEOMNI_PLACEMOE_CONFIG` additionally
+requires `VEOMNI_PLACEMOE_USE_LEGACY_CONFIG=1`; otherwise the canonical inline
+configuration is used. The legacy `config_path` input is exclusive and cannot
+be mixed with inline PlaceMoE fields.
 
 For a module-by-module explanation, see the
 [PlaceMoE code map](docs/perf/placemoe_code_map.md).
@@ -238,7 +276,8 @@ documented separately:
   workflow across supported deployments.
 - A mapping-only update replaces the runtime lookup table without expert-state
   movement; a full update migrates expert parameters and optimizer states and
-  atomically installs `L,M` at a step boundary.
+  installs `L,M` at a training-step boundary after validating all layer
+  artifacts.
 - PlaceMoE does not currently support FSDP2 CPU offload when replicated expert
   placement is enabled.
 

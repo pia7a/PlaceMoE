@@ -1,11 +1,13 @@
 """Typed configuration for PlaceMoE training-time updates.
 
-The canonical interface is a YAML or JSON file referenced by
-``VEOMNI_PLACEMOE_CONFIG``.
+The canonical interface is the nested ``train.hiermoe.placemoe`` block in the
+VeOmni training YAML. A standalone YAML/JSON file and
+``VEOMNI_PLACEMOE_CONFIG`` remain compatibility inputs for archived launchers.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from dataclasses import dataclass, field
@@ -113,6 +115,7 @@ class PlaceMoECalibration:
         artifact = _resolve_path(data.pop("artifact", ""), base_directory, "calibration.artifact")
         require_scope = _strict_bool(data.pop("require_scope", False), "calibration.require_scope")
         expected_scope = dict(_mapping(data.pop("expected_scope", None), "calibration.expected_scope"))
+        data = {key: value for key, value in data.items() if value is not None}
         if require_scope and not artifact:
             raise PlaceMoEConfigurationError("calibration.artifact is required when require_scope is true.")
         if require_scope and not expected_scope:
@@ -239,7 +242,7 @@ class PlaceMoEPlannerResources:
 @dataclass(frozen=True)
 class HotUpdateConfig:
     enabled: bool = False
-    layout_interval_steps: int | None = None
+    layout_interval_steps: int = 0
     mapping_interval_steps: int = 0
     last_update_step: int = 2**31 - 1
     work_root: str = "/tmp/veomni_placemoe_hot_update"
@@ -261,9 +264,9 @@ class HotUpdateConfig:
         if unknown:
             raise PlaceMoEConfigurationError(f"unknown hot_update fields: {', '.join(unknown)}.")
         defaults = cls()
-        layout_raw = payload.get("layout_interval_steps", defaults.layout_interval_steps)
-        layout_interval = (
-            None if layout_raw is None else _nonnegative_int(layout_raw, "hot_update.layout_interval_steps")
+        layout_interval = _nonnegative_int(
+            payload.get("layout_interval_steps", defaults.layout_interval_steps),
+            "hot_update.layout_interval_steps",
         )
         failure_policy = str(payload.get("failure_policy", defaults.failure_policy)).strip().lower()
         if failure_policy not in {"continue", "raise"}:
@@ -292,12 +295,45 @@ class HotUpdateConfig:
 class PlaceMoERuntimeConfig:
     """Complete runtime configuration with a strict file interface."""
 
+    enabled: bool = False
     initial_artifact: str = ""
     runtime_perf_model: str = ""
     hot_update: HotUpdateConfig = field(default_factory=HotUpdateConfig)
     calibration: PlaceMoECalibration = field(default_factory=PlaceMoECalibration)
     resources: PlaceMoEPlannerResources = field(default_factory=PlaceMoEPlannerResources)
     source_path: str = ""
+
+    @classmethod
+    def from_mapping(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        base_directory: str | os.PathLike[str] | None = None,
+        source_path: str = "",
+    ) -> "PlaceMoERuntimeConfig":
+        root = _mapping(payload, "PlaceMoE config")
+        if "placemoe" in root:
+            root = _mapping(root["placemoe"], "placemoe")
+        allowed = {"enabled", "initial_artifact", "runtime_perf_model", "hot_update", "calibration", "resources"}
+        unknown = sorted(set(root) - allowed)
+        if unknown:
+            raise PlaceMoEConfigurationError(f"unknown PlaceMoE fields: {', '.join(unknown)}.")
+        resolved_base = Path.cwd() if base_directory is None else Path(base_directory).expanduser().resolve()
+        result = cls(
+            enabled=_strict_bool(root.get("enabled", False), "enabled"),
+            initial_artifact=_resolve_path(root.get("initial_artifact", ""), resolved_base, "initial_artifact"),
+            runtime_perf_model=_resolve_path(root.get("runtime_perf_model", ""), resolved_base, "runtime_perf_model"),
+            hot_update=HotUpdateConfig.from_mapping(
+                _mapping(root.get("hot_update"), "hot_update"), base_directory=resolved_base
+            ),
+            calibration=PlaceMoECalibration.from_mapping(
+                _mapping(root.get("calibration"), "calibration"), base_directory=resolved_base
+            ),
+            resources=PlaceMoEPlannerResources.from_mapping(_mapping(root.get("resources"), "resources")),
+            source_path=source_path,
+        )
+        result.validate()
+        return result
 
     @classmethod
     def from_file(cls, path: str | os.PathLike[str]) -> "PlaceMoERuntimeConfig":
@@ -308,28 +344,38 @@ class PlaceMoERuntimeConfig:
             payload = json.loads(config_path.read_text(encoding="utf-8"))
         else:
             payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-        root = _mapping(payload, "PlaceMoE config")
-        if "placemoe" in root:
-            root = _mapping(root["placemoe"], "placemoe")
-        allowed = {"initial_artifact", "runtime_perf_model", "hot_update", "calibration", "resources"}
-        unknown = sorted(set(root) - allowed)
-        if unknown:
-            raise PlaceMoEConfigurationError(f"unknown PlaceMoE fields: {', '.join(unknown)}.")
-        base_directory = config_path.parent
-        result = cls(
-            initial_artifact=_resolve_path(root.get("initial_artifact", ""), base_directory, "initial_artifact"),
-            runtime_perf_model=_resolve_path(root.get("runtime_perf_model", ""), base_directory, "runtime_perf_model"),
-            hot_update=HotUpdateConfig.from_mapping(
-                _mapping(root.get("hot_update"), "hot_update"), base_directory=base_directory
-            ),
-            calibration=PlaceMoECalibration.from_mapping(
-                _mapping(root.get("calibration"), "calibration"), base_directory=base_directory
-            ),
-            resources=PlaceMoEPlannerResources.from_mapping(_mapping(root.get("resources"), "resources")),
-            source_path=str(config_path),
+        return cls.from_mapping(payload, base_directory=config_path.parent, source_path=str(config_path))
+
+    @classmethod
+    def from_training_config(cls, config: Any) -> "PlaceMoERuntimeConfig":
+        """Build the runtime config from ``train.hiermoe.placemoe``.
+
+        ``config_path`` keeps existing standalone files working.  Otherwise
+        the nested training YAML is the single source of truth.
+        """
+
+        if config is None:
+            return cls()
+        payload = (
+            dataclasses.asdict(config) if dataclasses.is_dataclass(config) else dict(_mapping(config, "placemoe"))
         )
-        result.validate()
-        return result
+        config_path = str(payload.pop("config_path", "") or "").strip()
+        base_directory = str(payload.pop("base_directory", "") or "").strip()
+        if config_path:
+            if _training_payload_has_runtime_values(payload, config):
+                raise PlaceMoEConfigurationError(
+                    "train.hiermoe.placemoe.config_path is a legacy, exclusive input; "
+                    "remove the inline PlaceMoE fields or remove config_path."
+                )
+            path = Path(os.path.expandvars(os.path.expanduser(config_path)))
+            if not path.is_absolute() and base_directory:
+                path = Path(base_directory).expanduser() / path
+            return cls.from_file(path)
+        return cls.from_mapping(
+            payload,
+            base_directory=base_directory or Path.cwd(),
+            source_path="train.hiermoe.placemoe",
+        )
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> "PlaceMoERuntimeConfig":
@@ -341,10 +387,54 @@ class PlaceMoERuntimeConfig:
 
     def validate(self) -> None:
         if self.hot_update.enabled:
-            if not self.initial_artifact:
-                raise PlaceMoEConfigurationError("initial_artifact is required when PlaceMoE hot updates are enabled.")
             if not self.hot_update.work_root:
                 raise PlaceMoEConfigurationError("hot_update.work_root must not be empty.")
+
+
+def _training_payload_has_runtime_values(payload: Mapping[str, Any], config: Any) -> bool:
+    """Return whether a training config changes any field beside file location.
+
+    Dataclass instances always contain every default, so comparing them with a
+    fresh instance distinguishes a real inline configuration from parser
+    defaults.  Mapping inputs are normally hand-written and therefore treat
+    every remaining key as explicit.
+    """
+
+    if dataclasses.is_dataclass(config):
+        try:
+            defaults = dataclasses.asdict(type(config)())
+        except TypeError:
+            return True
+        defaults.pop("config_path", None)
+        defaults.pop("base_directory", None)
+        return dict(payload) != defaults
+    return bool(payload)
+
+
+def training_config_is_explicit(config: Any) -> bool:
+    """Whether ``train.hiermoe.placemoe`` contains non-default input."""
+
+    if config is None:
+        return False
+    if dataclasses.is_dataclass(config):
+        try:
+            return dataclasses.asdict(config) != dataclasses.asdict(type(config)())
+        except TypeError:
+            return True
+    return bool(_mapping(config, "placemoe"))
+
+
+_CURRENT_RUNTIME_CONFIG = PlaceMoERuntimeConfig()
+
+
+def set_current_runtime_config(config: PlaceMoERuntimeConfig) -> None:
+    global _CURRENT_RUNTIME_CONFIG
+    config.validate()
+    _CURRENT_RUNTIME_CONFIG = config
+
+
+def get_current_runtime_config() -> PlaceMoERuntimeConfig:
+    return _CURRENT_RUNTIME_CONFIG
 
 
 __all__ = [
@@ -353,4 +443,7 @@ __all__ = [
     "PlaceMoEConfigurationError",
     "PlaceMoEPlannerResources",
     "PlaceMoERuntimeConfig",
+    "get_current_runtime_config",
+    "set_current_runtime_config",
+    "training_config_is_explicit",
 ]

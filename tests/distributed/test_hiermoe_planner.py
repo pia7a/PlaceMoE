@@ -60,11 +60,7 @@ def _exhaustive_copy_assignment(
 ) -> torch.Tensor:
     num_ranks = layout.numel() // slots_per_rank
     hierarchy_levels = sorted(
-        {
-            int(group_size)
-            for group_size in hierarchy_group_sizes
-            if 1 < int(group_size) < num_ranks
-        },
+        {int(group_size) for group_size in hierarchy_group_sizes if 1 < int(group_size) < num_ranks},
         reverse=True,
     )
     hierarchy_levels.append(1)
@@ -129,9 +125,7 @@ def _exhaustive_copy_assignment(
         for item in tied:
             combination_id = item[1]
             mixed = (
-                candidate_hashes[combination_id] * (tie_target + 1_000_003)
-                + tie_target * 48_271
-                + 1
+                candidate_hashes[combination_id] * (tie_target + 1_000_003) + tie_target * 48_271 + 1
             ) % tie_modulus
             tie_score = (mixed * 48_271 + 1) % tie_modulus
             scored_ties.append((tie_score, combination_id, item))
@@ -235,13 +229,7 @@ def _communication_objectives(
         source_rank = int(source_ranks[token_index])
         objectives.append(
             tuple(
-                len(
-                    {
-                        rank // group_size
-                        for rank in ranks
-                        if rank // group_size != source_rank // group_size
-                    }
-                )
+                len({rank // group_size for rank in ranks if rank // group_size != source_rank // group_size})
                 for group_size in (*hierarchy_group_sizes[:-1], 1)
             )
         )
