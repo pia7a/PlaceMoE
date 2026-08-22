@@ -5188,17 +5188,25 @@ class ExpertSwapManager:
     def _register_pipeline_gradient_hooks(self, layer: ExpertLayerState) -> None:
         if not self.gradient_overlap_enabled:
             return
+        unsupported = [
+            index
+            for index, param in enumerate(layer.expert_parameters)
+            if not callable(getattr(param, "register_post_accumulate_grad_hook", None))
+        ]
+        if unsupported:
+            raise RuntimeError(
+                "PlaceMoE requires replica-gradient overlap, but layer "
+                f"{layer.key!r} cannot register post-accumulate hooks for expert parameter indices "
+                f"{unsupported}. Disable PlaceMoE explicitly or use a supported PyTorch parameter implementation; "
+                "blocking synchronization is not selected automatically."
+            )
+
+        registered_handles: list[Any] = []
+        registered_param_ids: list[int] = []
         for param_index, param in enumerate(layer.expert_parameters):
             if id(param) in self._pipeline_grad_hook_params:
                 continue
             register = getattr(param, "register_post_accumulate_grad_hook", None)
-            if register is None:
-                logger.warning_rank0(
-                    "HierMoE gradient overlap cannot register a post-accumulate hook for layer %s; "
-                    "that layer will synchronize at the optimizer deadline.",
-                    layer.key,
-                )
-                continue
 
             def hook(_param: torch.Tensor, *, key: str = layer.key, index: int = param_index) -> None:
                 device = _local_tensor_view(_param).device
@@ -5207,15 +5215,20 @@ class ExpertSwapManager:
             try:
                 handle = register(hook)
             except (RuntimeError, TypeError) as error:
-                logger.warning_rank0(
-                    "HierMoE gradient overlap failed to register a gradient hook for layer %s: %s. "
-                    "The optimizer deadline fallback remains active.",
-                    layer.key,
-                    error,
-                )
-                continue
+                for registered_handle in registered_handles:
+                    registered_handle.remove()
+                    self._pipeline_grad_hook_handles.remove(registered_handle)
+                for param_id in registered_param_ids:
+                    self._pipeline_grad_hook_params.discard(param_id)
+                raise RuntimeError(
+                    "PlaceMoE requires replica-gradient overlap, but failed to register a gradient hook for "
+                    f"layer {layer.key!r}, parameter index {param_index}: {error}. Blocking synchronization is not "
+                    "selected automatically."
+                ) from error
             self._pipeline_grad_hook_handles.append(handle)
             self._pipeline_grad_hook_params.add(id(param))
+            registered_handles.append(handle)
+            registered_param_ids.append(id(param))
 
     def _pipeline_on_gradient_ready(
         self,
