@@ -123,33 +123,29 @@ After loading the image, follow the
 [Ascend container quick start](docs/usage/placemoe_container_quickstart.md)
 to mount NPUs, models, datasets, and configurations and launch training.
 
-On a new cluster, first calibrate the communication model with the same
-distributed topology as training. Run this on every node with its own
+After setting the runtime and planner artifact paths in the training YAML, the
+recommended preparation command creates only the missing artifacts. Run it on
+every node with the same distributed settings as training and change only
 `NODE_RANK`:
 
 ```bash
 NNODES=2 NODE_RANK=0 NPROC_PER_NODE=8 \
 MASTER_ADDR=192.168.0.10 MASTER_PORT=29501 \
-  scripts/placemoe/calibrate_npu.sh calibration/runtime_perf_model.json \
-  --hierarchy-group-sizes-csv 8,16
-```
-
-Then fit and validate the model-specific planner coefficients from the normal
-training YAML. Run this on every node with its own `NODE_RANK`; rank 0 writes
-the accepted artifact after a 5-step default-layout run:
-
-```bash
-NNODES=2 NODE_RANK=0 NPROC_PER_NODE=8 \
-MASTER_ADDR=192.168.0.10 MASTER_PORT=29502 \
-  placemoe calibrate-model \
+  placemoe prepare \
   --config configs/my_train.yaml \
-  --entrypoint tasks/train_vlm.py \
-  --runtime-perf-model calibration/runtime_perf_model.json \
-  --output calibration/placemoe_calibration.json
+  --entrypoint tasks/train_vlm.py
 ```
+
+The topology calibration is reusable across models on the same accelerator,
+communication backend, software stack, data type, and EP topology.
+The subsequent 5-step default-layout run fits model-dependent planner costs.
+Valid artifacts are reused; missing artifacts are generated, while an invalid
+existing artifact fails explicitly unless its stage is forced. Both stages
+remain available as separate `placemoe calibrate-runtime` and
+`placemoe calibrate-model` commands.
 
 See [PlaceMoE pre-training](docs/usage/placemoe_pretraining.md) for calibration
-and deployment details.
+reuse rules, separate commands, and deployment details.
 
 ## Production configuration and launch
 

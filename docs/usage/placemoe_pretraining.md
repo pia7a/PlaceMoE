@@ -31,52 +31,7 @@ To start a loaded image with NPU, model, dataset, configuration, and output
 mounts, follow [Running PlaceMoE from the validated Ascend
 image](placemoe_container_quickstart.md).
 
-## 2. Calibrate a new cluster topology
-
-Run the communication calibrator once with the same node and rank topology as
-training. For example, launch the following command on both nodes, changing
-only `NODE_RANK`:
-
-```bash
-NNODES=2 NODE_RANK=0 NPROC_PER_NODE=8 \
-MASTER_ADDR=192.168.0.10 MASTER_PORT=29501 \
-  scripts/placemoe/calibrate_npu.sh calibration/runtime_perf_model.json \
-  --hierarchy-group-sizes-csv 8,16
-```
-
-Rank 0 writes the fitted artifact. Make it available at the same path on every
-node before training. The benchmark measures A2A and hierarchy-level
-collectives over multiple message sizes; it is independent of the training
-model and dataset.
-
-## 3. Calibrate a new model
-
-Use the intended training YAML to fit the model-dependent planner costs. The
-artifact does not need to exist yet: this command derives an isolated
-default-layout run from the YAML and disables optimization, checkpoints, and
-parameter updates. Launch exactly one complete EP group on the required number
-of nodes, changing only `NODE_RANK`:
-
-```bash
-NNODES=2 NODE_RANK=0 NPROC_PER_NODE=8 \
-MASTER_ADDR=192.168.0.10 MASTER_PORT=29502 \
-  placemoe calibrate-model \
-  --config configs/my_train.yaml \
-  --entrypoint tasks/train_vlm.py \
-  --runtime-perf-model calibration/runtime_perf_model.json \
-  --output calibration/model_and_topology.json
-```
-
-The default run uses 5 steps: 2 warm-up steps, 1 fitting step, and 2 held-out
-validation steps. Rank 0 writes a scoped artifact only after validating the
-communication, expert-compute, and joint predictions; rejected artifacts
-cannot be used by the runtime. Use `tasks/train_text.py` for a text model and
-make the accepted artifact available at the same path on every node. The
-portable calibrator currently supports the validated 2-level node-to-rank
-hierarchy. Multi-node calibration also uses `MASTER_PORT+1` to exchange
-node-local timing summaries.
-
-## 4. Configure one VeOmni training YAML
+## 2. Configure one VeOmni training YAML
 
 Keep the model, dataset, distributed topology, and PlaceMoE settings in one
 file. The following block is the complete PlaceMoE surface:
@@ -129,7 +84,80 @@ to the canonical owners and the first full layout update creates replicas from
 profiled routes. Therefore a positive `layout_interval_steps` is required when
 `initial_artifact` is empty.
 
-## 5. Validate before launch
+## 3. Prepare calibration artifacts
+
+PlaceMoE has two reusable calibration stages. They do not generate `L` and
+`M`; the runtime planner generates those decisions from routes collected during
+the actual training job.
+
+| Artifact | Measures | Reuse boundary |
+| --- | --- | --- |
+| `runtime_perf_model` | Hierarchical A2A, state transfer, and gradient synchronization | Same hardware, EP size, ranks per node, and hierarchy |
+| `calibration.artifact` | Model-dependent communication and expert-compute coefficients | Same model, execution configuration, and topology |
+
+The recommended command checks both paths configured in the YAML, reuses valid
+artifacts, and creates only missing ones. Launch it on every node with the same
+distributed topology as training, changing only `NODE_RANK`:
+
+```bash
+NNODES=2 NODE_RANK=0 NPROC_PER_NODE=8 \
+MASTER_ADDR=192.168.0.10 MASTER_PORT=29501 \
+  placemoe prepare \
+  --config configs/my_train.yaml \
+  --entrypoint tasks/train_vlm.py
+```
+
+The model stage performs 5 default-layout steps: 2 warm-up steps, 1 fitting
+step, and 2 held-out validation steps. The accepted JSON is written at the
+configured path on every node. Use `tasks/train_text.py` for a text model.
+
+Cache handling is deliberate:
+
+- valid, byte-identical artifacts on every node are reused;
+- a missing artifact on any node is generated on all nodes;
+- an invalid or mismatched existing artifact stops preparation instead of
+  being silently overwritten; and
+- `--force-runtime` or `--force-model` explicitly replaces that stage. A
+  runtime recalibration also reruns model calibration because its provenance
+  records the runtime artifact hash.
+
+The cache validator fingerprints the model, representative data, execution
+settings, and training entrypoint in addition to checking model and topology
+scope. Use `--force-model` after a dependency or kernel upgrade that is not
+represented in the YAML or entrypoint.
+
+### Run the stages separately
+
+To calibrate only the topology, run the following on every node:
+
+```bash
+NNODES=2 NODE_RANK=0 NPROC_PER_NODE=8 \
+MASTER_ADDR=192.168.0.10 MASTER_PORT=29501 \
+  placemoe calibrate-runtime \
+  --output calibration/runtime_perf_model.json \
+  --hierarchy-group-sizes-csv 8,16
+```
+
+The communication benchmark is independent of the model and dataset. Then fit
+the model-dependent planner costs with:
+
+```bash
+NNODES=2 NODE_RANK=0 NPROC_PER_NODE=8 \
+MASTER_ADDR=192.168.0.10 MASTER_PORT=29502 \
+  placemoe calibrate-model \
+  --config configs/my_train.yaml \
+  --entrypoint tasks/train_vlm.py \
+  --runtime-perf-model calibration/runtime_perf_model.json \
+  --output calibration/model_and_topology.json
+```
+
+The standalone commands intentionally overwrite their requested outputs; use
+`placemoe prepare` when automatic reuse is desired. The portable preparation
+path currently supports the validated 2-level node-to-rank hierarchy and
+exactly one complete EP group. Keep `MASTER_PORT` and the next 4 ports free for
+torchrun, timing exchange, and preparation coordination.
+
+## 4. Validate before launch
 
 Run the deployment doctor on every node:
 
@@ -142,7 +170,7 @@ paths, runtime and planner calibration files, replica capacity, update
 schedule, and the canonical PlaceMoE preset. Warnings do not block launch;
 every `FAIL` should be resolved first.
 
-## 6. Launch on each node
+## 5. Launch on each node
 
 The launcher does not perform SSH orchestration. It runs the deployment doctor
 locally before torchrun, so use the same repository revision, training YAML,
@@ -164,7 +192,7 @@ Use `tasks/train_text.py` for a text model. Additional VeOmni command-line
 overrides may follow the YAML path. Set `PLACEMOE_SKIP_PREFLIGHT=1` only when an
 equivalent check is enforced by the cluster scheduler.
 
-## 7. Static and adaptive modes
+## 6. Static and adaptive modes
 
 `L` and `M` have independent schedules:
 
@@ -185,7 +213,7 @@ states, and install `L` and `M` at a training-step boundary.
 `failure_policy: continue` records planner failure and retains the current
 pair. Use `raise` when a failed adaptive update must terminate the job.
 
-## 8. Adapting another MoE model
+## 7. Adapting another MoE model
 
 PlaceMoE does not branch on model names. The default adapter supports expert
 modules whose leading dimension indexes local expert slots and that expose

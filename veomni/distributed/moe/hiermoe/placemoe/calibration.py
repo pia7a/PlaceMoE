@@ -285,8 +285,7 @@ def load_local_phase_timing_summary(
     paths = sorted(timing_directory.glob("moe_timing_rank*.jsonl"))
     if len(paths) != len(expected_rank_set):
         raise ModelCalibrationError(
-            f"expected {len(expected_rank_set)} local timing files, "
-            f"found {len(paths)} in {timing_directory}"
+            f"expected {len(expected_rank_set)} local timing files, found {len(paths)} in {timing_directory}"
         )
     rows: list[dict[str, Any]] = []
     for path in paths:
@@ -295,9 +294,7 @@ def load_local_phase_timing_summary(
                 rows.append(json.loads(line))
     observed_ranks = {int(row["rank"]) for row in rows}
     if observed_ranks != expected_rank_set:
-        raise ModelCalibrationError(
-            f"timing ranks are {sorted(observed_ranks)}, expected {sorted(expected_rank_set)}"
-        )
+        raise ModelCalibrationError(f"timing ranks are {sorted(observed_ranks)}, expected {sorted(expected_rank_set)}")
     by_key: dict[tuple[int, Any, str, str, int], float] = {}
     for payload in rows:
         step = int(payload["step"])
@@ -426,12 +423,16 @@ def merge_phase_timing_summaries(summaries: Sequence[Mapping[str, Any]]) -> tupl
     backward_compute = _positive(totals["backward_compute"], "backward expert-compute timing")
     communication_multiplier = (forward_communication + backward_communication) / forward_communication
     compute_multiplier = (forward_compute + backward_compute) / forward_compute
-    return communication_multiplier, compute_multiplier, {
-        "selected_steps": list(expected_steps or ()),
-        "timing_file_count": timing_file_count,
-        "rank_count": len(all_ranks),
-        **totals,
-    }
+    return (
+        communication_multiplier,
+        compute_multiplier,
+        {
+            "selected_steps": list(expected_steps or ()),
+            "timing_file_count": timing_file_count,
+            "rank_count": len(all_ranks),
+            **totals,
+        },
+    )
 
 
 def _model_identifier(root: Mapping[str, Any], explicit: str | None) -> str:
@@ -482,9 +483,7 @@ def build_planner_calibration_artifact(
             f"calibration report step is {calibration.get('step')}, expected {schedule.calibration_step}"
         )
     if len(validations) != schedule.validation_steps:
-        raise ModelCalibrationError(
-            f"expected {schedule.validation_steps} held-out reports, found {len(validations)}"
-        )
+        raise ModelCalibrationError(f"expected {schedule.validation_steps} held-out reports, found {len(validations)}")
     expected_validation_steps = list(range(schedule.calibration_step + 1, schedule.max_steps))
     actual_validation_steps = [int(report.get("step", -1)) for report in validations]
     if actual_validation_steps != expected_validation_steps:
@@ -514,8 +513,7 @@ def build_planner_calibration_artifact(
     for report in validations:
         features, actual = _forward_communication_rows(report, inter_beta, intra_beta)
         predicted_communication = [
-            network_scale * network + route_forward * assignments
-            for network, assignments in features
+            network_scale * network + route_forward * assignments for network, assignments in features
         ]
         variable_communication = [max(0.0, value - communication_intercept) for value in actual]
         communication_truth.extend(variable_communication)

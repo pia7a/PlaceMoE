@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Preflight command for portable PlaceMoE deployments."""
+"""Calibration, preparation, and preflight commands for PlaceMoE deployments."""
 
 from __future__ import annotations
 
@@ -23,10 +23,11 @@ import os
 import platform
 import subprocess
 import sys
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import yaml
 
@@ -44,6 +45,15 @@ from .calibration import (
     materialize_model_calibration_config,
     sha256_path,
     validate_runtime_performance_model,
+)
+from .preparation import (
+    CacheDecision,
+    CacheInspection,
+    build_preparation_spec,
+    decide_cache_action,
+    fingerprint_calibration_inputs,
+    inspect_planner_cache,
+    inspect_runtime_cache,
 )
 from .runtime import PlaceMoERuntimeConfig
 
@@ -349,7 +359,7 @@ def _doctor_command(args: argparse.Namespace) -> int:
     except (OSError, ValueError, yaml.YAMLError) as error:
         detail = str(error)
         if "calibration artifact" in detail:
-            detail += "; generate it with `placemoe calibrate-model`"
+            detail += "; generate it with `placemoe prepare` or `placemoe calibrate-model`"
         results = [CheckResult("configuration", "FAIL", detail)]
     if args.json:
         print(json.dumps([asdict(result) for result in results], indent=2))
@@ -371,8 +381,7 @@ def _distributed_environment() -> tuple[int, int, int, str, int]:
     master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1").strip()
     if nnodes < 1 or nproc_per_node < 1 or not 0 <= node_rank < nnodes:
         raise ModelCalibrationError(
-            f"invalid distributed launch: NNODES={nnodes}, NODE_RANK={node_rank}, "
-            f"NPROC_PER_NODE={nproc_per_node}"
+            f"invalid distributed launch: NNODES={nnodes}, NODE_RANK={node_rank}, NPROC_PER_NODE={nproc_per_node}"
         )
     if not master_addr or not 0 < master_port < 65536:
         raise ModelCalibrationError("MASTER_ADDR and MASTER_PORT must identify a valid rendezvous endpoint")
@@ -381,7 +390,7 @@ def _distributed_environment() -> tuple[int, int, int, str, int]:
 
 def _atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
     temporary.write_text(content, encoding="utf-8")
     temporary.replace(path)
 
@@ -454,6 +463,287 @@ def _wait_for_calibration_result(store: Any) -> dict[str, Any]:
     return json.loads(store.get(key).decode("utf-8"))
 
 
+def _parse_hierarchy_csv(value: str) -> tuple[int, ...]:
+    try:
+        hierarchy = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    except ValueError as error:
+        raise ModelCalibrationError("hierarchy group sizes must be comma-separated integers") from error
+    if not hierarchy or any(group_size <= 0 for group_size in hierarchy):
+        raise ModelCalibrationError("hierarchy group sizes must be positive")
+    return hierarchy
+
+
+def _resolve_runtime_backend(requested: str, device_type: str) -> str:
+    if requested != "auto":
+        return requested
+    return {"npu": "hccl", "cuda": "nccl", "cpu": "gloo"}.get(device_type, "gloo")
+
+
+def _calibrate_runtime_command(args: argparse.Namespace) -> int:
+    """Run standalone topology calibration through the canonical Python CLI."""
+
+    try:
+        output_path = Path(args.output).expanduser().resolve()
+        hierarchy = _parse_hierarchy_csv(args.hierarchy_group_sizes_csv)
+        nnodes, node_rank, nproc_per_node, master_addr, master_port = _distributed_environment()
+        if nnodes < 2:
+            raise ModelCalibrationError("portable PlaceMoE runtime calibration currently requires at least 2 nodes")
+        ep_size = nnodes * nproc_per_node
+        expected_hierarchy = (nproc_per_node, ep_size)
+        if hierarchy != expected_hierarchy:
+            raise ModelCalibrationError(
+                f"portable PlaceMoE calibration requires hierarchy_group_sizes={expected_hierarchy}, got {hierarchy}"
+            )
+        repository_root = Path(__file__).resolve().parents[5]
+        entrypoint = repository_root / "scripts" / "placemoe" / "calibrate_network.py"
+        if not entrypoint.is_file():
+            raise ModelCalibrationError(f"network calibration entrypoint not found: {entrypoint}")
+        python = os.environ.get("PLACEMOE_PYTHON", sys.executable)
+        command = [
+            python,
+            "-m",
+            "torch.distributed.run",
+            f"--nnodes={nnodes}",
+            f"--nproc-per-node={nproc_per_node}",
+            f"--node-rank={node_rank}",
+            f"--master-addr={master_addr}",
+            f"--master-port={master_port}",
+            str(entrypoint),
+            "--output-json",
+            str(output_path),
+            "--ep-size",
+            str(ep_size),
+            "--ranks-per-node",
+            str(nproc_per_node),
+            "--hierarchy-group-sizes-csv",
+            ",".join(str(value) for value in hierarchy),
+            "--backend",
+            str(args.backend),
+            "--dtype",
+            str(args.dtype),
+            "--message-bytes-csv",
+            str(args.message_bytes_csv),
+            "--warmup",
+            str(args.runtime_warmup),
+            "--iters",
+            str(args.runtime_iters),
+            "--measure-last-n",
+            str(args.runtime_measure_last_n),
+        ]
+        if args.details_json:
+            command.extend(("--details-json", str(Path(args.details_json).expanduser().resolve())))
+        work_root = (
+            Path(args.work_directory).expanduser().resolve()
+            if args.work_directory
+            else output_path.parent / f".{output_path.stem}.work"
+        )
+        log_path = work_root / f"node-{node_rank}" / "runtime-calibration.log"
+        return_code = _stream_training(command, environment=os.environ, log_path=log_path)
+        if return_code:
+            raise ModelCalibrationError(f"runtime calibration failed with exit code {return_code}; see {log_path}")
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        validate_runtime_performance_model(
+            _mapping(payload),
+            ep_size=ep_size,
+            ranks_per_node=nproc_per_node,
+            hierarchy_group_sizes=hierarchy,
+        )
+        print(f"PlaceMoE runtime calibration accepted: {output_path}")
+        return 0
+    except (OSError, ValueError, json.JSONDecodeError, ModelCalibrationError) as error:
+        print(f"PlaceMoE runtime calibration failed: {error}", file=sys.stderr)
+        return 2
+
+
+def _open_preparation_store(
+    *,
+    nnodes: int,
+    node_rank: int,
+    master_addr: str,
+    master_port: int,
+    port_offset: int,
+    timeout: timedelta | None = None,
+) -> Any | None:
+    if nnodes == 1:
+        return None
+    coordination_port = master_port + port_offset
+    if coordination_port >= 65536:
+        raise ModelCalibrationError(f"MASTER_PORT must be below {65536 - port_offset} for PlaceMoE preparation")
+    import torch.distributed as dist
+
+    return dist.TCPStore(
+        master_addr,
+        coordination_port,
+        nnodes,
+        node_rank == 0,
+        timeout=timeout or timedelta(hours=3),
+        wait_for_workers=True,
+    )
+
+
+def _coordinate_cache_decision(
+    inspection: CacheInspection,
+    *,
+    force: bool,
+    stage: str,
+    nnodes: int,
+    node_rank: int,
+    store: Any | None,
+) -> CacheDecision:
+    if store is None:
+        return decide_cache_action((inspection,), force=force)
+    prefix = f"placemoe-prepare/{stage}"
+    local_key = f"{prefix}/inspection/{node_rank}"
+    store.set(local_key, json.dumps(asdict(inspection), sort_keys=True))
+    inspection_keys = [f"{prefix}/inspection/{rank}" for rank in range(nnodes)]
+    store.wait(inspection_keys)
+    decision_key = f"{prefix}/decision"
+    if node_rank == 0:
+        inspections = [CacheInspection(**json.loads(store.get(key).decode("utf-8"))) for key in inspection_keys]
+        store.set(decision_key, json.dumps(asdict(decide_cache_action(inspections, force=force)), sort_keys=True))
+    store.wait([decision_key])
+    return CacheDecision(**json.loads(store.get(decision_key).decode("utf-8")))
+
+
+def _coordinate_stage_result(
+    inspection: CacheInspection,
+    *,
+    return_code: int,
+    stage: str,
+    nnodes: int,
+    node_rank: int,
+    store: Any | None,
+) -> tuple[int, str]:
+    if store is None:
+        if return_code == 0 and inspection.state == "valid":
+            return 0, inspection.detail
+        return 2, inspection.detail
+    prefix = f"placemoe-prepare/{stage}"
+    result_key = f"{prefix}/result/{node_rank}"
+    store.set(
+        result_key,
+        json.dumps(
+            {"return_code": int(return_code), "inspection": asdict(inspection)},
+            sort_keys=True,
+        ),
+    )
+    result_keys = [f"{prefix}/result/{rank}" for rank in range(nnodes)]
+    store.wait(result_keys)
+    final_key = f"{prefix}/final"
+    if node_rank == 0:
+        results = [json.loads(store.get(key).decode("utf-8")) for key in result_keys]
+        failures = [
+            f"node {rank}: {row['inspection']['detail']}"
+            for rank, row in enumerate(results)
+            if int(row["return_code"]) != 0 or row["inspection"]["state"] != "valid"
+        ]
+        digests = {
+            str(row["inspection"].get("digest") or "")
+            for row in results
+            if int(row["return_code"]) == 0 and row["inspection"]["state"] == "valid"
+        }
+        if not failures and ("" in digests or len(digests) != 1):
+            failures.append("generated artifacts differ across nodes")
+        final = {
+            "return_code": 2 if failures else 0,
+            "detail": "; ".join(failures) if failures else "valid on every node",
+        }
+        store.set(final_key, json.dumps(final, sort_keys=True))
+    store.wait([final_key])
+    final = json.loads(store.get(final_key).decode("utf-8"))
+    return int(final["return_code"]), str(final["detail"])
+
+
+def _coordinate_preparation_preflight(
+    local: Mapping[str, Any],
+    *,
+    nnodes: int,
+    node_rank: int,
+    store: Any | None,
+) -> tuple[int, str]:
+    if store is None:
+        return (0, "local inputs validated") if local.get("ok") else (2, str(local.get("error")))
+    prefix = "placemoe-prepare/preflight"
+    local_key = f"{prefix}/{node_rank}"
+    store.set(local_key, json.dumps(dict(local), sort_keys=True))
+    keys = [f"{prefix}/{rank}" for rank in range(nnodes)]
+    store.wait(keys)
+    final_key = f"{prefix}/final"
+    if node_rank == 0:
+        rows = [json.loads(store.get(key).decode("utf-8")) for key in keys]
+        failures = [f"node {rank}: {row.get('error')}" for rank, row in enumerate(rows) if not row.get("ok")]
+        identities = {json.dumps(row.get("identity"), sort_keys=True) for row in rows if row.get("ok")}
+        if not failures and len(identities) != 1:
+            failures.append("preparation inputs differ across nodes")
+        final = {
+            "return_code": 2 if failures else 0,
+            "detail": "; ".join(failures) if failures else "inputs match on every node",
+        }
+        store.set(final_key, json.dumps(final, sort_keys=True))
+    store.wait([final_key])
+    final = json.loads(store.get(final_key).decode("utf-8"))
+    return int(final["return_code"]), str(final["detail"])
+
+
+def _run_preparation_stage(
+    *,
+    stage: str,
+    force: bool,
+    inspect: Callable[[], CacheInspection],
+    run: Callable[[], int],
+    nnodes: int,
+    node_rank: int,
+    master_addr: str,
+    master_port: int,
+    port_offset: int,
+) -> tuple[int, bool]:
+    store = _open_preparation_store(
+        nnodes=nnodes,
+        node_rank=node_rank,
+        master_addr=master_addr,
+        master_port=master_port,
+        port_offset=port_offset,
+    )
+    try:
+        initial_inspection = inspect()
+    except Exception as error:
+        initial_inspection = CacheInspection("invalid", f"unexpected {stage} cache failure: {error}")
+    decision = _coordinate_cache_decision(
+        initial_inspection,
+        force=force,
+        stage=stage,
+        nnodes=nnodes,
+        node_rank=node_rank,
+        store=store,
+    )
+    if decision.action == "error":
+        print(f"PlaceMoE {stage} cache is invalid: {decision.detail}", file=sys.stderr)
+        return 2, False
+    if decision.action == "reuse":
+        print(f"PlaceMoE {stage} calibration reused: {decision.detail}")
+        return 0, False
+    print(f"PlaceMoE {stage} calibration running: {decision.detail}")
+    try:
+        return_code = run()
+        post_inspection = inspect()
+    except Exception as error:
+        return_code = 2
+        post_inspection = CacheInspection("invalid", f"unexpected {stage} failure: {error}")
+    final_code, detail = _coordinate_stage_result(
+        post_inspection,
+        return_code=return_code,
+        stage=stage,
+        nnodes=nnodes,
+        node_rank=node_rank,
+        store=store,
+    )
+    if final_code:
+        print(f"PlaceMoE {stage} calibration failed: {detail}", file=sys.stderr)
+    else:
+        print(f"PlaceMoE {stage} calibration ready: {detail}")
+    return final_code, True
+
+
 def _calibrate_model_command(args: argparse.Namespace) -> int:
     try:
         config_path = Path(args.config).expanduser().resolve()
@@ -481,9 +771,7 @@ def _calibrate_model_command(args: argparse.Namespace) -> int:
             )
         hierarchy = tuple(
             int(value)
-            for value in _mapping(_mapping(source.get("train")).get("hiermoe")).get(
-                "hierarchy_group_sizes", ()
-            )
+            for value in _mapping(_mapping(source.get("train")).get("hiermoe")).get("hierarchy_group_sizes", ())
         )
         expected_hierarchy = (nproc_per_node, ep_size)
         if hierarchy != expected_hierarchy:
@@ -583,12 +871,16 @@ def _calibrate_model_command(args: argparse.Namespace) -> int:
             if coordination_store is None:
                 raise ModelCalibrationError("distributed calibration coordination store is unavailable")
             result = _wait_for_calibration_result(coordination_store)
+            artifact_content = result.get("artifact_content")
+            if isinstance(artifact_content, str):
+                _atomic_write(output_path, artifact_content)
             if int(result["return_code"]):
                 print(f"PlaceMoE model calibration failed: {result['message']}", file=sys.stderr)
             else:
                 print(str(result["message"]))
             return int(result["return_code"])
 
+        artifact_content: str | None = None
         try:
             artifact = build_planner_calibration_artifact(
                 training_config=source,
@@ -602,7 +894,9 @@ def _calibrate_model_command(args: argparse.Namespace) -> int:
                 thresholds=thresholds,
                 model_id=args.model_id,
             )
-            _atomic_write(output_path, json.dumps(artifact, indent=2, sort_keys=True) + "\n")
+            artifact["provenance"]["calibration_input_sha256"] = fingerprint_calibration_inputs(source, entrypoint)
+            artifact_content = json.dumps(artifact, indent=2, sort_keys=True) + "\n"
+            _atomic_write(output_path, artifact_content)
             status = str(artifact["status"])
             return_code = 0 if status == "accepted" else 2
             message = f"PlaceMoE planner calibration {status}: {output_path}"
@@ -611,7 +905,11 @@ def _calibrate_model_command(args: argparse.Namespace) -> int:
             message = str(error)
         _publish_calibration_result(
             coordination_store,
-            {"return_code": return_code, "message": message},
+            {
+                "return_code": return_code,
+                "message": message,
+                "artifact_content": artifact_content,
+            },
         )
         if return_code:
             print(f"PlaceMoE model calibration failed: {message}", file=sys.stderr)
@@ -623,6 +921,172 @@ def _calibrate_model_command(args: argparse.Namespace) -> int:
         return 2
 
 
+def _prepare_command(args: argparse.Namespace) -> int:
+    """Reuse valid calibration artifacts and create only missing or forced stages."""
+
+    try:
+        nnodes, node_rank, nproc_per_node, master_addr, master_port = _distributed_environment()
+        source = None
+        spec = None
+        local_error = ""
+        identity: dict[str, Any] = {}
+        try:
+            config_path = Path(args.config).expanduser().resolve()
+            if not config_path.is_file():
+                raise ModelCalibrationError(f"training config not found: {config_path}")
+            source = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            if not isinstance(source, Mapping):
+                raise ModelCalibrationError("training config must contain a mapping")
+            OpsImplementationConfig(**dict(_mapping(_mapping(source.get("model")).get("ops_implementation"))))
+            runtime_device_type = get_device_type()
+            runtime_backend = _resolve_runtime_backend(args.runtime_backend, runtime_device_type)
+            spec = build_preparation_spec(
+                source,
+                config_path=config_path,
+                entrypoint=Path(args.entrypoint),
+                nnodes=nnodes,
+                nproc_per_node=nproc_per_node,
+                runtime_device_type=runtime_device_type,
+                runtime_backend=runtime_backend,
+                runtime_dtype=args.runtime_dtype,
+                model_id=args.model_id,
+            )
+            identity = {
+                "config_sha256": sha256_path(spec.config_path),
+                "entrypoint_sha256": sha256_path(spec.entrypoint),
+                "model_id": spec.model_id,
+                "ep_size": spec.ep_size,
+                "ranks_per_node": spec.ranks_per_node,
+                "hierarchy_group_sizes": list(spec.hierarchy_group_sizes),
+                "runtime_artifact": str(spec.runtime_artifact),
+                "planner_artifact": str(spec.planner_artifact),
+                "runtime_device_type": spec.runtime_device_type,
+                "runtime_backend": spec.runtime_backend,
+                "runtime_dtype": spec.runtime_dtype,
+                "calibration_input_sha256": spec.calibration_input_sha256,
+                "runtime_options": {
+                    "force": bool(args.force_runtime),
+                    "message_bytes_csv": args.runtime_message_bytes_csv,
+                    "warmup": args.runtime_warmup,
+                    "iters": args.runtime_iters,
+                    "measure_last_n": args.runtime_measure_last_n,
+                },
+                "model_options": {
+                    "force": bool(args.force_model),
+                    "warmup_steps": args.warmup_steps,
+                    "validation_steps": args.validation_steps,
+                    "compute_mape_threshold": args.compute_mape_threshold,
+                    "communication_mape_threshold": args.communication_mape_threshold,
+                    "joint_mape_threshold": args.joint_mape_threshold,
+                },
+            }
+        except Exception as error:
+            local_error = str(error)
+        preflight_store = _open_preparation_store(
+            nnodes=nnodes,
+            node_rank=node_rank,
+            master_addr=master_addr,
+            master_port=master_port,
+            port_offset=4,
+            timeout=timedelta(minutes=5),
+        )
+        preflight_code, preflight_detail = _coordinate_preparation_preflight(
+            {"ok": not local_error, "error": local_error, "identity": identity},
+            nnodes=nnodes,
+            node_rank=node_rank,
+            store=preflight_store,
+        )
+        if preflight_code:
+            print(f"PlaceMoE preparation preflight failed: {preflight_detail}", file=sys.stderr)
+            return preflight_code
+        if source is None or spec is None:
+            raise ModelCalibrationError("preparation inputs were not materialized after preflight")
+        work_root = (
+            Path(args.work_directory).expanduser().resolve()
+            if args.work_directory
+            else spec.planner_artifact.parent / ".placemoe-prepare.work"
+        )
+        runtime_args = argparse.Namespace(
+            output=str(spec.runtime_artifact),
+            hierarchy_group_sizes_csv=",".join(str(value) for value in spec.hierarchy_group_sizes),
+            backend=args.runtime_backend,
+            dtype=args.runtime_dtype,
+            message_bytes_csv=args.runtime_message_bytes_csv,
+            runtime_warmup=args.runtime_warmup,
+            runtime_iters=args.runtime_iters,
+            runtime_measure_last_n=args.runtime_measure_last_n,
+            details_json=None,
+            work_directory=str(work_root / "runtime"),
+        )
+        runtime_code, runtime_ran = _run_preparation_stage(
+            stage="runtime",
+            force=bool(args.force_runtime),
+            inspect=lambda: inspect_runtime_cache(spec.runtime_artifact, spec),
+            run=lambda: _calibrate_runtime_command(runtime_args),
+            nnodes=nnodes,
+            node_rank=node_rank,
+            master_addr=master_addr,
+            master_port=master_port,
+            port_offset=2,
+        )
+        if runtime_code:
+            return runtime_code
+
+        model_args = argparse.Namespace(
+            config=str(spec.config_path),
+            entrypoint=str(spec.entrypoint),
+            runtime_perf_model=str(spec.runtime_artifact),
+            output=str(spec.planner_artifact),
+            work_directory=str(work_root / "model"),
+            model_id=spec.model_id,
+            warmup_steps=args.warmup_steps,
+            validation_steps=args.validation_steps,
+            compute_mape_threshold=args.compute_mape_threshold,
+            communication_mape_threshold=args.communication_mape_threshold,
+            joint_mape_threshold=args.joint_mape_threshold,
+        )
+        runtime_sha256 = sha256_path(spec.runtime_artifact)
+        model_code, _model_ran = _run_preparation_stage(
+            stage="model",
+            force=bool(args.force_model or runtime_ran),
+            inspect=lambda: inspect_planner_cache(
+                spec.planner_artifact,
+                spec,
+                runtime_artifact_sha256=runtime_sha256,
+            ),
+            run=lambda: _calibrate_model_command(model_args),
+            nnodes=nnodes,
+            node_rank=node_rank,
+            master_addr=master_addr,
+            master_port=master_port,
+            port_offset=3,
+        )
+        if model_code:
+            return model_code
+        print("PlaceMoE calibration artifacts are ready; running deployment doctor.")
+        return _doctor_command(
+            argparse.Namespace(
+                config=str(spec.config_path),
+                allow_cpu=bool(args.allow_cpu),
+                json=False,
+            )
+        )
+    except (OSError, TypeError, ValueError, yaml.YAMLError, json.JSONDecodeError, ModelCalibrationError) as error:
+        print(f"PlaceMoE preparation failed: {error}", file=sys.stderr)
+        return 2
+
+
+def _add_model_fit_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--model-id", help="scope identifier; defaults to the model directory name")
+    parser.add_argument("--warmup-steps", type=int, default=2, help="warm-up steps before fitting (default: 2)")
+    parser.add_argument(
+        "--validation-steps", type=int, default=2, help="held-out validation steps after fitting (default: 2)"
+    )
+    parser.add_argument("--compute-mape-threshold", type=float, default=5.0)
+    parser.add_argument("--communication-mape-threshold", type=float, default=10.0)
+    parser.add_argument("--joint-mape-threshold", type=float, default=10.0)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="placemoe", description="PlaceMoE deployment and validation tools")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -631,6 +1095,24 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--allow-cpu", action="store_true", help="do not require torch_npu or visible NPUs")
     doctor.add_argument("--json", action="store_true", help="emit machine-readable results")
     doctor.set_defaults(handler=_doctor_command)
+    runtime = subparsers.add_parser(
+        "calibrate-runtime",
+        help="measure and fit topology-specific PlaceMoE runtime costs",
+    )
+    runtime.add_argument("--output", required=True, help="runtime performance model JSON")
+    runtime.add_argument("--hierarchy-group-sizes-csv", required=True, help="for example 8,16")
+    runtime.add_argument("--backend", default="auto")
+    runtime.add_argument("--dtype", default="bf16")
+    runtime.add_argument(
+        "--message-bytes-csv",
+        default="67108864,134217728,268435456,536870912",
+    )
+    runtime.add_argument("--warmup", dest="runtime_warmup", type=int, default=2)
+    runtime.add_argument("--iters", dest="runtime_iters", type=int, default=5)
+    runtime.add_argument("--measure-last-n", dest="runtime_measure_last_n", type=int, default=3)
+    runtime.add_argument("--details-json")
+    runtime.add_argument("--work-directory")
+    runtime.set_defaults(handler=_calibrate_runtime_command)
     calibrate = subparsers.add_parser(
         "calibrate-model",
         help="fit and validate planner coefficients with a short default-layout training run",
@@ -638,17 +1120,31 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate.add_argument("--config", required=True, help="normal VeOmni training YAML")
     calibrate.add_argument("--entrypoint", required=True, help="VeOmni training entrypoint for the model type")
     calibrate.add_argument("--runtime-perf-model", required=True, help="topology calibration JSON")
-    calibrate.add_argument("--output", required=True, help="planner calibration JSON written by NODE_RANK=0")
+    calibrate.add_argument("--output", required=True, help="planner calibration JSON written on every node")
     calibrate.add_argument("--work-directory", help="directory for the derived YAML, logs, and timing samples")
-    calibrate.add_argument("--model-id", help="scope identifier; defaults to the model directory name")
-    calibrate.add_argument("--warmup-steps", type=int, default=2, help="warm-up steps before fitting (default: 2)")
-    calibrate.add_argument(
-        "--validation-steps", type=int, default=2, help="held-out validation steps after fitting (default: 2)"
-    )
-    calibrate.add_argument("--compute-mape-threshold", type=float, default=5.0)
-    calibrate.add_argument("--communication-mape-threshold", type=float, default=10.0)
-    calibrate.add_argument("--joint-mape-threshold", type=float, default=10.0)
+    _add_model_fit_arguments(calibrate)
     calibrate.set_defaults(handler=_calibrate_model_command)
+    prepare = subparsers.add_parser(
+        "prepare",
+        help="reuse valid calibration artifacts and create missing ones",
+    )
+    prepare.add_argument("--config", required=True, help="normal VeOmni training YAML")
+    prepare.add_argument("--entrypoint", required=True, help="VeOmni training entrypoint for the model type")
+    prepare.add_argument("--work-directory", help="directory for calibration logs and derived files")
+    prepare.add_argument("--force-runtime", action="store_true", help="rerun topology calibration")
+    prepare.add_argument("--force-model", action="store_true", help="rerun the 5-step model calibration")
+    prepare.add_argument("--allow-cpu", action="store_true", help="allow CPU-only deployment doctor checks")
+    prepare.add_argument("--runtime-backend", default="auto")
+    prepare.add_argument("--runtime-dtype", default="bf16")
+    prepare.add_argument(
+        "--runtime-message-bytes-csv",
+        default="67108864,134217728,268435456,536870912",
+    )
+    prepare.add_argument("--runtime-warmup", type=int, default=2)
+    prepare.add_argument("--runtime-iters", type=int, default=5)
+    prepare.add_argument("--runtime-measure-last-n", type=int, default=3)
+    _add_model_fit_arguments(prepare)
+    prepare.set_defaults(handler=_prepare_command)
     return parser
 
 

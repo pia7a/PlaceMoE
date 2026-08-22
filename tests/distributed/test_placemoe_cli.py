@@ -3,8 +3,30 @@
 from __future__ import annotations
 
 import argparse
+import json
+
+import yaml
 
 from veomni.distributed.moe.hiermoe.placemoe import cli
+from veomni.distributed.moe.hiermoe.placemoe.calibration import sha256_path
+from veomni.distributed.moe.hiermoe.placemoe.preparation import (
+    CacheInspection,
+    fingerprint_calibration_inputs,
+)
+
+
+class _FakeStore:
+    def __init__(self, values=None) -> None:
+        self.values = dict(values or {})
+
+    def set(self, key, value) -> None:
+        self.values[key] = value.encode("utf-8") if isinstance(value, str) else value
+
+    def get(self, key):
+        return self.values[key]
+
+    def wait(self, keys) -> None:
+        assert all(key in self.values for key in keys)
 
 
 def test_doctor_accepts_platform_local_torch_wheel_suffix() -> None:
@@ -31,6 +53,325 @@ def test_cli_exposes_model_calibration_command() -> None:
     assert args.handler is cli._calibrate_model_command
     assert args.warmup_steps == 2
     assert args.validation_steps == 2
+
+
+def test_cli_exposes_runtime_calibration_and_prepare_commands() -> None:
+    runtime = cli.build_parser().parse_args(
+        [
+            "calibrate-runtime",
+            "--output",
+            "runtime.json",
+            "--hierarchy-group-sizes-csv",
+            "8,16",
+        ]
+    )
+    prepare = cli.build_parser().parse_args(
+        ["prepare", "--config", "train.yaml", "--entrypoint", "tasks/train_vlm.py"]
+    )
+
+    assert runtime.handler is cli._calibrate_runtime_command
+    assert runtime.runtime_warmup == 2
+    assert prepare.handler is cli._prepare_command
+    assert not prepare.force_runtime
+    assert not prepare.force_model
+
+
+def test_stage_result_rejects_different_generated_artifacts() -> None:
+    peer_result = json.dumps(
+        {
+            "return_code": 0,
+            "inspection": {"state": "valid", "detail": "scope matches", "digest": "def"},
+        }
+    ).encode("utf-8")
+    store = _FakeStore({"placemoe-prepare/runtime/result/1": peer_result})
+
+    return_code, detail = cli._coordinate_stage_result(
+        CacheInspection("valid", "scope matches", "abc"),
+        return_code=0,
+        stage="runtime",
+        nnodes=2,
+        node_rank=0,
+        store=store,
+    )
+
+    assert return_code == 2
+    assert "differ across nodes" in detail
+
+
+def test_preflight_rejects_different_node_inputs() -> None:
+    peer = json.dumps({"ok": True, "error": "", "identity": {"config_sha256": "def"}}).encode("utf-8")
+    store = _FakeStore({"placemoe-prepare/preflight/1": peer})
+
+    return_code, detail = cli._coordinate_preparation_preflight(
+        {"ok": True, "error": "", "identity": {"config_sha256": "abc"}},
+        nnodes=2,
+        node_rank=0,
+        store=store,
+    )
+
+    assert return_code == 2
+    assert "inputs differ across nodes" in detail
+
+
+def test_preparation_stage_converts_unexpected_exception_to_failure(monkeypatch) -> None:
+    monkeypatch.setattr(cli, "_open_preparation_store", lambda **_kwargs: None)
+
+    return_code, ran = cli._run_preparation_stage(
+        stage="runtime",
+        force=False,
+        inspect=lambda: CacheInspection("missing", "not generated"),
+        run=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+        nnodes=1,
+        node_rank=0,
+        master_addr="127.0.0.1",
+        master_port=29500,
+        port_offset=2,
+    )
+
+    assert return_code == 2
+    assert ran
+
+
+def test_prepare_reuses_valid_artifacts_without_running_calibrators(tmp_path, monkeypatch, capsys) -> None:
+    model = tmp_path / "Qwen"
+    model.mkdir()
+    entrypoint = tmp_path / "train.py"
+    entrypoint.touch()
+    calibration = tmp_path / "calibration"
+    calibration.mkdir()
+    runtime = calibration / "runtime.json"
+    runtime.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "source": "bench_hiermoe_perf_model",
+                "a2a": {"alpha": 1.0, "beta": 1.0e-8},
+                "inter": [{"alpha": 1.0, "beta": 2.0e-8}],
+                "intra": {"alpha": 1.0, "beta": 2.0e-9},
+                "state_move": {
+                    "intra": {"alpha": 1.0, "beta": 2.0e-9},
+                    "inter": {"alpha": 1.0, "beta": 2.0e-8},
+                },
+                "gradient_sync": {
+                    "gather": {
+                        "intra": {"alpha": 1.0, "beta": 2.0e-9},
+                        "inter": {"alpha": 1.0, "beta": 2.0e-8},
+                    },
+                    "scatter": {
+                        "intra": {"alpha": 1.0, "beta": 2.0e-9},
+                        "inter": {"alpha": 1.0, "beta": 2.0e-8},
+                    },
+                },
+                "metadata": {
+                    "ep_size": 2,
+                    "ranks_per_node": 2,
+                    "hierarchy_group_sizes": [2, 2],
+                    "device_type": "npu",
+                    "backend": "hccl",
+                    "dtype": "bf16",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    planner = calibration / "planner.json"
+    planner.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_type": "placemoe_planner_calibration",
+                "status": "accepted",
+                "scope": {
+                    "model_id": "Qwen",
+                    "ep_size": 2,
+                    "ranks_per_node": 2,
+                    "hierarchy_group_sizes": [2, 2],
+                },
+                "coefficients": {
+                    "inter_ms_per_byte": 1.0e-8,
+                    "intra_ms_per_byte": 2.0e-9,
+                    "route_ms_per_assignment": 3.0e-5,
+                    "communication_multiplier": 2.0,
+                    "compute_ms_per_assignment": 4.0e-5,
+                    "compute_multiplier": 2.0,
+                },
+                "held_out_validation": {"checks": {"communication": True, "compute": True, "joint": True}},
+                "provenance": {"runtime_perf_model_sha256": sha256_path(runtime)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = tmp_path / "train.yaml"
+    config.write_text(
+        f"""
+model:
+  model_path: {model}
+  ops_implementation:
+    moe_implementation: fused_npu
+    cross_entropy_loss_implementation: npu
+    rms_norm_implementation: npu
+    swiglu_mlp_implementation: eager
+    rotary_pos_emb_implementation: npu
+    load_balancing_loss_implementation: eager
+train:
+  accelerator:
+    ep_size: 2
+  hiermoe:
+    hierarchy_group_sizes: [2, 2]
+    placemoe:
+      enabled: true
+      base_directory: {tmp_path}
+      runtime_perf_model: calibration/runtime.json
+      calibration:
+        artifact: calibration/planner.json
+""",
+        encoding="utf-8",
+    )
+    planner_payload = json.loads(planner.read_text(encoding="utf-8"))
+    planner_payload["provenance"]["calibration_input_sha256"] = fingerprint_calibration_inputs(
+        yaml.safe_load(config.read_text(encoding="utf-8")), entrypoint
+    )
+    planner.write_text(json.dumps(planner_payload), encoding="utf-8")
+    monkeypatch.setattr(cli, "_distributed_environment", lambda: (1, 0, 2, "127.0.0.1", 29500))
+    monkeypatch.setattr(cli, "get_device_type", lambda: "npu")
+    monkeypatch.setattr(cli, "_calibrate_runtime_command", lambda _args: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(cli, "_calibrate_model_command", lambda _args: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(cli, "_doctor_command", lambda _args: 0)
+    args = cli.build_parser().parse_args(
+        ["prepare", "--config", str(config), "--entrypoint", str(entrypoint), "--allow-cpu"]
+    )
+
+    assert cli._prepare_command(args) == 0
+    output = capsys.readouterr().out
+    assert "runtime calibration reused" in output
+    assert "model calibration reused" in output
+
+
+def test_prepare_generates_missing_runtime_and_model_artifacts(tmp_path, monkeypatch) -> None:
+    model = tmp_path / "Qwen"
+    model.mkdir()
+    entrypoint = tmp_path / "train.py"
+    entrypoint.touch()
+    config = tmp_path / "train.yaml"
+    config.write_text(
+        f"""
+model:
+  model_path: {model}
+  ops_implementation:
+    moe_implementation: fused_npu
+    cross_entropy_loss_implementation: npu
+    rms_norm_implementation: npu
+    swiglu_mlp_implementation: eager
+    rotary_pos_emb_implementation: npu
+    load_balancing_loss_implementation: eager
+train:
+  accelerator:
+    ep_size: 2
+  hiermoe:
+    hierarchy_group_sizes: [2, 2]
+    placemoe:
+      enabled: true
+      base_directory: {tmp_path}
+      runtime_perf_model: calibration/runtime.json
+      calibration:
+        artifact: calibration/planner.json
+""",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def calibrate_runtime(args) -> int:
+        calls.append("runtime")
+        runtime_path = tmp_path / "calibration" / "runtime.json"
+        runtime_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "source": "bench_hiermoe_perf_model",
+                    "a2a": {"alpha": 1.0, "beta": 1.0e-8},
+                    "inter": [{"alpha": 1.0, "beta": 2.0e-8}],
+                    "intra": {"alpha": 1.0, "beta": 2.0e-9},
+                    "state_move": {
+                        "intra": {"alpha": 1.0, "beta": 2.0e-9},
+                        "inter": {"alpha": 1.0, "beta": 2.0e-8},
+                    },
+                    "gradient_sync": {
+                        "gather": {
+                            "intra": {"alpha": 1.0, "beta": 2.0e-9},
+                            "inter": {"alpha": 1.0, "beta": 2.0e-8},
+                        },
+                        "scatter": {
+                            "intra": {"alpha": 1.0, "beta": 2.0e-9},
+                            "inter": {"alpha": 1.0, "beta": 2.0e-8},
+                        },
+                    },
+                    "metadata": {
+                        "ep_size": 2,
+                        "ranks_per_node": 2,
+                        "hierarchy_group_sizes": [2, 2],
+                        "device_type": "npu",
+                        "backend": "hccl",
+                        "dtype": "bf16",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert args.output == str(runtime_path)
+        return 0
+
+    def calibrate_model(args) -> int:
+        calls.append("model")
+        runtime_path = tmp_path / "calibration" / "runtime.json"
+        planner_path = tmp_path / "calibration" / "planner.json"
+        planner_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "artifact_type": "placemoe_planner_calibration",
+                    "status": "accepted",
+                    "scope": {
+                        "model_id": "Qwen",
+                        "ep_size": 2,
+                        "ranks_per_node": 2,
+                        "hierarchy_group_sizes": [2, 2],
+                    },
+                    "coefficients": {
+                        "inter_ms_per_byte": 1.0e-8,
+                        "intra_ms_per_byte": 2.0e-9,
+                        "route_ms_per_assignment": 3.0e-5,
+                        "communication_multiplier": 2.0,
+                        "compute_ms_per_assignment": 4.0e-5,
+                        "compute_multiplier": 2.0,
+                    },
+                    "held_out_validation": {"checks": {"communication": True, "compute": True, "joint": True}},
+                    "provenance": {
+                        "runtime_perf_model_sha256": sha256_path(runtime_path),
+                        "calibration_input_sha256": fingerprint_calibration_inputs(
+                            yaml.safe_load(config.read_text(encoding="utf-8")), entrypoint
+                        ),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert args.output == str(planner_path)
+        return 0
+
+    monkeypatch.setattr(cli, "_distributed_environment", lambda: (1, 0, 2, "127.0.0.1", 29500))
+    monkeypatch.setattr(cli, "get_device_type", lambda: "npu")
+    monkeypatch.setattr(cli, "_calibrate_runtime_command", calibrate_runtime)
+    monkeypatch.setattr(cli, "_calibrate_model_command", calibrate_model)
+    monkeypatch.setattr(cli, "_doctor_command", lambda _args: 0)
+    args = cli.build_parser().parse_args(
+        ["prepare", "--config", str(config), "--entrypoint", str(entrypoint), "--allow-cpu"]
+    )
+
+    assert cli._prepare_command(args) == 0
+    assert calls == ["runtime", "model"]
+    assert (tmp_path / "calibration" / "runtime.json").is_file()
+    assert (tmp_path / "calibration" / "planner.json").is_file()
 
 
 def test_doctor_validates_inline_training_configuration(tmp_path, monkeypatch) -> None:
@@ -160,3 +501,4 @@ def test_doctor_command_reports_missing_calibration_artifact(tmp_path, monkeypat
     assert "FAIL" in output
     assert "configuration" in output
     assert "missing.json" in output
+    assert "placemoe prepare" in output

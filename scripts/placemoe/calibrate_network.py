@@ -539,7 +539,9 @@ def main() -> None:
     output_text = broadcast_text(output_text, device=device, src=0)
     if env_int("LOCAL_RANK", 0) == 0:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
-        args.output_json.write_text(output_text, encoding="utf-8")
+        temporary = args.output_json.with_name(f".{args.output_json.name}.tmp-{os.getpid()}-{rank}")
+        temporary.write_text(output_text, encoding="utf-8")
+        temporary.replace(args.output_json)
         print(f"Wrote HierMoE perf model to {args.output_json}", flush=True)
 
     dist.destroy_process_group()

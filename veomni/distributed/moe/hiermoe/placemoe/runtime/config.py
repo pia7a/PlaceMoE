@@ -109,9 +109,7 @@ def _validate_scope(
     if missing:
         details.append(f"missing keys {missing}")
     if mismatched:
-        mismatch_values = {
-            key: {"expected": expected_scope[key], "actual": artifact_scope[key]} for key in mismatched
-        }
+        mismatch_values = {key: {"expected": expected_scope[key], "actual": artifact_scope[key]} for key in mismatched}
         details.append(f"mismatched values {mismatch_values}")
     raise PlaceMoEConfigurationError(
         f"calibration artifact {artifact} does not match expected scope: {'; '.join(details)}."
@@ -151,7 +149,13 @@ class PlaceMoECalibration:
         artifact_scope: Mapping[str, Any] = {}
         artifact_type = ""
         if artifact:
-            artifact_payload = json.loads(Path(artifact).read_text(encoding="utf-8"))
+            artifact_path = Path(artifact)
+            if not artifact_path.is_file():
+                raise PlaceMoEConfigurationError(f"calibration artifact {artifact} does not exist.")
+            try:
+                artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise PlaceMoEConfigurationError(f"calibration artifact {artifact} is invalid: {error}") from error
             if not isinstance(artifact_payload, Mapping):
                 raise PlaceMoEConfigurationError(f"calibration artifact {artifact} must contain a mapping.")
             raw_artifact_type = artifact_payload.get("artifact_type")

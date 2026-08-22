@@ -9,9 +9,8 @@ reference, see [PlaceMoE pre-training](placemoe_pretraining.md).
 ## 1. Prepare host paths
 
 Keep models, datasets, training configurations, calibration artifacts, and
-outputs outside the image. The example below assumes that calibration paths
-referenced by the YAML are under `CONFIG_DIR`; use another read-only mount if
-they are stored elsewhere.
+outputs outside the image. Store generated calibration artifacts under the
+writable `OUTPUT_DIR`, and reference their container paths from the YAML.
 
 ```bash
 IMAGE=placemoe:ascend-910b-cann9-torch2.9
@@ -35,8 +34,8 @@ The mounts establish the following contract:
 | --- | --- | --- |
 | `MODEL_ROOT` | `/workspace/model` | Named model directories and tokenizers |
 | `DATA_ROOT` | `/workspace/dataset` | Named dataset directories or shards |
-| `CONFIG_DIR` | `/workspace/configs` | Complete training YAMLs and read-only calibration inputs |
-| `OUTPUT_DIR` | `/workspace/output` | Checkpoints, logs, planner artifacts, and route snapshots |
+| `CONFIG_DIR` | `/workspace/configs` | Complete training YAMLs |
+| `OUTPUT_DIR` | `/workspace/output` | Calibration artifacts, checkpoints, logs, planner artifacts, and route snapshots |
 
 Use the same container paths on every node. Training YAML files must contain
 container paths such as `/workspace/model/Qwen3-VL-30B-A3B-Instruct`, rather
@@ -179,12 +178,12 @@ The launcher runs `placemoe doctor --config` locally before `torchrun`. It does 
 perform SSH orchestration, so both commands must be started through the
 cluster scheduler or on their respective nodes.
 
-## 6. New-cluster calibration
+## 6. Prepare calibration artifacts
 
-Before the first training job on a new topology, generate the runtime
-communication model using the same `NNODES`, `NPROC_PER_NODE`, and hierarchy
-as training. For a 2-node, 16-rank deployment, run the following on both nodes
-and change `NODE_RANK` accordingly:
+Configure `runtime_perf_model` and `calibration.artifact` in the training YAML
+to point into `/workspace/output`. The recommended command reuses valid JSON
+artifacts and creates only missing ones. For a 2-node, 16-rank deployment, run
+it on both nodes and change only `NODE_RANK`:
 
 ```bash
 NNODES=2 \
@@ -192,32 +191,19 @@ NODE_RANK=0 \
 NPROC_PER_NODE=8 \
 MASTER_ADDR=192.168.0.10 \
 MASTER_PORT=29501 \
-scripts/placemoe/calibrate_npu.sh \
-  /workspace/output/calibration/runtime_perf_model.json \
-  --hierarchy-group-sizes-csv 8,16
-```
-
-The model-specific expert-compute coefficients belong in the planner
-calibration artifact configured under `train.hiermoe.placemoe.calibration`.
-After the topology calibration finishes, run the following on both nodes,
-changing only `NODE_RANK`. Model calibration uses exactly one complete EP
-group:
-
-```bash
-NNODES=2 NODE_RANK=0 NPROC_PER_NODE=8 \
-MASTER_ADDR=192.168.0.10 MASTER_PORT=29502 \
-placemoe calibrate-model \
+placemoe prepare \
   --config /workspace/configs/my_train.yaml \
-  --entrypoint tasks/train_vlm.py \
-  --runtime-perf-model /workspace/output/calibration/runtime_perf_model.json \
-  --output /workspace/output/calibration/placemoe_calibration.json
+  --entrypoint tasks/train_vlm.py
 ```
 
-This runs 5 default-layout steps. Rank 0 writes the scoped planner artifact and
-exits successfully only when held-out validation accepts it. Make both
-calibration files available at the configured paths on every node, then run
-`placemoe doctor`. See the pre-training guide for the complete configuration
-surface.
+The first stage measures communication for the topology. The second runs 5
+default-layout steps to fit and validate the model-dependent planner costs.
+Valid files are not recomputed; an invalid existing file fails explicitly.
+Use `--force-runtime` or `--force-model` only when replacement is intended.
+After preparation, run `placemoe doctor` and then launch training.
+
+For separate `calibrate-runtime` and `calibrate-model` commands, artifact reuse
+rules, and model-versus-topology scope, see the pre-training guide.
 
 ## 7. Common failures
 
