@@ -79,7 +79,7 @@ _ACTIVE_BRIDGE: MoERuntimeBridge | None = None
 
 
 def _load_entry_point_bridge(name: str) -> MoERuntimeBridge | None:
-    matches = entry_points(group=MOE_RUNTIME_BRIDGE_ENTRY_POINT, name=name)
+    matches = tuple(entry_points(group=MOE_RUNTIME_BRIDGE_ENTRY_POINT, name=name))
     if not matches:
         return None
     if len(matches) != 1:
@@ -111,15 +111,22 @@ def _validate_bridge(bridge: MoERuntimeBridge, expected_name: str) -> None:
         )
 
 
+def load_moe_runtime_bridge(name: str) -> MoERuntimeBridge:
+    """Load and validate one installed or bundled runtime provider."""
+
+    bridge = _load_entry_point_bridge(name) or _load_builtin_bridge(name)
+    _validate_bridge(bridge, name)
+    return bridge
+
+
 def configure_moe_runtime_bridge(config: Any, **kwargs: Any) -> Any:
-    """Select, validate, configure, and publish the runtime bridge."""
+    """Select, configure, and publish the runtime bridge."""
 
     global _ACTIVE_BRIDGE
 
     placemoe_config = getattr(config, "placemoe", None)
     name = "placemoe" if bool(getattr(placemoe_config, "enabled", False)) else "hiermoe"
-    bridge = _load_entry_point_bridge(name) or _load_builtin_bridge(name)
-    _validate_bridge(bridge, name)
+    bridge = load_moe_runtime_bridge(name)
     state = bridge.configure(config, **kwargs)
     _ACTIVE_BRIDGE = bridge
     return state
@@ -144,4 +151,5 @@ __all__ = [
     "MoERuntimeBridge",
     "configure_moe_runtime_bridge",
     "get_moe_runtime_bridge",
+    "load_moe_runtime_bridge",
 ]

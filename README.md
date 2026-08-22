@@ -262,6 +262,8 @@ be mixed with inline PlaceMoE fields.
 
 For a module-by-module explanation, see the
 [PlaceMoE code map](docs/perf/placemoe_code_map.md).
+For model-only VeOmni forks, see
+[the versioned bridge integration guide](docs/usage/placemoe_veomni_bridge.md).
 
 ## Results
 

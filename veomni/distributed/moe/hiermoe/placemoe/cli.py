@@ -30,6 +30,7 @@ import yaml
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.distributed.moe.hiermoe.perf_model import HierMoEPerfModel
+from veomni.distributed.moe.runtime_bridge import MOE_RUNTIME_BRIDGE_API_VERSION, load_moe_runtime_bridge
 from veomni.utils.device import get_device_type, get_torch_device
 
 from .runtime import PlaceMoERuntimeConfig
@@ -143,6 +144,18 @@ def run_doctor(config_path: Path, *, require_npu: bool) -> list[CheckResult]:
         ),
         CheckResult("architecture", "PASS", platform.machine()),
     ]
+    try:
+        runtime_bridge = load_moe_runtime_bridge("placemoe")
+    except (ImportError, LookupError, RuntimeError, TypeError, ValueError) as error:
+        results.append(CheckResult("runtime_bridge", "FAIL", str(error)))
+    else:
+        results.append(
+            CheckResult(
+                "runtime_bridge",
+                "PASS",
+                f"provider={runtime_bridge.name}, API={MOE_RUNTIME_BRIDGE_API_VERSION}",
+            )
+        )
 
     torch_version = _version("torch")
     results.append(

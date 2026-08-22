@@ -65,6 +65,7 @@ train:
     by_name = {result.name: result for result in results}
 
     assert by_name["model"].status == "PASS"
+    assert by_name["runtime_bridge"].status == "PASS"
     assert by_name["dataset"].status == "PASS"
     assert by_name["performance_model"].status == "PASS"
     assert by_name["performance_model_schema"].status == "PASS"

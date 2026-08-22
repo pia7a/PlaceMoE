@@ -124,3 +124,12 @@ def test_bridge_api_version_mismatch_fails_before_configuration(monkeypatch):
 def test_unconfigured_bridge_access_fails_explicitly():
     with pytest.raises(RuntimeError, match="has not been configured"):
         runtime_bridge.get_moe_runtime_bridge()
+
+
+def test_public_loader_validates_provider_without_configuring_it(monkeypatch):
+    bridge = _FakeBridge()
+    monkeypatch.setattr(runtime_bridge, "_load_entry_point_bridge", lambda _name: bridge)
+
+    assert runtime_bridge.load_moe_runtime_bridge("placemoe") is bridge
+    with pytest.raises(RuntimeError, match="has not been configured"):
+        runtime_bridge.get_moe_runtime_bridge()
