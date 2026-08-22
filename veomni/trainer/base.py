@@ -32,7 +32,7 @@ import time
 import warnings
 from abc import ABC
 from collections import defaultdict
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from dataclasses import asdict
 from typing import Any, Callable, Dict, List
 
@@ -57,21 +57,7 @@ from ..data.chat_template import ChatTemplate
 from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
-from ..distributed.moe.hiermoe import (
-    bind_hiermoe_model,
-    bind_hiermoe_optimizer,
-    configure_hiermoe,
-    configure_hiermoe_pipeline_microstep,
-    destroy_hiermoe_pipeline_process_groups,
-    disable_hiermoe_placement,
-    maybe_log_hiermoe_metrics,
-    maybe_run_hiermoe_expert_swap,
-    set_hiermoe_layer_swap_forward_enabled,
-    set_hiermoe_route_capture_forward_enabled,
-    set_hiermoe_step,
-    shutdown_hiermoe_pipeline,
-    sync_hiermoe_redundant_gradients,
-)
+from ..distributed.moe.runtime_bridge import configure_moe_runtime_bridge, get_moe_runtime_bridge
 from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import get_parallel_state, init_parallel_state
 from ..distributed.torch_parallelize import build_parallelize_model
@@ -304,7 +290,7 @@ class BaseTrainer(Stateful, ABC):
         )
         ps = get_parallel_state()
         mixed_precision = self.args.train.accelerator.fsdp_config.mixed_precision
-        configure_hiermoe(
+        configure_moe_runtime_bridge(
             self.args.train.hiermoe,
             ep_group=ps.ep_group if getattr(ps, "ep_enabled", False) else None,
             ep_fsdp_size=ps.ep_fsdp_size if getattr(ps, "ep_enabled", False) else 1,
@@ -483,7 +469,7 @@ class BaseTrainer(Stateful, ABC):
             **kwargs,
         )
         self.model.train()
-        bind_hiermoe_model(self.model)
+        get_moe_runtime_bridge().bind_model(self.model)
         if physical_moe_load_enabled():
             attached = bind_physical_moe_layer_keys(self.model)
             if attached == 0:
@@ -503,7 +489,7 @@ class BaseTrainer(Stateful, ABC):
             no_decay_params=args.train.optimizer.no_decay_params,
             muon_kwargs=_collect_muon_kwargs(args.train.optimizer),
         )
-        bind_hiermoe_optimizer(self.optimizer)
+        get_moe_runtime_bridge().bind_optimizer(self.optimizer)
 
     def _build_lr_scheduler(self):
         args: VeOmniArguments = self.args
@@ -605,7 +591,7 @@ class BaseTrainer(Stateful, ABC):
         self.evaluate_callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches=None):
-        set_hiermoe_step(max(0, self.state.global_step - 1))
+        get_moe_runtime_bridge().set_step(max(0, self.state.global_step - 1))
         self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.tqdm_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.wandb_callback.on_step_begin(self.state, micro_batches=micro_batches)
@@ -616,7 +602,7 @@ class BaseTrainer(Stateful, ABC):
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
         self.run_hiermoe_expert_swap()
-        maybe_log_hiermoe_metrics(self.state.global_step)
+        get_moe_runtime_bridge().log_metrics(self.state.global_step)
         self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.tqdm_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.wandb_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
@@ -634,22 +620,15 @@ class BaseTrainer(Stateful, ABC):
         placement_step = max(0, trainer_step - 1)
         with self._full_profile_range("hiermoe_expert_swap"):
             if hiermoe_config.enable and hiermoe_config.expert_swap:
-                maybe_run_hiermoe_expert_swap(placement_step)
+                get_moe_runtime_bridge().run_step_update(placement_step)
         self._hiermoe_last_swap_step = trainer_step
 
-    @contextmanager
     def hiermoe_layer_swap_forward(self):
-        previous_swap = set_hiermoe_layer_swap_forward_enabled(True)
-        previous_capture = set_hiermoe_route_capture_forward_enabled(True)
-        try:
-            yield
-        finally:
-            set_hiermoe_route_capture_forward_enabled(previous_capture)
-            set_hiermoe_layer_swap_forward_enabled(previous_swap)
+        return get_moe_runtime_bridge().training_forward()
 
     @staticmethod
     def hiermoe_placement_disabled():
-        return disable_hiermoe_placement()
+        return get_moe_runtime_bridge().placement_disabled()
 
     def sync_hiermoe_redundant_gradients(self) -> None:
         hiermoe_config = self.args.train.hiermoe
@@ -658,7 +637,7 @@ class BaseTrainer(Stateful, ABC):
             and hiermoe_config.expert_swap
             and hiermoe_config.redundant_slot_increment_per_device > 0
         ):
-            sync_hiermoe_redundant_gradients()
+            get_moe_runtime_bridge().sync_redundant_gradients()
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass.
@@ -728,7 +707,7 @@ class BaseTrainer(Stateful, ABC):
 
     def model_reshard(self, micro_step: int, num_micro_steps: int):
         """Reshard model after backward pass."""
-        configure_hiermoe_pipeline_microstep(micro_step, num_micro_steps)
+        get_moe_runtime_bridge().configure_microstep(micro_step, num_micro_steps)
         args: VeOmniArguments = self.args
         if (
             args.train.accelerator.fsdp_config.fsdp_mode == "fsdp2"
@@ -811,10 +790,10 @@ class BaseTrainer(Stateful, ABC):
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 
     def destroy_distributed(self):
-        shutdown_hiermoe_pipeline()
+        get_moe_runtime_bridge().shutdown()
         helper.empty_cache()
         dist.barrier()
-        destroy_hiermoe_pipeline_process_groups()
+        get_moe_runtime_bridge().destroy_process_groups()
         dist.destroy_process_group()
 
     def train(self):

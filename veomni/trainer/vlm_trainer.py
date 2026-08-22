@@ -21,7 +21,7 @@ import torch
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import MainCollator, build_data_transform, build_multimodal_chat_template
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
-from ..distributed.moe.hiermoe import bind_hiermoe_optimizer
+from ..distributed.moe.runtime_bridge import get_moe_runtime_bridge
 from ..models import build_foundation_model, build_processor
 from ..optim import build_optimizer
 from ..utils import helper
@@ -252,7 +252,7 @@ class VLMTrainer:
             no_decay_params=args.train.optimizer.no_decay_params,
             muon_kwargs=_collect_muon_kwargs(args.train.optimizer),
         )
-        bind_hiermoe_optimizer(self.base.optimizer)
+        get_moe_runtime_bridge().bind_optimizer(self.base.optimizer)
 
     def on_train_begin(self):
         self.base.on_train_begin()

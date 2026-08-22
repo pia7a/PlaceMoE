@@ -43,6 +43,9 @@ dependencies = [
 [project.scripts]
 placemoe = "veomni.distributed.moe.hiermoe.placemoe.cli:main"
 
+[project.entry-points."veomni.moe_runtime_bridges"]
+placemoe = "placemoe.bridge:create_bridge"
+
 [project.optional-dependencies]
 dev = [
   "pre-commit>=4.0.0,<5.0",

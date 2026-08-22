@@ -154,9 +154,12 @@ def parallelize_model_fsdp2(
         #   e.g. embed_tokens.weight, decoder.regular_mlp, decoder.embed_tokens.weight, and decoder.moe.experts
         fqn2spec_info = parallel_plan.apply(model, parallel_state.extra_parallel_fsdp_device_mesh)
         if parallel_state.extra_parallel_enabled("ep"):
-            from .moe.hiermoe import maybe_expand_hiermoe_expert_slots
+            from .moe.runtime_bridge import get_moe_runtime_bridge
 
-            maybe_expand_hiermoe_expert_slots(model, parallel_state.extra_parallel_sizes["ep"])
+            get_moe_runtime_bridge().maybe_expand_expert_slots(
+                model,
+                parallel_state.extra_parallel_sizes["ep"],
+            )
 
         model._fqn2spec_info = fqn2spec_info
         _extra_parallel_mesh = {}

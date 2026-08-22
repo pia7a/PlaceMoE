@@ -144,6 +144,20 @@ VeOmni uses FSDP2 exclusively.
 4. SP is orthogonal to FSDP2 — models call Ulysses all-to-all (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`) around attention; the FSDP shard mesh fuses with SP mesh (`dp_shard_sp`)
 5. EP token routing is in model MoE code + `moe_layer.py` using `ep_group` from `ParallelState`
 
+## MoE Runtime Bridge
+
+`veomni/distributed/moe/runtime_bridge.py` is the versioned host boundary for
+optional MoE runtimes such as PlaceMoE. Trainers and EP parallelization invoke
+the bridge for model and optimizer binding, forward dispatch scopes, step
+updates, replica-gradient synchronization, and shutdown instead of importing a
+specific runtime implementation.
+
+Runtime providers register through the `veomni.moe_runtime_bridges` entry-point
+group. The in-tree `placemoe` provider delegates to the validated HierMoE
+implementation and remains available as a source-tree fallback. Model-specific
+expert discovery is handled separately by the PlaceMoE adapter registry, so a
+standard VeOmni MoE model does not need PlaceMoE-specific model code.
+
 ## Config Structure
 
 ```
