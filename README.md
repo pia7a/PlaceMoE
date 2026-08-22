@@ -113,8 +113,12 @@ Build the validated production image with:
 docker build -t placemoe:ascend -f docker/ascend/Dockerfile .
 ```
 
-Override `BASE_IMAGE` only when the target cluster provides an equivalent
-Python 3.11 / CANN 9 / torch 2.9 / torch-npu 2.9 base image.
+The default public VeOmni base is pinned by digest. Override `BASE_IMAGE` only
+when the target cluster provides an equivalent Python 3.11 / CANN 9 / torch
+2.9 / torch-npu 2.9 image.
+
+For offline clusters and multi-node image distribution, see
+[Packaging and distributing the Ascend image](docs/usage/placemoe_image_distribution.md).
 
 On a new cluster, first calibrate the communication model with the same
 distributed topology as training. Run this on every node with its own

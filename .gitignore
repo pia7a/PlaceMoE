@@ -15,6 +15,7 @@ log.txt
 *.md
 /configs/placemoe/gpu_ep32.env
 !docs/perf/hiermoe_e2e_ablation_guide_zh.md
+!docs/usage/placemoe_image_distribution.md
 !docs/usage/placemoe_pretraining.md
 profile/runs/
 profile/figures/
@@ -27,3 +28,6 @@ veomni/ops/platform/npu/hiermoe_planner_ops/build/
 
 /results/
 scripts/profile/.paper32_*_launcher.sh
+*.tar.gz
+*.tar.gz.sha256
+*.tar.gz.image-id

@@ -3,7 +3,7 @@
 # This image is the software stack used by the validated Ascend testbed.  A
 # deployment may override BASE_IMAGE with an equivalent validated CANN 9.0 /
 # Python 3.11 / PyTorch 2.9 / torch-npu 2.9 image.
-ARG BASE_IMAGE=ascendai/veomni:qwen35-main-triton321-torch290-warmcache
+ARG BASE_IMAGE=quay.io/ascend/veomni@sha256:99b49fe15c57387dc14f21beca75717146de458f6ce88950ee278444c65b5065
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.9.8
 FROM ${UV_IMAGE} AS uv
 FROM ${BASE_IMAGE}

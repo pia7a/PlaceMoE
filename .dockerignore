@@ -10,3 +10,11 @@ dist
 results
 profile/runs
 *.log
+.env
+.env.*
+*.key
+*.pem
+*.tar
+*.tar.gz
+*.tgz
+*.sha256

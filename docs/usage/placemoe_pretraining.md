@@ -25,6 +25,9 @@ and installs the current PlaceMoE tree.
 docker build -t placemoe:ascend -f docker/ascend/Dockerfile .
 ```
 
+To move the validated image to an offline or multi-node cluster, follow
+[Packaging and distributing the PlaceMoE Ascend image](placemoe_image_distribution.md).
+
 ## 2. Calibrate a new cluster topology
 
 Run the communication calibrator once with the same node and rank topology as
