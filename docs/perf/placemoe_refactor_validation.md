@@ -139,3 +139,38 @@ The focused evidence satisfies the refactor acceptance gate:
 
 The results do not replace the paper's longer steady-state experiments and
 must not be quoted as statistically robust speedups.
+
+## Production bridge validation on 2 nodes
+
+The production-portability refactor was additionally checked on 2 Ascend
+nodes with 8 NPUs per node. This gate tests integration contracts rather than
+reproducing the paper's performance matrix: both models retain a single MoE
+layer to keep the distributed run short, while still exercising real EP16
+dispatch, expert execution, replica-gradient synchronization, and optimizer
+state handling.
+
+Before the distributed runs, the current canonical planner was replayed on
+the historical 48-layer Qwen3-VL/ShareGPT4V EP32 route snapshots. The generated
+`layers`, `replay`, `schema_version`, and `topology` payload has the same
+semantic SHA-256 (`41a8059d...653db6ea`) as the historical artifact. The exact
+held-out cost is also unchanged at 5556.006 ms, versus 7271.245 ms for uniform
+replication. This establishes planner-output and cost equivalence independently
+of the runtime smoke tests.
+
+| Run | Runtime behavior | Steady-state evidence |
+| --- | --- | --- |
+| Qwen3-VL / ShareGPT4V | One mapping-only refresh was submitted at step 2 and atomically applied at step 12 without moving expert states. | Steps 13--30 average 2.792 s; final loss and gradient norm are finite. Every step launches a replica-gradient overlap job, hiding 99.56% of its raw synchronization time on average. |
+| DeepSeek-V3 / Tulu-3 | A preloaded replicated layout runs with learning rate 0 through the generic fused-expert adapter. | Steps 2--6 average 1.051 s; final loss and gradient norm are finite. Every step launches an overlap job, hiding 99.49% on average. |
+
+The Qwen refresh explicitly passes the current calibration coefficients to the
+asynchronous canonical planner. The DeepSeek run uses the same model-independent
+adapter resolution as Qwen: modules are selected by supported expert parameter
+forms, not model names. Both 16-rank jobs completed on every rank without a
+blocking gradient-synchronization fallback.
+
+The validation also exposed a VeOmni configuration round-trip issue: serialized
+configurations already contain the automatically injected `ep` dimension.
+Reloading them used to append a duplicate dimension and create duplicate
+optimizer parameter groups. `AcceleratorConfig` now accepts one matching
+serialized entry, canonicalizes identical duplicates from older configurations,
+and rejects conflicting entries.

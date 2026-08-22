@@ -386,9 +386,33 @@ class AcceleratorConfig:
     def __post_init__(self):
         # although expert parallel and extra parallel are both provided in the arguments,
         # the implementation is configuring extra parallelism to include expert parallelism
-        self.extra_parallel_sizes.append(self.ep_size)
-        self.extra_parallel_names.append("ep")
-        self.extra_parallel_placement_innermost.append(self.ep_outside)
+        if not (
+            len(self.extra_parallel_sizes)
+            == len(self.extra_parallel_names)
+            == len(self.extra_parallel_placement_innermost)
+        ):
+            raise ValueError("Extra-parallel configuration lists must have equal lengths.")
+
+        ep_indices = [index for index, name in enumerate(self.extra_parallel_names) if name == "ep"]
+        if not ep_indices:
+            self.extra_parallel_sizes.append(self.ep_size)
+            self.extra_parallel_names.append("ep")
+            self.extra_parallel_placement_innermost.append(self.ep_outside)
+            return
+
+        for ep_index in ep_indices:
+            if self.extra_parallel_sizes[ep_index] != self.ep_size:
+                raise ValueError("The explicit 'ep' extra-parallel size must match ep_size.")
+            if self.extra_parallel_placement_innermost[ep_index] != self.ep_outside:
+                raise ValueError("The explicit 'ep' placement must match ep_outside.")
+
+        # Configurations serialized by older VeOmni releases may already contain
+        # more than one identical auto-injected EP entry. Canonicalize them so a
+        # saved configuration remains safe to reuse.
+        for ep_index in reversed(ep_indices[1:]):
+            del self.extra_parallel_sizes[ep_index]
+            del self.extra_parallel_names[ep_index]
+            del self.extra_parallel_placement_innermost[ep_index]
 
 
 @dataclass
