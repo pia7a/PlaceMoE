@@ -180,6 +180,28 @@ def test_runtime_config_loads_accepted_calibration_artifact(tmp_path) -> None:
     assert config.calibration.compute_ms_per_assignment == pytest.approx(4.0e-5)
 
 
+def test_runtime_config_rejects_wrong_calibration_artifact_type(tmp_path) -> None:
+    calibration = tmp_path / "calibration.json"
+    calibration.write_text(
+        json.dumps(
+            {
+                "artifact_type": "hiermoe_runtime_performance_model",
+                "status": "accepted",
+                "coefficients": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PlaceMoEConfigurationError, match="expected 'placemoe_planner_calibration'"):
+        PlaceMoERuntimeConfig.from_training_config(
+            {
+                "base_directory": str(tmp_path),
+                "calibration": {"artifact": "calibration.json"},
+            }
+        )
+
+
 def test_inline_dataclass_uses_calibration_artifact_coefficients(tmp_path) -> None:
     _write_scoped_calibration(tmp_path, {"model_id": "deepseek"})
     training = PlaceMoEArguments(enabled=True, base_directory=str(tmp_path))
@@ -374,22 +396,23 @@ def test_planner_termination_cleans_workers_after_leader_exit(monkeypatch) -> No
     assert signals == [(456, signal.SIGTERM), (456, signal.SIGKILL)]
 
 
-def _write_scoped_calibration(tmp_path, scope: dict) -> None:
+def _write_scoped_calibration(tmp_path, scope: dict, *, artifact_type: str | None = None) -> None:
+    payload = {
+        "status": "accepted",
+        "scope": scope,
+        "coefficients": {
+            "inter_ms_per_byte": 1.0e-8,
+            "intra_ms_per_byte": 2.0e-9,
+            "route_ms_per_assignment": 3.0e-5,
+            "communication_multiplier": 3.1,
+            "compute_ms_per_assignment": 4.0e-5,
+            "compute_multiplier": 4.19,
+        },
+    }
+    if artifact_type is not None:
+        payload["artifact_type"] = artifact_type
     (tmp_path / "calibration.json").write_text(
-        json.dumps(
-            {
-                "status": "accepted",
-                "scope": scope,
-                "coefficients": {
-                    "inter_ms_per_byte": 1.0e-8,
-                    "intra_ms_per_byte": 2.0e-9,
-                    "route_ms_per_assignment": 3.0e-5,
-                    "communication_multiplier": 3.1,
-                    "compute_ms_per_assignment": 4.0e-5,
-                    "compute_multiplier": 4.19,
-                },
-            }
-        ),
+        json.dumps(payload),
         encoding="utf-8",
     )
 
@@ -455,6 +478,35 @@ def test_runtime_config_rejects_mismatched_calibration_scope(tmp_path) -> None:
 
     with pytest.raises(PlaceMoEConfigurationError, match="does not match expected scope"):
         PlaceMoERuntimeConfig.from_file(config_path)
+
+
+def test_runtime_config_automatically_validates_artifact_scope(tmp_path) -> None:
+    _write_scoped_calibration(
+        tmp_path,
+        {
+            "model_id": "qwen",
+            "ep_size": 16,
+            "ranks_per_node": 8,
+            "hierarchy_group_sizes": [8, 16],
+        },
+        artifact_type="placemoe_planner_calibration",
+    )
+    config = PlaceMoERuntimeConfig.from_training_config(
+        {
+            "base_directory": str(tmp_path),
+            "calibration": {"artifact": "calibration.json"},
+        }
+    )
+
+    with pytest.raises(PlaceMoEConfigurationError, match="mismatched values"):
+        config.calibration.validate_artifact_scope(
+            {
+                "model_id": "deepseek",
+                "ep_size": 16,
+                "ranks_per_node": 8,
+                "hierarchy_group_sizes": [8, 16],
+            }
+        )
 
 
 def test_runtime_config_rejects_required_scope_without_artifact(tmp_path) -> None:

@@ -132,6 +132,9 @@ placemoe doctor --config /path/to/training.yaml
 ```
 
 Only start distributed training after `doctor` succeeds on every node.
+The complete device-mount, container-entry, and single- and multi-node launch
+commands are provided in [Running PlaceMoE from the validated Ascend
+image](placemoe_container_quickstart.md).
 
 ## 6. Release checklist
 

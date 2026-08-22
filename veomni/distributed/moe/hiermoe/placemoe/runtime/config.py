@@ -94,6 +94,30 @@ def _resolve_path(value: Any, base_directory: Path, name: str) -> str:
     return str(path.resolve())
 
 
+def _validate_scope(
+    artifact: str,
+    artifact_scope: Mapping[str, Any],
+    expected_scope: Mapping[str, Any],
+) -> None:
+    missing = sorted(set(expected_scope) - set(artifact_scope))
+    mismatched = sorted(
+        key for key, expected in expected_scope.items() if key in artifact_scope and artifact_scope[key] != expected
+    )
+    if not missing and not mismatched:
+        return
+    details = []
+    if missing:
+        details.append(f"missing keys {missing}")
+    if mismatched:
+        mismatch_values = {
+            key: {"expected": expected_scope[key], "actual": artifact_scope[key]} for key in mismatched
+        }
+        details.append(f"mismatched values {mismatch_values}")
+    raise PlaceMoEConfigurationError(
+        f"calibration artifact {artifact} does not match expected scope: {'; '.join(details)}."
+    )
+
+
 @dataclass(frozen=True)
 class PlaceMoECalibration:
     """Calibrated coefficients passed unchanged to every planner invocation."""
@@ -105,6 +129,7 @@ class PlaceMoECalibration:
     compute_ms_per_assignment: float = _DEFAULT_COMPUTE_MS_PER_ASSIGNMENT
     compute_multiplier: float = _DEFAULT_COMPUTE_MULTIPLIER
     artifact: str = ""
+    artifact_type: str = ""
     require_scope: bool = False
     expected_scope: Mapping[str, Any] = field(default_factory=dict)
     artifact_scope: Mapping[str, Any] = field(default_factory=dict)
@@ -124,10 +149,18 @@ class PlaceMoECalibration:
             )
 
         artifact_scope: Mapping[str, Any] = {}
+        artifact_type = ""
         if artifact:
             artifact_payload = json.loads(Path(artifact).read_text(encoding="utf-8"))
             if not isinstance(artifact_payload, Mapping):
                 raise PlaceMoEConfigurationError(f"calibration artifact {artifact} must contain a mapping.")
+            raw_artifact_type = artifact_payload.get("artifact_type")
+            if raw_artifact_type is not None and raw_artifact_type != "placemoe_planner_calibration":
+                raise PlaceMoEConfigurationError(
+                    f"calibration artifact {artifact} has type {raw_artifact_type!r}, "
+                    "expected 'placemoe_planner_calibration'."
+                )
+            artifact_type = str(raw_artifact_type or "")
             if artifact_payload.get("status", "accepted") != "accepted":
                 raise PlaceMoEConfigurationError(
                     f"calibration artifact {artifact} has status "
@@ -136,29 +169,14 @@ class PlaceMoECalibration:
             raw_artifact_scope = artifact_payload.get("scope")
             if isinstance(raw_artifact_scope, Mapping):
                 artifact_scope = dict(raw_artifact_scope)
+            elif artifact_type == "placemoe_planner_calibration":
+                _mapping(raw_artifact_scope, "calibration artifact scope")
             elif require_scope:
                 _mapping(raw_artifact_scope, "calibration artifact scope")
             else:
                 artifact_scope = {}
             if require_scope:
-                missing = sorted(set(expected_scope) - set(artifact_scope))
-                mismatched = sorted(
-                    key
-                    for key, expected in expected_scope.items()
-                    if key in artifact_scope and artifact_scope[key] != expected
-                )
-                if missing or mismatched:
-                    details = []
-                    if missing:
-                        details.append(f"missing keys {missing}")
-                    if mismatched:
-                        mismatch_values = {
-                            key: {"expected": expected_scope[key], "actual": artifact_scope[key]} for key in mismatched
-                        }
-                        details.append(f"mismatched values {mismatch_values}")
-                    raise PlaceMoEConfigurationError(
-                        f"calibration artifact {artifact} does not match expected scope: {'; '.join(details)}."
-                    )
+                _validate_scope(artifact, artifact_scope, expected_scope)
             coefficients = artifact_payload.get("coefficients", artifact_payload)
             if not isinstance(coefficients, Mapping):
                 raise PlaceMoEConfigurationError(f"calibration artifact {artifact} has no coefficient mapping.")
@@ -200,10 +218,20 @@ class PlaceMoECalibration:
                 data.get("compute_multiplier", defaults.compute_multiplier), "calibration.compute_multiplier"
             ),
             artifact=artifact,
+            artifact_type=artifact_type,
             require_scope=require_scope,
             expected_scope=expected_scope,
             artifact_scope=artifact_scope,
         )
+
+    def validate_artifact_scope(self, expected_scope: Mapping[str, Any]) -> None:
+        """Reject a planner artifact calibrated for another model or topology."""
+
+        if not self.artifact or (self.artifact_type != "placemoe_planner_calibration" and not self.require_scope):
+            return
+        required_scope = dict(self.expected_scope)
+        required_scope.update(expected_scope)
+        _validate_scope(self.artifact, self.artifact_scope, required_scope)
 
 
 @dataclass(frozen=True)

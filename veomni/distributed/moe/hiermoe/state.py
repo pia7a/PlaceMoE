@@ -137,6 +137,12 @@ def configure_hiermoe(
     )
     inline_placemoe = getattr(config, "placemoe", None)
     placemoe_config = _resolve_placemoe_runtime_config(inline_placemoe)
+    expected_calibration_scope: dict[str, Any] = {
+        "ep_size": ep_size,
+        "ranks_per_node": hierarchy.local_world_size,
+        "hierarchy_group_sizes": list(hierarchy.group_sizes),
+    }
+    placemoe_config.calibration.validate_artifact_scope(expected_calibration_scope)
     set_current_runtime_config(placemoe_config)
     configure_placemoe_runtime(placemoe_config)
     perf_model_path = (

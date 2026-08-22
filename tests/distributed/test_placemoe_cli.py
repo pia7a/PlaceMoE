@@ -13,6 +13,26 @@ def test_doctor_accepts_platform_local_torch_wheel_suffix() -> None:
     assert not cli._matches_validated_version("2.9.1+cpu", "2.9.0")
 
 
+def test_cli_exposes_model_calibration_command() -> None:
+    args = cli.build_parser().parse_args(
+        [
+            "calibrate-model",
+            "--config",
+            "train.yaml",
+            "--entrypoint",
+            "tasks/train_vlm.py",
+            "--runtime-perf-model",
+            "runtime.json",
+            "--output",
+            "planner.json",
+        ]
+    )
+
+    assert args.handler is cli._calibrate_model_command
+    assert args.warmup_steps == 2
+    assert args.validation_steps == 2
+
+
 def test_doctor_validates_inline_training_configuration(tmp_path, monkeypatch) -> None:
     model = tmp_path / "model"
     model.mkdir()

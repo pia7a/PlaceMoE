@@ -35,7 +35,10 @@ usage/support_new_models/qwen3_omni_moe_example.md
 usage/support_new_models/dit_model_guide.md
 usage/checkpoint_conversion.md
 usage/trainer.md
+usage/placemoe_container_quickstart.md
+usage/placemoe_image_distribution.md
 usage/placemoe_pretraining.md
+usage/placemoe_veomni_bridge.md
 usage/agent_workflow.md
 ```
 

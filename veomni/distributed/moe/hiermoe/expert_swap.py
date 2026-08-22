@@ -2971,15 +2971,13 @@ class ExpertSwapManager:
         if _COST_MODEL_VERIFY and (
             self.expert_swap_mode != "step"
             or self.expert_swap_selector != "hiermoe_greedy_cover_p1"
-            or not _FIXED_R2_LAYOUT
             or self.expert_swap_max_pairs_per_layer != 0
             or _ONLINE_FREEZE_COST_MODE != "off"
             or _FORWARD_REUSE_COVER
         ):
             raise ValueError(
-                "Cost-model verification requires fixed R2 step mode, "
-                "the hiermoe_greedy_cover_p1 selector, zero swaps, and all placement "
-                "experiments disabled."
+                "Cost-model verification requires step mode, the hiermoe_greedy_cover_p1 "
+                "selector, zero swaps, and all placement experiments disabled."
             )
         if _ONLINE_LUT_UPDATE and (
             not self.fixed_pipeline_overlap

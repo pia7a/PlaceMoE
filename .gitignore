@@ -16,6 +16,7 @@ log.txt
 /configs/placemoe/gpu_ep32.env
 !docs/perf/hiermoe_e2e_ablation_guide_zh.md
 !docs/usage/placemoe_image_distribution.md
+!docs/usage/placemoe_container_quickstart.md
 !docs/usage/placemoe_pretraining.md
 !docs/usage/placemoe_veomni_bridge.md
 profile/runs/

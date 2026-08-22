@@ -119,6 +119,9 @@ when the target cluster provides an equivalent Python 3.11 / CANN 9 / torch
 
 For offline clusters and multi-node image distribution, see
 [Packaging and distributing the Ascend image](docs/usage/placemoe_image_distribution.md).
+After loading the image, follow the
+[Ascend container quick start](docs/usage/placemoe_container_quickstart.md)
+to mount NPUs, models, datasets, and configurations and launch training.
 
 On a new cluster, first calibrate the communication model with the same
 distributed topology as training. Run this on every node with its own
@@ -129,6 +132,20 @@ NNODES=2 NODE_RANK=0 NPROC_PER_NODE=8 \
 MASTER_ADDR=192.168.0.10 MASTER_PORT=29501 \
   scripts/placemoe/calibrate_npu.sh calibration/runtime_perf_model.json \
   --hierarchy-group-sizes-csv 8,16
+```
+
+Then fit and validate the model-specific planner coefficients from the normal
+training YAML. Run this on every node with its own `NODE_RANK`; rank 0 writes
+the accepted artifact after a 5-step default-layout run:
+
+```bash
+NNODES=2 NODE_RANK=0 NPROC_PER_NODE=8 \
+MASTER_ADDR=192.168.0.10 MASTER_PORT=29502 \
+  placemoe calibrate-model \
+  --config configs/my_train.yaml \
+  --entrypoint tasks/train_vlm.py \
+  --runtime-perf-model calibration/runtime_perf_model.json \
+  --output calibration/placemoe_calibration.json
 ```
 
 See [PlaceMoE pre-training](docs/usage/placemoe_pretraining.md) for calibration

@@ -290,6 +290,12 @@ class BaseTrainer(Stateful, ABC):
         )
         ps = get_parallel_state()
         mixed_precision = self.args.train.accelerator.fsdp_config.mixed_precision
+        placemoe = self.args.train.hiermoe.placemoe
+        if placemoe.enabled and placemoe.calibration.artifact:
+            model_id = os.path.basename(
+                os.path.normpath(str(self.args.model.model_path or self.args.model.config_path))
+            )
+            placemoe.calibration.expected_scope["model_id"] = model_id
         configure_moe_runtime_bridge(
             self.args.train.hiermoe,
             ep_group=ps.ep_group if getattr(ps, "ep_enabled", False) else None,
