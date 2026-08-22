@@ -18,10 +18,10 @@ import pytest
 import torch
 from torch import nn
 
+from placemoe import register_moe_model_adapter, resolve_moe_model_adapter
 from veomni.distributed.moe.hiermoe import expert_swap as expert_swap_module
 from veomni.distributed.moe.hiermoe.expert_swap import ExpertSwapManager, expand_redundant_expert_slots
 from veomni.distributed.moe.hiermoe.perf_model import HierMoEPerfModel
-from veomni.distributed.moe.hiermoe.placemoe.model_adapter import resolve_moe_model_adapter
 from veomni.distributed.moe.hiermoe.topology import Hierarchy
 from veomni.distributed.parallel_plan import _is_hiermoe_redundant_slot_expert_param as parallel_slot_param
 from veomni.models.module_utils import _is_hiermoe_redundant_slot_expert_param as checkpoint_slot_param
@@ -35,6 +35,18 @@ class _SplitProjectionExperts(nn.Module):
         self.gate_proj = nn.Parameter(torch.ones(2, 3, 2))
         self.up_proj = nn.Parameter(torch.full((2, 3, 2), 2.0))
         self.down_proj = nn.Parameter(torch.full((2, 2, 3), 3.0))
+
+
+def test_public_adapter_api_is_available_without_hiermoe_import_path() -> None:
+    assert callable(register_moe_model_adapter)
+    assert resolve_moe_model_adapter(_SplitProjectionExperts()).name == "stacked-split-gate-up"
+
+
+def test_model_registration_fails_when_no_expert_adapter_matches() -> None:
+    manager = object.__new__(ExpertSwapManager)
+
+    with pytest.raises(RuntimeError, match="did not find a supported expert module"):
+        manager.register_model(nn.Sequential(nn.Linear(2, 2)))
 
 
 def _manager() -> ExpertSwapManager:

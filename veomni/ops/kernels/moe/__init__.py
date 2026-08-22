@@ -116,8 +116,9 @@ def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
 
 # OpSlot kernel registrations
 
+from placemoe.model_adapter import require_moe_model_adapter
+
 from ....distributed.moe.hiermoe import get_hiermoe_expert_layer_key, get_hiermoe_expert_layer_key_from_params
-from ....distributed.moe.hiermoe.placemoe.model_adapter import require_moe_model_adapter
 from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
 
 

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import defaultdict
 from types import SimpleNamespace
 
 import pytest
@@ -76,3 +77,24 @@ def test_required_overlap_rolls_back_partial_hook_registration():
     assert registered.handle.removed is True
     assert manager._pipeline_grad_hook_handles == []
     assert manager._pipeline_grad_hook_params == set()
+
+
+def test_required_overlap_rejects_a_backward_path_that_bypasses_registered_hooks(monkeypatch):
+    manager = _manager()
+    manager._pipeline_layer_order = ("layers.0.experts",)
+    manager.layers = {
+        "layers.0.experts": SimpleNamespace(expert_parameters=(object(), object(), object())),
+    }
+    manager._pipeline_grad_ready = defaultdict(set, {"layers.0.experts": {0, 1}})
+    manager._pipeline_grad_submit_lock = SimpleNamespace(
+        __enter__=lambda _self: None,
+        __exit__=lambda _self, *_args: None,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_replica_grad_schedule_for_layer",
+        lambda _layer: SimpleNamespace(groups=(object(),)),
+    )
+
+    with pytest.raises(RuntimeError, match="did not observe all registered expert gradients"):
+        manager._finish_pipeline_gradient_sync()

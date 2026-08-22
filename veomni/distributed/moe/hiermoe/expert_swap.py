@@ -38,6 +38,8 @@ try:
 except ImportError:  # pragma: no cover - older torch fallback
     DTensor = ()  # type: ignore[assignment]
 
+from placemoe.model_adapter import MoEModelAdapter, resolve_moe_model_adapter
+
 from ....utils import logging
 from ....utils.accelerator_timing import AcceleratorEvent, record_accelerator_event
 from ....utils.device import get_device_type, get_torch_device, synchronize
@@ -63,7 +65,6 @@ from .greedy_planner import GreedyCommunicationPlanner, assign_tokens_to_copies_
 from .online_lut_planner import propose_online_lut_move
 from .perf_model import HierMoEPerfModel
 from .placemoe.artifacts import build_placemoe_artifact, validate_placemoe_artifact
-from .placemoe.model_adapter import MoEModelAdapter, resolve_moe_model_adapter
 from .placemoe.runtime import (
     HotUpdateController,
     HotUpdateJob,
@@ -5258,8 +5259,9 @@ class ExpertSwapManager:
                     if index >= len(order):
                         return
                     layer_key = order[index]
+                    expected_parameters = len(self.layers[layer_key].expert_parameters)
                     if (
-                        len(self._pipeline_grad_ready[layer_key]) < 2
+                        len(self._pipeline_grad_ready[layer_key]) < expected_parameters
                         or layer_key not in self._pipeline_grad_dispatch_complete
                     ):
                         return
@@ -5409,6 +5411,21 @@ class ExpertSwapManager:
     @torch.no_grad()
     def _finish_pipeline_gradient_sync(self) -> None:
         order = self._pipeline_layer_order or tuple(self.layers)
+        missing_hooks = {}
+        for layer_key in order:
+            layer = self.layers[layer_key]
+            if not self._replica_grad_schedule_for_layer(layer).groups:
+                continue
+            expected = set(range(len(layer.expert_parameters)))
+            missing = sorted(expected - self._pipeline_grad_ready[layer_key])
+            if missing:
+                missing_hooks[layer_key] = missing
+        if missing_hooks:
+            raise RuntimeError(
+                "PlaceMoE replica-gradient overlap did not observe all registered expert gradients: "
+                f"{missing_hooks}. Verify that every MoE layer uses the PlaceMoE dispatch path; blocking "
+                "synchronization is not selected automatically."
+            )
         with self._pipeline_grad_submit_lock:
             with self._pipeline_lock:
                 self._pipeline_grad_comm_blocked = False
@@ -5643,9 +5660,17 @@ class ExpertSwapManager:
                 )
 
     def register_model(self, model: nn.Module) -> None:
+        matched_layers = 0
         for key, module in model.named_modules():
             if self._is_expert_module(module):
                 self.register_layer(key, module)
+                matched_layers += 1
+        if matched_layers == 0:
+            raise RuntimeError(
+                "PlaceMoE did not find a supported expert module in the model. Standard stacked gate_up_proj/down_proj "
+                "and gate_proj/up_proj/down_proj experts are detected automatically; register a MoEModelAdapter for "
+                "another representation."
+            )
         self._normalize_ablation_layer_keys()
         if _FIXED_R2_LAYOUT:
             self.install_fixed_r2_layout()

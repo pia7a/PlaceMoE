@@ -12,32 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-independent metadata for expert-stacked parameters."""
+"""Compatibility exports for PlaceMoE expert-parameter metadata."""
 
 from __future__ import annotations
 
-
-FUSED_STACKED_EXPERT_PARAMETER_NAMES = ("gate_up_proj", "down_proj")
-SPLIT_STACKED_EXPERT_PARAMETER_NAMES = ("gate_proj", "up_proj", "down_proj")
-STACKED_EXPERT_PARAMETER_NAMES = frozenset(FUSED_STACKED_EXPERT_PARAMETER_NAMES + SPLIT_STACKED_EXPERT_PARAMETER_NAMES)
-
-
-def is_stacked_expert_parameter_name(parameter_name: str) -> bool:
-    """Whether a checkpoint key has an expert-indexed leading dimension.
-
-    Supported VeOmni MoE implementations expose either fused ``gate_up_proj``
-    or split ``gate_proj``/``up_proj`` tensors directly under ``experts``.
-    ``.weight`` is accepted for adapters that wrap the tensor in a module.
-    Per-expert ``ModuleList`` keys are intentionally excluded.
-    """
-
-    marker = ".experts."
-    if marker not in parameter_name:
-        return False
-    leaf = parameter_name.rsplit(marker, 1)[1]
-    if leaf.endswith(".weight"):
-        leaf = leaf[: -len(".weight")]
-    return leaf in STACKED_EXPERT_PARAMETER_NAMES
+from placemoe.model_adapter import (
+    FUSED_STACKED_EXPERT_PARAMETER_NAMES,
+    SPLIT_STACKED_EXPERT_PARAMETER_NAMES,
+    STACKED_EXPERT_PARAMETER_NAMES,
+    is_stacked_expert_parameter_name,
+)
 
 
 __all__ = [

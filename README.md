@@ -199,6 +199,21 @@ model-name branch, and other layouts can register a small adapter.
 Scripts under `scripts/placemoe/reproduction/` preserve paper testbeds and are
 not production configuration interfaces.
 
+### Using an existing VeOmni model integration
+
+The trainer and EP host call PlaceMoE through the versioned
+`veomni.moe_runtime_bridges` interface. A user who has only added or modified a
+model in VeOmni should carry those model files, registration, and parallel plan
+into this checkout; the training loop does not require model-specific PlaceMoE
+patches. Fused `gate_up_proj`/`down_proj` and split
+`gate_proj`/`up_proj`/`down_proj` experts are detected automatically. Other
+representations register one adapter through the public
+`placemoe.register_moe_model_adapter` API.
+
+PlaceMoE fails before training if no expert adapter matches. It also requires
+replica-gradient overlap hooks to register and execute; blocking replica
+synchronization is never selected implicitly.
+
 ## Controlling layout and mapping updates
 
 `L` and `M` use independent update intervals:
@@ -222,7 +237,8 @@ are coalesced while training continues with the current pair. With
 | --- | --- |
 | `veomni/distributed/moe/hiermoe/placemoe/` | Routing statistics, allocation, placement, mapping, exact-cost optimization, and artifact validation. |
 | `veomni/distributed/moe/hiermoe/placemoe/runtime/` | Typed configuration, independent update scheduling, asynchronous planner control, and process construction. |
-| `veomni/distributed/moe/hiermoe/placemoe/model_adapter.py` | Stable model boundary for expert parameters and fused-kernel weights. |
+| `veomni/distributed/moe/runtime_bridge.py` | Versioned lifecycle boundary between VeOmni and an MoE runtime provider. |
+| `placemoe/model_adapter.py` | Public model boundary for expert parameters and fused-kernel weights. |
 | `scripts/profile/plan_placemoe.py` | Canonical offline and runtime planner CLI. |
 | `scripts/placemoe/launch_npu.sh` | Thin, model-independent multi-node NPU launcher. |
 | `scripts/placemoe/reproduction/npu_ep32.sh` | Original NPU EP32 paper-reproduction launcher. |

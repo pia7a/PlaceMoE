@@ -1,8 +1,8 @@
 # PlaceMoE pre-training
 
-PlaceMoE is a built-in VeOmni MoE runtime extension. It uses the normal model,
-data, trainer, FSDP2, and distributed-launch interfaces; the only additional
-configuration lives under `train.hiermoe.placemoe`.
+PlaceMoE integrates through VeOmni's versioned MoE runtime bridge. It uses the
+normal model, data, trainer, FSDP2, and distributed-launch interfaces; the only
+additional configuration lives under `train.hiermoe.placemoe`.
 
 ## 1. Prepare the environment
 
@@ -170,10 +170,17 @@ another parameter layout registers one `MoEModelAdapter` that returns its
 expert-stacked parameters and normalized fused-kernel weights:
 
 ```python
-from veomni.distributed.moe.hiermoe.placemoe import register_moe_model_adapter
+from placemoe import register_moe_model_adapter
 
 register_moe_model_adapter(MyModelAdapter())
 ```
+
+Therefore, a model already integrated through VeOmni's standard model and EP
+interfaces needs no PlaceMoE-specific model changes when it uses either default
+expert representation. PlaceMoE fails during model binding if no adapter
+matches, and fails during the first backward pass if the required
+replica-gradient hooks do not execute; it never silently selects blocking
+replica synchronization.
 
 The planner remains unchanged because it consumes logical routes, topology,
 capacities, and calibration rather than model-specific modules.

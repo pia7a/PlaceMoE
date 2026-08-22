@@ -14,7 +14,38 @@
 
 """Public PlaceMoE integration package."""
 
-from .bridge import PlaceMoERuntimeBridge
+from .model_adapter import (
+    FUSED_STACKED_EXPERT_PARAMETER_NAMES,
+    SPLIT_STACKED_EXPERT_PARAMETER_NAMES,
+    STACKED_EXPERT_PARAMETER_NAMES,
+    ExpertParameter,
+    MoEKernelWeights,
+    MoEModelAdapter,
+    is_stacked_expert_parameter_name,
+    register_moe_model_adapter,
+    require_moe_model_adapter,
+    resolve_moe_model_adapter,
+)
 
 
-__all__ = ["PlaceMoERuntimeBridge"]
+def __getattr__(name: str):
+    if name == "PlaceMoERuntimeBridge":
+        from .bridge import PlaceMoERuntimeBridge
+
+        return PlaceMoERuntimeBridge
+    raise AttributeError(name)
+
+
+__all__ = [
+    "ExpertParameter",
+    "FUSED_STACKED_EXPERT_PARAMETER_NAMES",
+    "MoEKernelWeights",
+    "MoEModelAdapter",
+    "PlaceMoERuntimeBridge",
+    "SPLIT_STACKED_EXPERT_PARAMETER_NAMES",
+    "STACKED_EXPERT_PARAMETER_NAMES",
+    "is_stacked_expert_parameter_name",
+    "register_moe_model_adapter",
+    "require_moe_model_adapter",
+    "resolve_moe_model_adapter",
+]

@@ -24,7 +24,8 @@ import torch
 import torch.nn as nn
 from torch.distributed._tensor import DeviceMesh, DTensor, Replicate, Shard
 
-from ..models.moe_parameter import is_stacked_expert_parameter_name
+from placemoe.model_adapter import is_stacked_expert_parameter_name
+
 from ..utils import logging
 from .utils import check_fqn_match, get_module_from_path, set_module_from_path
 
