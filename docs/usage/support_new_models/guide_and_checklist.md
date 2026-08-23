@@ -1,5 +1,7 @@
 # Support New Models — Guide and Checklist
 
+English | [中文](guide_and_checklist_zh.md)
+
 **TLDR:** VeOmni layers FSDP, Sequence Parallelism (SP), Expert Parallelism (EP), and fused kernels on top of HuggingFace models. This guide walks you through the integration steps with checklists per model type. For worked examples, see:
 - [qwen3_vl_example.md](./qwen3_vl_example.md) — VLM + MoE (image/video, deepstack, EP)
 - [qwen3_omni_moe_example.md](./qwen3_omni_moe_example.md) — Omni-modal MoE (image/video/audio, talker)

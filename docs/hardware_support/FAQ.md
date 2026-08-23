@@ -1,5 +1,7 @@
 # FAQ: Common Issues and Solutions for Ascend NPU
 
+English | [中文](FAQ_zh.md)
+
 This document addresses frequently asked questions and common issues encountered when using VeOmni with Ascend NPUs.
 
 ## Q: How to resolve memory fragmentation issues on NPU?

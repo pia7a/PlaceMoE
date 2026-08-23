@@ -44,6 +44,19 @@ usage/agent_workflow.md
 
 ```{toctree}
 :maxdepth: 1
+:caption: PlaceMoE 中文文档
+
+usage/placemoe_container_quickstart_zh.md
+usage/placemoe_image_distribution_zh.md
+usage/placemoe_pretraining_zh.md
+usage/placemoe_veomni_bridge_zh.md
+perf/placemoe_code_map_zh.md
+usage/support_new_models/guide_and_checklist_zh.md
+hardware_support/FAQ_zh.md
+```
+
+```{toctree}
+:maxdepth: 1
 :caption: Hardware Support
 
 hardware_support/get_started_npu.md

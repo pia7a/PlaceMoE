@@ -1,5 +1,7 @@
 # PlaceMoE Code Map
 
+English | [中文](placemoe_code_map_zh.md)
+
 This document is the source of truth for the PlaceMoE refactor. It separates
 the paper algorithm, the training runtime, retained baselines, and historical
 profiling artifacts. The refactor must keep the existing runtime artifact

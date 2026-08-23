@@ -1,5 +1,7 @@
 # Packaging and distributing the PlaceMoE Ascend image
 
+English | [中文](placemoe_image_distribution_zh.md)
+
 This guide describes how to preserve a validated PlaceMoE image, transfer it
 to an offline Ascend cluster, and load the identical image on every node. A
 Docker image archive contains the image and all parent layers, so the target

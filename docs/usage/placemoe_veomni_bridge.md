@@ -1,5 +1,7 @@
 # Integrating PlaceMoE with a model-modified VeOmni fork
 
+English | [中文](placemoe_veomni_bridge_zh.md)
+
 PlaceMoE separates model integration from MoE runtime integration. The VeOmni
 host invokes an MoE provider through the versioned
 `veomni.moe_runtime_bridges` entry point, while PlaceMoE discovers expert

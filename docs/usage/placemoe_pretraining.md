@@ -1,5 +1,7 @@
 # PlaceMoE pre-training
 
+English | [中文](placemoe_pretraining_zh.md)
+
 PlaceMoE integrates through VeOmni's versioned MoE runtime bridge. It uses the
 normal model, data, trainer, FSDP2, and distributed-launch interfaces; the only
 additional configuration lives under `train.hiermoe.placemoe`.

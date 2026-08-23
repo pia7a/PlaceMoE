@@ -4,6 +4,8 @@
 
 ### Accelerating MoE Training through Expert Placement and Replica Coordination
 
+English | [中文](README_zh.md)
+
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](pyproject.toml)
 [![Repository](https://img.shields.io/badge/GitHub-pia7a%2FPlaceMoE-black?logo=github)](https://github.com/pia7a/PlaceMoE)
@@ -121,7 +123,8 @@ For offline clusters and multi-node image distribution, see
 [Packaging and distributing the Ascend image](docs/usage/placemoe_image_distribution.md).
 After loading the image, follow the
 [Ascend container quick start](docs/usage/placemoe_container_quickstart.md)
-to mount NPUs, models, datasets, and configurations and launch training.
+([中文](docs/usage/placemoe_container_quickstart_zh.md)) to mount NPUs, models,
+datasets, configurations, source, and outputs and launch training.
 
 After setting the runtime and planner artifact paths in the training YAML, the
 recommended preparation command creates only the missing artifacts. Run it on
