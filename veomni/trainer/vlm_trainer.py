@@ -21,6 +21,7 @@ import torch
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import MainCollator, build_data_transform, build_multimodal_chat_template
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
+from ..distributed.moe.runtime_bridge import get_moe_runtime_bridge
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.torch_compile import (
     CompileConfig,
@@ -316,6 +317,7 @@ class VLMTrainer:
             no_decay_params=args.train.optimizer.no_decay_params,
             muon_kwargs=_collect_muon_kwargs(args.train.optimizer),
         )
+        get_moe_runtime_bridge().bind_optimizer(self.base.optimizer)
 
     def on_train_begin(self):
         self.base.on_train_begin()
@@ -370,6 +372,8 @@ class VLMTrainer:
             total_loss += loss.item()
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
+
+        self.base.sync_hiermoe_redundant_gradients()
 
         # Gradient clipping (reads FSDP/EP groups from current ParallelState)
         with use_parallel_state("base"):

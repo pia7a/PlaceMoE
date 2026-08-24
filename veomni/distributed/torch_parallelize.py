@@ -41,6 +41,22 @@ from .utils import check_fqn_match, sort_fqn_by_submodule_first
 logger = logging.get_logger(__name__)
 
 
+def _resolve_checkpoint_context_fn(external_context_fn):
+    from .moe.hiermoe.state import (
+        hiermoe_checkpoint_context_fn,
+        hiermoe_checkpoint_physical_route_replay_enabled,
+        hiermoe_checkpoint_replay_enabled,
+    )
+
+    if not hiermoe_checkpoint_replay_enabled():
+        return external_context_fn
+    if hiermoe_checkpoint_physical_route_replay_enabled():
+        logger.info_rank0("Enable HierMoE activation-checkpoint physical-route replay.")
+    else:
+        logger.info_rank0("Enable HierMoE activation-checkpoint recompute guard for static physical routes.")
+    return partial(hiermoe_checkpoint_context_fn, external_context_fn)
+
+
 def _reset_hf_initialized_flag(module: nn.Module) -> None:
     if hasattr(module, "_is_hf_initialized"):
         module._is_hf_initialized = False
@@ -212,6 +228,15 @@ def parallelize_model_fsdp2(
         # Add SpecInfo to extra_parallel modules,
         #   e.g. embed_tokens.weight, decoder.regular_mlp, decoder.embed_tokens.weight, and decoder.moe.experts
         fqn2spec_info = parallel_plan.apply(model, parallel_state.extra_parallel_fsdp_device_mesh)
+        if parallel_state.extra_parallel_enabled("ep"):
+            from .moe.runtime_bridge import get_configured_moe_runtime_bridge
+
+            moe_runtime_bridge = get_configured_moe_runtime_bridge()
+            if moe_runtime_bridge is not None:
+                moe_runtime_bridge.maybe_expand_expert_slots(
+                    model,
+                    parallel_state.extra_parallel_sizes["ep"],
+                )
 
         model._fqn2spec_info = fqn2spec_info
         _extra_parallel_mesh = {}
@@ -645,7 +670,7 @@ def build_parallelize_model(
 
         gradient_checkpointing_kwargs = {
             "use_reentrant": use_reentrant,
-            "context_fn": kwargs.pop("recompute_context_fn", noop_context_fn),
+            "context_fn": _resolve_checkpoint_context_fn(kwargs.pop("recompute_context_fn", noop_context_fn)),
         }
         if not use_reentrant:
             gradient_checkpointing_kwargs["early_stop"] = checkpoint_early_stop

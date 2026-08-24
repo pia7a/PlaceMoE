@@ -40,6 +40,8 @@ from tqdm import tqdm
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 
+from placemoe.model_adapter import is_stacked_expert_parameter_name
+
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.device import get_device_type, synchronize
@@ -61,6 +63,23 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+
+def _is_hiermoe_redundant_slot_expert_param(
+    para_group_name: str,
+    parameter_name: str,
+    tensor_shape: torch.Size,
+    target_shape: torch.Size,
+    para_size: int,
+) -> bool:
+    if para_group_name != "ep" or len(tensor_shape) < 1 or len(target_shape) < 1:
+        return False
+    if not is_stacked_expert_parameter_name(parameter_name):
+        return False
+    if tensor_shape[0] % int(para_size) != 0:
+        return False
+    base_chunk_dim0 = tensor_shape[0] // int(para_size)
+    return target_shape[0] > base_chunk_dim0 and tuple(tensor_shape[1:]) == tuple(target_shape[1:])
 
 
 _FLOAT8_DTYPES = tuple(
@@ -1142,6 +1161,31 @@ def rank0_load_and_broadcast_weights(
         parameter_names_to_load.discard(name)
         del tensor
 
+    def _requires_full_hiermoe_broadcast(name: str, shape: torch.Size) -> bool:
+        """Return whether an EP tensor must remain whole to materialize replicas.
+
+        The regular large-tensor path sends one contiguous EP shard to each
+        rank. A PlaceMoE layout may assign a rank copies owned by several
+        different EP shards, so the runtime parallel plan must see the complete
+        logical-expert tensor and gather the requested copies itself.
+        """
+        if parallel_plan is None or name not in parameter_names_to_load:
+            return False
+        para_group_name = parallel_plan._get_shard_parameter_groupname(name)
+        if para_group_name != "ep":
+            return False
+        module, local_name = _find_submodule(model, name)
+        target_shape = module._parameters[local_name].shape
+        parallel_state = get_parallel_state()
+        para_size = parallel_state.extra_parallel_sizes[para_group_name]
+        return _is_hiermoe_redundant_slot_expert_param(
+            para_group_name,
+            name,
+            torch.Size(shape),
+            target_shape,
+            para_size,
+        )
+
     # --- Broadcast shard count ---
     state_dict_iterators = _load_state_dict(weights_path) if global_rank == 0 else None
     shard_count = len(state_dict_iterators) if global_rank == 0 else 0
@@ -1221,6 +1265,16 @@ def rank0_load_and_broadcast_weights(
 
             if name is None or shape is None or dtype is None:
                 raise RuntimeError("Received incomplete broadcast metadata.")
+            # Every rank owns the same live-model key set, so all ranks can
+            # skip checkpoint tensors that the current model does not use.
+            # In particular, reduced-layer validation models often reuse a
+            # full checkpoint; broadcasting those unused tensors needlessly
+            # consumes communication memory and can leave a long queue of
+            # accelerator collectives before the first training step.
+            if name not in buffer_dict and name not in parameter_names_to_load:
+                logger.info_rank0(f"Unexpected key in state dict: {name}.")
+                del tensor
+                continue
             if (
                 (
                     (cpu_load_param_name is not None and name in cpu_load_param_name)
@@ -1228,6 +1282,7 @@ def rank0_load_and_broadcast_weights(
                 )
                 and name in parameter_names_to_load
                 and (parallel_plan is not None and parallel_plan._get_shard_parameter_groupname(name) is not None)
+                and not _requires_full_hiermoe_broadcast(name, shape)
             ):
                 _chunk_and_broadcast_and_dispatch(name, shape, dtype, tensor)
             else:
@@ -1272,6 +1327,10 @@ def rank0_load_and_broadcast_weights(
             dtype = metadata.dtype
             if name is None or shape is None or dtype is None:
                 raise RuntimeError("Received incomplete broadcast metadata from finalize.")
+            if name not in buffer_dict and name not in parameter_names_to_load:
+                logger.info_rank0(f"Unexpected key in state dict: {name}.")
+                del tensor
+                continue
             _broadcast_and_dispatch(name, shape, dtype, tensor)
 
     if is_peft_model and adapter_path:

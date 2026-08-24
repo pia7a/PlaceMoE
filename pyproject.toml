@@ -31,7 +31,15 @@ dependencies = [
   "setuptools",
   "einops>=0.8.1",
   "matplotlib>=3.7",  # veomni.utils.moe_monitor expert-load heatmap
+  "scikit-learn>=1.6",  # PlaceMoE spectral partition initialization
+  "scipy>=1.11",  # PlaceMoE capacity-constrained assignment and matching
 ]
+
+[project.scripts]
+placemoe = "veomni.distributed.moe.hiermoe.placemoe.cli:main"
+
+[project.entry-points."veomni.moe_runtime_bridges"]
+placemoe = "placemoe.bridge:create_bridge"
 
 [project.optional-dependencies]
 # Three mutually-exclusive hardware extras (see `[tool.uv].conflicts`): a

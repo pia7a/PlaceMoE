@@ -16,7 +16,7 @@ import math
 import os
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from ..utils import logging
 from ..utils.env import get_env
@@ -622,6 +622,314 @@ class CheckpointConfig:
 
 
 @dataclass
+class PlaceMoEHotUpdateArguments:
+    """train.hiermoe.placemoe.hot_update.* — Periodic PlaceMoE updates."""
+
+    enabled: bool = False
+    layout_interval_steps: int = 0
+    mapping_interval_steps: int = 0
+    last_update_step: int = 2**31 - 1
+    work_root: str = "/tmp/veomni_placemoe_hot_update"
+    planner_path: str = ""
+    failure_policy: Literal["continue", "raise"] = "continue"
+
+
+@dataclass
+class PlaceMoECalibrationArguments:
+    """train.hiermoe.placemoe.calibration.* — Planner cost coefficients."""
+
+    inter_ms_per_byte: Optional[float] = None
+    intra_ms_per_byte: Optional[float] = None
+    route_ms_per_assignment: Optional[float] = None
+    communication_multiplier: Optional[float] = None
+    compute_ms_per_assignment: Optional[float] = None
+    compute_multiplier: Optional[float] = None
+    artifact: str = ""
+    require_scope: bool = False
+    expected_scope: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PlaceMoEPlannerResourceArguments:
+    """train.hiermoe.placemoe.resources.* — CPU planner resources."""
+
+    workers: int = 48
+    candidate_workers: int = 4
+    worker_threads: int = 1
+    planner_cpu_ids: str = ""
+    training_cpu_ids: str = ""
+
+
+@dataclass
+class PlaceMoEArguments:
+    """train.hiermoe.placemoe.* — Canonical PlaceMoE runtime configuration."""
+
+    enabled: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable the canonical PlaceMoE runtime preset. This selects hierarchical token deduplication, "
+                "source-aware dispatch, step-boundary updates, and replica-gradient overlap without enabling "
+                "the legacy swap/cover planners."
+            )
+        },
+    )
+    config_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional legacy PlaceMoE YAML/JSON file. Inline fields are preferred."},
+    )
+    base_directory: str = field(
+        default="",
+        metadata={"help": "Base directory for relative PlaceMoE paths. Empty uses the launch directory."},
+    )
+    initial_artifact: str = field(
+        default="",
+        metadata={"help": "Optional initial PlaceMoE layout artifact. Empty starts from the default layout."},
+    )
+    runtime_perf_model: str = ""
+    hot_update: PlaceMoEHotUpdateArguments = field(default_factory=PlaceMoEHotUpdateArguments)
+    calibration: PlaceMoECalibrationArguments = field(default_factory=PlaceMoECalibrationArguments)
+    resources: PlaceMoEPlannerResourceArguments = field(default_factory=PlaceMoEPlannerResourceArguments)
+
+
+@dataclass
+class HierMoEConfig:
+    """train.hiermoe.* — Hierarchical MoE communication controls."""
+
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Enable HierMoE dispatch/combine optimization for expert parallel MoE."},
+    )
+    token_dedup: bool = field(
+        default=True,
+        metadata={"help": "Deduplicate tokens across hierarchical communication groups."},
+    )
+    communication_mode: Literal["auto", "direct", "hierarchical"] = field(
+        default="hierarchical",
+        metadata={
+            "help": (
+                "MoE communication path. 'hierarchical' always uses the deepest topology-supported path "
+                "(default), 'direct' always uses rank-level All-to-All, and 'auto' selects the predicted "
+                "fastest path from the profiled alpha/beta model for each current route."
+            )
+        },
+    )
+    expert_swap: bool = field(
+        default=True,
+        metadata={"help": "Enable hierarchical expert swap when HierMoE is active."},
+    )
+    expert_swap_interval: int = field(
+        default=1,
+        metadata={"help": "Number of training steps between expert swap decisions."},
+    )
+    expert_swap_max_pairs_per_layer: int = field(
+        default=1,
+        metadata={"help": "Maximum disjoint expert pairs to swap per MoE layer; 0 disables swaps."},
+    )
+    expert_swap_selector: Literal["current_joint", "hiermoe_exact_p1", "hiermoe_greedy_cover_p1", "legacy_batched"] = (
+        field(
+            default="current_joint",
+            metadata={
+                "help": (
+                    "Expert-swap selector. current_joint uses the current communication-plus-compute planner; "
+                    "hiermoe_exact_p1 evaluates every expert pair with HierMoE exact duplicate-free "
+                    "hierarchical communication cost and applies the globally best improving pair in either "
+                    "step or current-route layer mode; "
+                    "hiermoe_greedy_cover_p1 jointly evaluates one owner swap or one redundant-slot cover "
+                    "from exact current-layer routes, optimizes communication only, fills empty slots before "
+                    "steady-state search, and accepts only a strictly improving steady-state action; "
+                    "legacy_batched restores the approximate batched fast-2D/fast-hierarchy P1 selector and "
+                    "the compact route-summary P4 selector used by the historical implementation."
+                )
+            },
+        )
+    )
+    redundant_slot_increment_per_device: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Extra physical expert slots reserved per EP rank for HierMoE slot-level redundant expert copies. "
+                "0 keeps the original one-copy-per-logical-expert layout."
+            )
+        },
+    )
+    greedy_max_copies_per_expert: int = field(
+        default=4,
+        metadata={
+            "help": (
+                "Maximum physical copies per logical expert for hiermoe_greedy_cover_p1. "
+                "Must be between 1 and 8; 4 balances placement freedom and fused planner cost."
+            )
+        },
+    )
+    max_slot_op_search_rounds: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Maximum non-KEEP redundant-slot actions per MoE layer. None uses the total redundant-slot "
+                "capacity (redundant_slot_increment_per_device * ep_size); 0 disables replica planning."
+            )
+        },
+    )
+    planner_route_sample_size: int = field(
+        default=1024,
+        metadata={
+            "help": (
+                "Per-rank deterministic token sample budget used by the current-route placement planner. "
+                "The planner samples min(local_token_count, planner_route_sample_size) complete top-k routes."
+            )
+        },
+    )
+    expert_swap_mode: Literal["step", "layer"] = field(
+        default="step",
+        metadata={
+            "help": (
+                "When to run Expert Swap. 'step' preserves the paper-style step-end swap using the previous "
+                "routing sample; 'layer' swaps immediately after each MoE layer obtains current router results."
+            )
+        },
+    )
+    fixed_pipeline_overlap: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable the fixed cross-step HierMoE overlap pipeline. In step mode, each layer plans from its "
+                "current route on a dedicated ordered worker, redundant gradients synchronize as layer gradients "
+                "become ready, and accepted swap/cover migrations prefetch before the next use of that layer."
+            )
+        },
+    )
+    use_from_step: int = field(
+        default=0,
+        metadata={"help": "Must be 0. HierMoE starts from formal training step 0 when enabled."},
+    )
+    topology: Literal["auto"] = field(
+        default="auto",
+        metadata={"help": "Hierarchy topology source. Currently supports auto."},
+    )
+    hierarchy_group_sizes: List[int] = field(
+        default_factory=list,
+        metadata={"help": "Optional hierarchy group sizes. Empty means infer from the EP group topology."},
+    )
+    fit_perf_model_on_startup: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Fit alpha/beta performance model before training step 0; required for active placement "
+                "when perf_model_path is unset."
+            )
+        },
+    )
+    perf_model_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Path to benchmark-generated JSON alpha/beta coefficients; required for active placement "
+                "unless startup fitting is enabled."
+            )
+        },
+    )
+    smooth_max_gamma: float = field(
+        default=10,
+        metadata={"help": "Smooth-max gamma for Expert Swap cost estimation."},
+    )
+    log_interval: int = field(
+        default=10,
+        metadata={"help": "Number of steps between rank0 HierMoE metric logs."},
+    )
+    debug_validate: bool = field(
+        default=False,
+        metadata={"help": "Run additional baseline timing/validation for HierMoE debugging."},
+    )
+    placemoe: PlaceMoEArguments = field(default_factory=PlaceMoEArguments)
+
+    def __post_init__(self):
+        if self.placemoe.enabled:
+            self.enable = True
+            self.token_dedup = True
+            self.communication_mode = "hierarchical"
+            self.expert_swap = True
+            self.expert_swap_max_pairs_per_layer = 0
+            self.expert_swap_selector = "hiermoe_greedy_cover_p1"
+            self.expert_swap_mode = "step"
+            self.fixed_pipeline_overlap = True
+            self.max_slot_op_search_rounds = 0
+        if self.communication_mode not in {"auto", "direct", "hierarchical"}:
+            raise ValueError("train.hiermoe.communication_mode must be auto, direct, or hierarchical.")
+        if self.expert_swap_interval < 1:
+            raise ValueError("train.hiermoe.expert_swap_interval must be >= 1.")
+        if self.expert_swap_max_pairs_per_layer < 0:
+            raise ValueError("train.hiermoe.expert_swap_max_pairs_per_layer must be >= 0.")
+        if self.expert_swap_selector not in {
+            "current_joint",
+            "hiermoe_exact_p1",
+            "hiermoe_greedy_cover_p1",
+            "legacy_batched",
+        }:
+            raise ValueError(
+                "train.hiermoe.expert_swap_selector must be current_joint, hiermoe_exact_p1, "
+                "hiermoe_greedy_cover_p1, or legacy_batched."
+            )
+        if self.expert_swap_selector == "hiermoe_exact_p1":
+            if self.expert_swap_max_pairs_per_layer != 1:
+                raise ValueError(
+                    "train.hiermoe.expert_swap_selector=hiermoe_exact_p1 requires expert_swap_max_pairs_per_layer=1."
+                )
+            if self.redundant_slot_increment_per_device != 0:
+                raise ValueError(
+                    "train.hiermoe.expert_swap_selector=hiermoe_exact_p1 does not support redundant slots."
+                )
+        if self.expert_swap_selector == "hiermoe_greedy_cover_p1":
+            if self.expert_swap_max_pairs_per_layer > 1:
+                raise ValueError(
+                    "train.hiermoe.expert_swap_selector=hiermoe_greedy_cover_p1 supports at most one "
+                    "steady-state swap per layer."
+                )
+            if self.redundant_slot_increment_per_device <= 0:
+                raise ValueError(
+                    "train.hiermoe.expert_swap_selector=hiermoe_greedy_cover_p1 requires redundant slots."
+                )
+        if self.expert_swap_selector == "legacy_batched":
+            if self.redundant_slot_increment_per_device != 0:
+                raise ValueError("train.hiermoe.expert_swap_selector=legacy_batched does not support redundant slots.")
+            if self.expert_swap_mode != "step":
+                raise ValueError("train.hiermoe.expert_swap_selector=legacy_batched requires expert_swap_mode=step.")
+        if self.fixed_pipeline_overlap:
+            if self.expert_swap_mode != "step":
+                raise ValueError("train.hiermoe.fixed_pipeline_overlap requires expert_swap_mode=step.")
+            if not self.expert_swap:
+                raise ValueError("train.hiermoe.fixed_pipeline_overlap requires expert_swap=true.")
+            if self.redundant_slot_increment_per_device <= 0:
+                raise ValueError(
+                    "train.hiermoe.fixed_pipeline_overlap requires redundant_slot_increment_per_device>0."
+                )
+            if self.expert_swap_selector != "hiermoe_greedy_cover_p1":
+                raise ValueError(
+                    "train.hiermoe.fixed_pipeline_overlap currently requires "
+                    "expert_swap_selector=hiermoe_greedy_cover_p1."
+                )
+
+        if self.redundant_slot_increment_per_device < 0:
+            raise ValueError("train.hiermoe.redundant_slot_increment_per_device must be >= 0.")
+        if not 1 <= self.greedy_max_copies_per_expert <= 8:
+            raise ValueError("train.hiermoe.greedy_max_copies_per_expert must be between 1 and 8.")
+        if self.max_slot_op_search_rounds is not None and self.max_slot_op_search_rounds < 0:
+            raise ValueError("train.hiermoe.max_slot_op_search_rounds must be >= 0.")
+        if self.planner_route_sample_size <= 0:
+            raise ValueError("train.hiermoe.planner_route_sample_size must be > 0.")
+        if self.expert_swap_mode not in {"step", "layer"}:
+            raise ValueError("train.hiermoe.expert_swap_mode must be 'step' or 'layer'.")
+        if self.use_from_step != 0:
+            raise ValueError("train.hiermoe.use_from_step must be 0 for step-0 HierMoE activation.")
+        if self.smooth_max_gamma <= 0:
+            raise ValueError("train.hiermoe.smooth_max_gamma must be positive.")
+        if self.log_interval < 1:
+            raise ValueError("train.hiermoe.log_interval must be >= 1.")
+        if any(size <= 0 for size in self.hierarchy_group_sizes):
+            raise ValueError("train.hiermoe.hierarchy_group_sizes must contain only positive integers.")
+
+
+@dataclass
 class TorchCompileConfig:
     """train.torch_compile.* — Per-block torch.compile options."""
 
@@ -792,6 +1100,7 @@ class TrainingArguments:
     chunk_mbs_config: ChunkMBSConfig = field(default_factory=ChunkMBSConfig)
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    hiermoe: HierMoEConfig = field(default_factory=HierMoEConfig)
 
     def __post_init__(self):
         if self.dyn_bsz_physical_overflow_ratio < 1.0:
@@ -808,6 +1117,7 @@ class TrainingArguments:
 
         self._validate_accelerator()
         self._derive_batch_config()
+        self._validate_hiermoe()
         self._resolve_checkpoint_paths()
         self._resolve_profile()
 
@@ -876,6 +1186,31 @@ class TrainingArguments:
             "train.ep_sharded_stream_load requires train.broadcast_model_weights_from_rank0=False "
             "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
         )
+
+    def _validate_hiermoe(self):
+        if self.hiermoe.enable and self.accelerator.ep_size <= 1:
+            logger.warning_rank0(
+                "train.hiermoe.enable=true but ep_size <= 1; HierMoE will no-op to the original MoE path."
+            )
+        placement_enabled = bool(
+            self.hiermoe.enable
+            and self.hiermoe.token_dedup
+            and self.hiermoe.expert_swap
+            and self.accelerator.ep_size > 1
+            and (
+                self.hiermoe.expert_swap_max_pairs_per_layer > 0
+                or self.hiermoe.redundant_slot_increment_per_device > 0
+            )
+        )
+        if placement_enabled and self.accelerator.fsdp_config.offload:
+            raise ValueError(
+                "HierMoE swap/replica placement does not support train.accelerator.fsdp_config.offload=true."
+            )
+        if placement_enabled and self.hiermoe.expert_swap_mode == "layer" and self.gradient_accumulation_steps != 1:
+            raise ValueError(
+                "train.hiermoe.expert_swap_mode='layer' requires gradient_accumulation_steps == 1 so the "
+                "current-route placement remains fixed for the complete forward/backward pass."
+            )
 
     def _derive_batch_config(self):
         acc = self.accelerator

@@ -13,18 +13,128 @@
 # limitations under the License.
 
 
+import json
+import os
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Dict, Union
 
 import torch
 import torch.nn as nn
 from torch.distributed._tensor import DeviceMesh, DTensor, Replicate, Shard
 
+from placemoe.model_adapter import is_stacked_expert_parameter_name
+
 from ..utils import logging
 from .utils import check_fqn_match, get_module_from_path, set_module_from_path
 
 
 logger = logging.get_logger(__name__)
+
+
+@lru_cache(maxsize=4)
+def _resolve_hiermoe_initial_layout_path(config_path: str, hiermoe_path: str) -> str:
+    if config_path:
+        from .moe.hiermoe.placemoe.runtime import PlaceMoERuntimeConfig
+
+        config = PlaceMoERuntimeConfig.from_file(config_path)
+        if config.initial_artifact:
+            return config.initial_artifact
+    return hiermoe_path
+
+
+def _hiermoe_initial_layout_path() -> str:
+    from .moe.hiermoe.placemoe.runtime import get_current_runtime_config
+
+    current = get_current_runtime_config()
+    if current.source_path:
+        return current.initial_artifact
+    legacy_enabled = os.environ.get("VEOMNI_PLACEMOE_USE_LEGACY_CONFIG", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not legacy_enabled:
+        return ""
+    return _resolve_hiermoe_initial_layout_path(
+        os.environ.get("VEOMNI_PLACEMOE_CONFIG", "").strip(),
+        os.environ.get("VEOMNI_HIERMOE_INITIAL_LAYOUT", "").strip(),
+    )
+
+
+_hiermoe_initial_layout_path.cache_clear = _resolve_hiermoe_initial_layout_path.cache_clear  # type: ignore[attr-defined]
+
+
+@lru_cache(maxsize=4)
+def _hiermoe_initial_layouts(path: str) -> dict[str, tuple[int, ...]]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    raw_layers = payload.get("layers")
+    if not isinstance(raw_layers, dict) or not raw_layers:
+        raise ValueError(f"HierMoE initial layout file {path!r} has no layer layouts.")
+    layouts: dict[str, tuple[int, ...]] = {}
+    for layer_key, raw_layer in raw_layers.items():
+        if not isinstance(raw_layer, dict) or "slot_to_logical" not in raw_layer:
+            raise ValueError(f"HierMoE initial layout layer {layer_key!r} has no slot_to_logical.")
+        layouts[str(layer_key)] = tuple(int(value) for value in raw_layer["slot_to_logical"])
+    return layouts
+
+
+def _hiermoe_initial_layout_shard(
+    tensor: torch.Tensor,
+    parameter_name: str,
+    target_shape: tuple,
+    *,
+    para_rank: int,
+) -> torch.Tensor | None:
+    path = _hiermoe_initial_layout_path()
+    if not path:
+        return None
+    layer_key = parameter_name.rsplit(".", maxsplit=1)[0]
+    layouts = _hiermoe_initial_layouts(path)
+    if layer_key not in layouts:
+        marker = ".layers."
+        suffix = layer_key[layer_key.index(marker) :] if marker in layer_key else ""
+        matches = [key for key in layouts if suffix and key.endswith(suffix)]
+        if len(matches) != 1:
+            raise ValueError(
+                f"HierMoE initial layout file {path!r} has no unambiguous layer for {layer_key!r}; "
+                f"suffix={suffix!r}, matches={matches}."
+            )
+        layer_key = matches[0]
+    local_slots = int(target_shape[0])
+    slot_start = int(para_rank) * local_slots
+    logical_experts = layouts[layer_key][slot_start : slot_start + local_slots]
+    if len(logical_experts) != local_slots:
+        raise ValueError(f"HierMoE initial layout for {layer_key!r} does not cover EP rank {para_rank}.")
+    result = tensor.new_zeros(target_shape)
+    active_slots = [slot for slot, logical in enumerate(logical_experts) if logical >= 0]
+    if active_slots:
+        slot_indices = torch.tensor(active_slots, dtype=torch.long, device=tensor.device)
+        expert_indices = torch.tensor(
+            [logical_experts[slot] for slot in active_slots], dtype=torch.long, device=tensor.device
+        )
+        result.index_copy_(0, slot_indices, tensor.index_select(0, expert_indices))
+    return result
+
+
+def _is_hiermoe_redundant_slot_expert_param(
+    shard_group: str,
+    parameter_name: str,
+    tensor_shape: torch.Size,
+    target_shape: tuple,
+    para_size: int,
+) -> bool:
+    return bool(
+        shard_group == "ep"
+        and len(tensor_shape) >= 1
+        and len(target_shape) >= 1
+        and is_stacked_expert_parameter_name(parameter_name)
+        and tensor_shape[0] % int(para_size) == 0
+        and target_shape[0] > tensor_shape[0] // int(para_size)
+        and tuple(tensor_shape[1:]) == tuple(target_shape[1:])
+    )
 
 
 @dataclass
@@ -188,6 +298,25 @@ class ParallelPlan:
 
             # Check if we need to slice based on tensor vs target shape mismatch
             if len(tensor.shape) >= 1 and len(target_shape) >= 1:
+                para_size = parallel_state.extra_parallel_sizes[shard_group]
+                if _is_hiermoe_redundant_slot_expert_param(
+                    shard_group, parameter_name, tensor.shape, target_shape, para_size
+                ):
+                    base_shard = tensor.shape[0] // para_size
+                    para_rank = (
+                        parallel_state.extra_parallel_rank(shard_group)
+                        if parallel_state.extra_parallel_enabled(shard_group)
+                        else 0
+                    )
+                    preloaded = _hiermoe_initial_layout_shard(
+                        tensor, parameter_name, target_shape, para_rank=para_rank
+                    )
+                    if preloaded is not None:
+                        return preloaded
+                    start_idx = para_rank * base_shard
+                    padded = tensor.new_zeros(target_shape)
+                    padded[:base_shard].copy_(tensor[start_idx : start_idx + base_shard])
+                    return padded
                 # If tensor has more feature than target, we need to slice
                 if tensor.shape[0] > target_shape[0] and tensor.shape[0] % target_shape[0] == 0:
                     para_size = tensor.shape[0] // target_shape[0]

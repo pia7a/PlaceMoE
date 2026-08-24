@@ -58,8 +58,14 @@ from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
 from ..distributed.chunk_mbs import build_chunk_mbs_ranges, chunk_mbs_context
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
+from ..distributed.moe.runtime_bridge import configure_moe_runtime_bridge, get_moe_runtime_bridge
 from ..distributed.offloading import build_activation_offloading_context
-from ..distributed.parallel_state import clear_parallel_state, init_parallel_state, use_parallel_state
+from ..distributed.parallel_state import (
+    clear_parallel_state,
+    get_parallel_state,
+    init_parallel_state,
+    use_parallel_state,
+)
 from ..distributed.torch_compile import CompileConfig, mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
@@ -76,6 +82,7 @@ from ..utils.device import (
 )
 from ..utils.loss_utils import count_loss_token, mean_global_loss, reduce_global_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
+from ..utils.physical_moe_load import bind_physical_moe_layer_keys, physical_moe_load_enabled
 from .callbacks import (
     ChannelLossCallback,
     CheckpointerCallback,
@@ -101,6 +108,16 @@ def _has_trainable_lora_parameters(module: torch.nn.Module | None) -> bool:
         param.requires_grad and ({"lora_A", "lora_B"} & set(name.split(".")))
         for name, param in module.named_parameters()
     )
+
+
+def _hiermoe_gradient_bytes_per_element(mixed_precision) -> int:
+    dtype_name = (
+        mixed_precision.reduce_dtype or mixed_precision.param_dtype or "float32"
+        if mixed_precision.enable
+        else "bfloat16"
+    )
+    dtype = getattr(torch, dtype_name or "float32")
+    return torch.empty((), dtype=dtype).element_size()
 
 
 class BackgroundPrefetcher:
@@ -373,6 +390,23 @@ class BaseTrainer(Stateful, ABC):
         # must not run under NCCL_DETERMINISTIC=1 on some GPU platforms (L20).
         self.register_parallel_state("base")
 
+        ps = get_parallel_state()
+        mixed_precision = self.args.train.accelerator.fsdp_config.mixed_precision
+        placemoe = self.args.train.hiermoe.placemoe
+        if placemoe.enabled and placemoe.calibration.artifact:
+            model_id = os.path.basename(
+                os.path.normpath(str(self.args.model.model_path or self.args.model.config_path))
+            )
+            placemoe.calibration.expected_scope["model_id"] = model_id
+        configure_moe_runtime_bridge(
+            self.args.train.hiermoe,
+            ep_group=ps.ep_group if getattr(ps, "ep_enabled", False) else None,
+            ep_fsdp_size=ps.ep_fsdp_size if getattr(ps, "ep_enabled", False) else 1,
+            activation_checkpointing_enabled=self.args.train.gradient_checkpointing.enable,
+            fsdp_offload_enabled=self.args.train.accelerator.fsdp_config.offload,
+            gradient_bytes_per_element=_hiermoe_gradient_bytes_per_element(mixed_precision),
+        )
+
         # Set random seed
         helper.set_seed(self.args.train.seed, self.args.train.enable_full_determinism)
 
@@ -598,6 +632,12 @@ class BaseTrainer(Stateful, ABC):
             **kwargs,
         )
         self.model.train()
+        get_moe_runtime_bridge().bind_model(self.model)
+        if physical_moe_load_enabled():
+            attached = bind_physical_moe_layer_keys(self.model)
+            if attached == 0:
+                raise RuntimeError("Physical MoE load metrics were enabled but no expert modules were found.")
+            logger.info_rank0(f"Physical MoE load metrics: registered {attached} expert layer(s).")
 
     def _build_optimizer(self):
         args: VeOmniArguments = self.args
@@ -612,6 +652,7 @@ class BaseTrainer(Stateful, ABC):
             no_decay_params=args.train.optimizer.no_decay_params,
             muon_kwargs=_collect_muon_kwargs(args.train.optimizer),
         )
+        get_moe_runtime_bridge().bind_optimizer(self.optimizer)
 
     def _build_lr_scheduler(self):
         args: VeOmniArguments = self.args
@@ -688,12 +729,35 @@ class BaseTrainer(Stateful, ABC):
             callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches=None, **kwargs):
+        get_moe_runtime_bridge().set_step(max(0, self.state.global_step - 1))
         for callback in self._callbacks:
             callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
+        self.run_hiermoe_update()
+        get_moe_runtime_bridge().log_metrics(self.state.global_step)
         for callback in self._callbacks:
             callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+
+    def run_hiermoe_update(self) -> None:
+        trainer_step = int(self.state.global_step)
+        if getattr(self, "_hiermoe_last_update_step", -1) == trainer_step:
+            return
+        if self.args.train.hiermoe.enable and self.args.train.hiermoe.expert_swap:
+            get_moe_runtime_bridge().run_step_update(max(0, trainer_step - 1))
+        self._hiermoe_last_update_step = trainer_step
+
+    def hiermoe_forward_context(self):
+        return get_moe_runtime_bridge().training_forward()
+
+    @staticmethod
+    def hiermoe_placement_disabled():
+        return get_moe_runtime_bridge().placement_disabled()
+
+    def sync_hiermoe_redundant_gradients(self) -> None:
+        config = self.args.train.hiermoe
+        if config.enable and config.expert_swap and config.redundant_slot_increment_per_device > 0:
+            get_moe_runtime_bridge().sync_redundant_gradients()
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass.
@@ -756,6 +820,7 @@ class BaseTrainer(Stateful, ABC):
                 self.model_fwd_context,
                 set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
                 channel_forward_context,
+                self.hiermoe_forward_context(),
             ):
                 outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
@@ -776,6 +841,7 @@ class BaseTrainer(Stateful, ABC):
 
     def model_reshard(self, micro_step: int, num_micro_steps: int):
         """Reshard model after backward pass."""
+        get_moe_runtime_bridge().configure_microstep(micro_step, num_micro_steps)
         args: VeOmniArguments = self.args
         if (
             args.train.accelerator.fsdp_config.fsdp_mode == "fsdp2"
@@ -839,6 +905,8 @@ class BaseTrainer(Stateful, ABC):
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
+        self.sync_hiermoe_redundant_gradients()
+
         # Gradient clipping (reads FSDP/EP groups from current ParallelState)
         with use_parallel_state("base"):
             grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
@@ -851,6 +919,7 @@ class BaseTrainer(Stateful, ABC):
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 
     def destroy_distributed(self):
+        get_moe_runtime_bridge().shutdown()
         if not dist.is_available() or not dist.is_initialized():
             return
 
@@ -866,6 +935,7 @@ class BaseTrainer(Stateful, ABC):
             return
 
         synchronize()
+        get_moe_runtime_bridge().destroy_process_groups()
         dist.destroy_process_group()
         clear_parallel_state()
 

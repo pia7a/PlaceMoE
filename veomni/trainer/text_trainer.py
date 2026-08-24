@@ -144,6 +144,8 @@ class TextTrainer:
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
+        self.base.sync_hiermoe_redundant_gradients()
+
         # Gradient clipping (reads FSDP/EP groups from current ParallelState)
         with use_parallel_state("base"):
             grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)

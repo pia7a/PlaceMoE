@@ -178,6 +178,8 @@ class DiTTrainer:
     offline_embedding_saver: OfflineEmbeddingSaver = None
 
     def __init__(self, args: VeOmniDiTArguments):
+        if args.train.hiermoe.placemoe.enabled:
+            raise ValueError("PlaceMoE is not supported by DiTTrainer.")
         if getattr(getattr(args.train, "chunk_mbs_config", None), "enable", False):
             raise ValueError("train.chunk_mbs_config is not supported by DiTTrainer.")
         if args.train.channel_loss.enable:

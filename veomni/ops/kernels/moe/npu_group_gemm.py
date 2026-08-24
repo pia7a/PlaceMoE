@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import os
+import time
 from typing import List, Optional
 
 import torch
@@ -21,34 +23,73 @@ import torch.nn.functional as F
 import torch_npu
 
 from ....distributed.moe.comm import all_to_all
+from ....distributed.moe.hiermoe import (
+    get_hiermoe_state,
+    hiermoe_active,
+    rank_dedup_combine,
+    rank_dedup_dispatch,
+    record_hiermoe_metrics,
+)
 from ....distributed.moe.moe_utils import sort_chunks_by_idxs
+from ....distributed.moe.timing import (
+    current_full_profile_phase,
+    enter_moe_profile_range,
+    exit_moe_profile_range,
+    moe_timing_context,
+    moe_timing_enabled,
+    moe_timing_event,
+    record_moe_timing_span,
+)
+from ....distributed.moe.validation import moe_validation_enabled, record_moe_validation_routing
 from ....distributed.parallel_state import get_parallel_state
 from ....utils.device import stream_synchronize
+from ....utils.physical_moe_load import record_physical_moe_load
 from ._kernels.kernel.npu_group_gemm import npu_group_gemm
 
 
-def _clamped_swiglu(x: torch.Tensor, limit: float) -> torch.Tensor:
-    """gpt-oss-style clamped SwiGLU (DeepSeek-V4).
-
-    ``torch_npu.npu_swiglu`` is a fused kernel with no clamp support, so this
-    manual (unfused) path is only taken when ``swiglu_limit`` is set -- today
-    that is exclusively DeepSeek-V4's ``PatchedDeepseekV4Experts`` (see
-    ``deepseek_v4_gpu_patch_gen_config.py``). Chunk convention and clamp
-    bounds mirror that class's eager ``_apply_gate`` exactly: first half of
-    the last dim is ``gate`` (clamped to ``max=limit``), second half is ``up``
-    (clamped to ``[-limit, limit]``), activation is SiLU (DeepSeek-V4's
-    ``config.hidden_act``).
-    """
-    gate, up = x.chunk(2, dim=-1)
-    gate = gate.clamp(max=limit)
-    up = up.clamp(min=-limit, max=limit)
-    return F.silu(gate) * up
+_NPU_MOE_TIMING_CALL_INDEX = 0
 
 
-def _swiglu(x: torch.Tensor, swiglu_limit: float | None) -> torch.Tensor:
-    if swiglu_limit is None:
+def _swiglu(x: torch.Tensor, limit: float | None) -> torch.Tensor:
+    if limit is None:
         return torch_npu.npu_swiglu(x, dim=-1)
-    return _clamped_swiglu(x, swiglu_limit)
+    gate, up = x.chunk(2, dim=-1)
+    return F.silu(gate.clamp(max=limit)) * up.clamp(min=-limit, max=limit)
+
+
+def _moe_timing_num_layers() -> int:
+    raw = os.environ.get("VERL_MOE_TIMING_NUM_LAYERS", "0")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _start_npu_moe_timing(
+    num_experts: int,
+    hidden_states: torch.Tensor,
+    selected_experts: torch.Tensor,
+    ep_group: Optional[dist.ProcessGroup],
+) -> dict[str, object] | None:
+    global _NPU_MOE_TIMING_CALL_INDEX
+    if not moe_timing_enabled() and not moe_validation_enabled():
+        return None
+
+    call_index = _NPU_MOE_TIMING_CALL_INDEX
+    _NPU_MOE_TIMING_CALL_INDEX += 1
+    num_layers = _moe_timing_num_layers()
+    ep_size = dist.get_world_size(ep_group) if ep_group is not None else 1
+    return {
+        "call_index": call_index,
+        "layer": call_index % num_layers if num_layers else None,
+        "num_layers": num_layers,
+        "num_experts": int(num_experts),
+        "ep_size": int(ep_size),
+        "tokens": int(hidden_states.shape[0]) if hidden_states.ndim > 1 else int(hidden_states.numel()),
+        "token_expert_assignments": int(selected_experts.numel()),
+        "top_k": int(selected_experts.shape[-1]) if selected_experts.ndim > 1 else 1,
+        "phase": current_full_profile_phase(),
+    }
 
 
 def _npu_fused_moe_forward(
@@ -95,6 +136,7 @@ def npu_ep_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     ep_group: Optional[dist.ProcessGroup] = None,
+    layer_key: str | None = None,
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """NPU expert-parallel fused MoE forward pass.
@@ -103,17 +145,235 @@ def npu_ep_fused_moe_forward(
     Handles alltoall dispatch/combine for expert parallelism.
     """
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+    timing_record = _start_npu_moe_timing(num_experts, hidden_states, selected_experts, ep_group)
+    record_moe_validation_routing(
+        timing_record,
+        selected_experts=selected_experts,
+        num_experts=num_experts,
+        ep_group=ep_group,
+    )
+    if hiermoe_active():
+        state = get_hiermoe_state()
+        placement_manager = (
+            state.expert_swap_manager
+            if (
+                state is not None
+                and state.placement_mapping_enabled
+                and state.expert_swap_manager is not None
+                and state.expert_swap_manager.placement_planning_enabled()
+                and layer_key is not None
+            )
+            else None
+        )
+        capture_placement_timing = (
+            placement_manager is not None
+            and state.layer_swap_forward_enabled
+            and placement_manager.layer_calibration_enabled()
+        )
+        record_metrics = (
+            state is not None and state.layer_swap_forward_enabled and state.current_step % state.log_interval == 0
+        )
+        record_wall_metrics = record_metrics and state.debug_validate
+        baseline_original_all_to_all_ms = None
+        if state is not None and state.debug_validate:
+            baseline_start = time.perf_counter()
+            with torch.no_grad():
+                (
+                    debug_input_splits,
+                    debug_output_splits,
+                    debug_tokens_per_local_expert,
+                    _debug_tokens_per_expert,
+                ) = dispatch_preprocess(selected_experts, num_experts, ep_group)
+                alltoall_dispatch(
+                    hidden_states.detach(),
+                    selected_experts,
+                    debug_input_splits,
+                    debug_output_splits,
+                    num_experts,
+                    debug_tokens_per_local_expert,
+                    ep_group,
+                )
+                stream_synchronize()
+            baseline_original_all_to_all_ms = (time.perf_counter() - baseline_start) * 1000.0
+
+        placement_already_applied = False
+        if placement_manager is not None and state.expert_swap_mode == "layer" and state.layer_swap_forward_enabled:
+            assert layer_key is not None
+            state.expert_swap_pair = placement_manager.maybe_swap_layer_on_routing(
+                layer_key=layer_key,
+                selected_experts=selected_experts,
+                hidden_size=hidden_states.shape[-1],
+                bytes_per_element=hidden_states.element_size(),
+                step=state.current_step,
+            )
+            placement_already_applied = True
+
+        placement_dispatch_start = placement_manager.placement_timing_event() if capture_placement_timing else None
+        dispatch_start = time.perf_counter() if record_wall_metrics else None
+        region_start = moe_timing_event() if timing_record is not None else None
+        with moe_timing_context(timing_record, component="all_to_all", section="hiermoe_pre_all_to_all"):
+            hidden_states, hiermoe_ctx, num_global_sum_tokens_per_local_expert = rank_dedup_dispatch(
+                hidden_states=hidden_states,
+                selected_experts=selected_experts,
+                routing_weights=routing_weights,
+                num_experts=num_experts,
+                ep_group=ep_group,
+                layer_key=layer_key,
+                placement_already_applied=placement_already_applied,
+            )
+        record_physical_moe_load(
+            layer_key,
+            int(hidden_states.shape[0]),
+            device=hidden_states.device,
+        )
+        placement_dispatch_end = placement_manager.placement_timing_event() if capture_placement_timing else None
+        dispatch_ms = (time.perf_counter() - dispatch_start) * 1000.0 if dispatch_start is not None else None
+        region_end = moe_timing_event() if timing_record is not None else None
+        record_moe_timing_span(
+            timing_record,
+            direction="forward",
+            component="moe_comm_region",
+            section="hiermoe_pre_all_to_all_region",
+            start_event=region_start,
+            end_event=region_end,
+        )
+        if placement_manager is not None and layer_key is not None:
+            assert layer_key is not None
+            placement_manager.record_dispatch_statistics(
+                layer_key=layer_key,
+                step=state.current_step,
+                dispatch_context=hiermoe_ctx,
+            )
+
+        if placement_already_applied and placement_manager is not None and layer_key is not None:
+            placement_manager.wait_pending_layer_swap(layer_key)
+        if fc1_1_2_weight is not None:
+            fc1_weight = fc1_1_2_weight
+        else:
+            fc1_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1)
+        fc1_weight = fc1_weight.transpose(1, 2)
+        active_local_experts = int(num_global_sum_tokens_per_local_expert.numel())
+        if active_local_experts < int(fc1_weight.shape[0]):
+            fc1_weight = fc1_weight[:active_local_experts]
+            fc2_weight = fc2_weight[:active_local_experts]
+        placement_compute_start = placement_manager.placement_timing_event() if capture_placement_timing else None
+        expert_start = time.perf_counter() if record_wall_metrics else None
+        with moe_timing_context(timing_record, component="expert_compute", section="hiermoe_expert_compute"):
+            annotation = enter_moe_profile_range(
+                timing_record,
+                direction="forward",
+                component="expert_compute",
+                section="hiermoe_expert_compute",
+            )
+            timing_start = moe_timing_event() if timing_record is not None else None
+            try:
+                intermediate_hidden_states = npu_group_gemm(
+                    hidden_states,
+                    fc1_weight,
+                    num_global_sum_tokens_per_local_expert,
+                )
+                intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit)
+                hidden_states = npu_group_gemm(
+                    intermediate_activations, fc2_weight.transpose(1, 2), num_global_sum_tokens_per_local_expert
+                )
+            finally:
+                timing_end = moe_timing_event() if timing_record is not None else None
+                exit_moe_profile_range(annotation)
+            record_moe_timing_span(
+                timing_record,
+                direction="forward",
+                component="expert_compute",
+                section="hiermoe_expert_compute",
+                start_event=timing_start,
+                end_event=timing_end,
+            )
+        expert_ms = (time.perf_counter() - expert_start) * 1000.0 if expert_start is not None else None
+        placement_compute_end = placement_manager.placement_timing_event() if capture_placement_timing else None
+
+        placement_combine_start = placement_manager.placement_timing_event() if capture_placement_timing else None
+        combine_start = time.perf_counter() if record_wall_metrics else None
+        region_start = moe_timing_event() if timing_record is not None else None
+        with moe_timing_context(timing_record, component="all_to_all", section="hiermoe_post_all_to_all"):
+            hidden_states = rank_dedup_combine(hidden_states, hiermoe_ctx)
+        placement_combine_end = placement_manager.placement_timing_event() if capture_placement_timing else None
+        if placement_manager is not None and layer_key is not None and state.layer_swap_forward_enabled:
+            placement_manager.advance_pipeline_after_combine(layer_key)
+        combine_ms = (time.perf_counter() - combine_start) * 1000.0 if combine_start is not None else None
+        region_end = moe_timing_event() if timing_record is not None else None
+        record_moe_timing_span(
+            timing_record,
+            direction="forward",
+            component="moe_comm_region",
+            section="hiermoe_post_all_to_all_region",
+            start_event=region_start,
+            end_event=region_end,
+        )
+        if record_metrics:
+            metrics = {
+                "enable": True,
+                "selected_dim": hiermoe_ctx.selected_dim,
+                "dedup_ratio_dispatch": hiermoe_ctx.dedup_ratio_dispatch,
+                "dedup_ratio_combine": hiermoe_ctx.dedup_ratio_combine,
+                "expert_swap_pair": state.expert_swap_pair,
+                "expert_swap_interval": state.expert_swap_interval,
+                "expert_swap_max_pairs_per_layer": state.expert_swap_max_pairs_per_layer,
+                "perf_model_source": state.perf_model.source,
+            }
+            if record_wall_metrics:
+                metrics["dispatch_wall_ms"] = float(dispatch_ms or 0.0)
+                metrics["combine_wall_ms"] = float(combine_ms or 0.0)
+                metrics["local_expert_compute_wall_ms"] = float(expert_ms or 0.0)
+                metrics["baseline_original_all_to_all_ms"] = float(baseline_original_all_to_all_ms or 0.0)
+            record_hiermoe_metrics(metrics)
+        if capture_placement_timing:
+            assert layer_key is not None
+            assert placement_manager is not None
+            assert placement_dispatch_start is not None and placement_dispatch_end is not None
+            assert placement_compute_start is not None and placement_compute_end is not None
+            assert placement_combine_start is not None and placement_combine_end is not None
+            placement_manager.record_layer_timing(
+                layer_key=layer_key,
+                step=state.current_step,
+                selected_experts=selected_experts,
+                tokens_per_local_expert=num_global_sum_tokens_per_local_expert,
+                dispatch_start=placement_dispatch_start,
+                dispatch_end=placement_dispatch_end,
+                compute_start=placement_compute_start,
+                compute_end=placement_compute_end,
+                combine_start=placement_combine_start,
+                combine_end=placement_combine_end,
+                selected_dim=hiermoe_ctx.selected_dim,
+                communication_events=hiermoe_ctx.internal_timing_events,
+            )
+        return hidden_states
+
     input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
         dispatch_preprocess(selected_experts, num_experts, ep_group)
     )
-    hidden_states, unpermute_indices = alltoall_dispatch(
-        hidden_states,
-        selected_experts,
-        input_splits,
-        output_splits,
-        num_experts,
-        num_global_tokens_per_local_expert,
-        ep_group,
+    region_start = moe_timing_event() if timing_record is not None else None
+    with moe_timing_context(timing_record, component="all_to_all", section="pre_all_to_all"):
+        hidden_states, unpermute_indices = alltoall_dispatch(
+            hidden_states,
+            selected_experts,
+            input_splits,
+            output_splits,
+            num_experts,
+            num_global_tokens_per_local_expert,
+            ep_group,
+        )
+    record_physical_moe_load(
+        layer_key,
+        int(hidden_states.shape[0]),
+        device=hidden_states.device,
+    )
+    region_end = moe_timing_event() if timing_record is not None else None
+    record_moe_timing_span(
+        timing_record,
+        direction="forward",
+        component="moe_comm_region",
+        section="pre_all_to_all_region",
+        start_event=region_start,
+        end_event=region_end,
     )
 
     if fc1_1_2_weight is not None:
@@ -121,21 +381,56 @@ def npu_ep_fused_moe_forward(
     else:
         fc1_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1)
     fc1_weight = fc1_weight.transpose(1, 2)
-    intermediate_hidden_states = npu_group_gemm(hidden_states, fc1_weight, num_global_sum_tokens_per_local_expert)
-    intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit)
-    hidden_states = npu_group_gemm(
-        intermediate_activations, fc2_weight.transpose(1, 2), num_global_sum_tokens_per_local_expert
-    )
+    with moe_timing_context(timing_record, component="expert_compute", section="expert_compute"):
+        annotation = enter_moe_profile_range(
+            timing_record,
+            direction="forward",
+            component="expert_compute",
+            section="expert_compute",
+        )
+        timing_start = moe_timing_event() if timing_record is not None else None
+        try:
+            intermediate_hidden_states = npu_group_gemm(
+                hidden_states,
+                fc1_weight,
+                num_global_sum_tokens_per_local_expert,
+            )
+            intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit)
+            hidden_states = npu_group_gemm(
+                intermediate_activations, fc2_weight.transpose(1, 2), num_global_sum_tokens_per_local_expert
+            )
+        finally:
+            timing_end = moe_timing_event() if timing_record is not None else None
+            exit_moe_profile_range(annotation)
+        record_moe_timing_span(
+            timing_record,
+            direction="forward",
+            component="expert_compute",
+            section="expert_compute",
+            start_event=timing_start,
+            end_event=timing_end,
+        )
 
-    hidden_states = alltoall_combine(
-        hidden_states,
-        routing_weights,
-        unpermute_indices,
-        input_splits,
-        output_splits,
-        num_experts,
-        num_global_tokens_per_local_expert,
-        ep_group,
+    region_start = moe_timing_event() if timing_record is not None else None
+    with moe_timing_context(timing_record, component="all_to_all", section="post_all_to_all"):
+        hidden_states = alltoall_combine(
+            hidden_states,
+            routing_weights,
+            unpermute_indices,
+            input_splits,
+            output_splits,
+            num_experts,
+            num_global_tokens_per_local_expert,
+            ep_group,
+        )
+    region_end = moe_timing_event() if timing_record is not None else None
+    record_moe_timing_span(
+        timing_record,
+        direction="forward",
+        component="moe_comm_region",
+        section="post_all_to_all_region",
+        start_event=region_start,
+        end_event=region_end,
     )
     return hidden_states
 
@@ -243,6 +538,7 @@ def npu_fused_moe_forward(
     fc1_2_weight: torch.Tensor | None,
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
+    layer_key: str | None = None,
     swiglu_limit: float | None = None,
 ):
     if get_parallel_state().ep_enabled:
@@ -256,6 +552,7 @@ def npu_fused_moe_forward(
             fc2_weight,
             fc1_1_2_weight,
             ep_group=get_parallel_state().ep_group,
+            layer_key=layer_key,
             swiglu_limit=swiglu_limit,
         )
     else:

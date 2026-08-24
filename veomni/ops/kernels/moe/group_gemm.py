@@ -530,6 +530,7 @@ def group_gemm_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    layer_key: str | None = None,
 ):
     """Triton grouped-gemm fused MoE forward pass.
 

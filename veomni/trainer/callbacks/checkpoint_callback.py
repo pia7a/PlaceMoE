@@ -19,6 +19,12 @@ import torch
 import torch.distributed as dist
 
 from ...checkpoint import CheckpointerBase, build_checkpointer
+from ...distributed.moe.hiermoe import (
+    assert_hiermoe_checkpoint_layout_compatible,
+    assert_hiermoe_trainable_only_checkpoint_safe,
+    hiermoe_state_dict,
+    load_hiermoe_state_dict,
+)
 from ...models import save_model_assets
 from ...utils import helper
 from ...utils.save_safetensor_utils import save_hf_safetensor, save_lora_adapter_with_dcp
@@ -74,12 +80,18 @@ class CheckpointerCallback(Callback):
 
         self.trainer.checkpointer.wait_for_pending_save()
 
+        trainable_only = bool(getattr(args.model, "lora_config", None))
         self.trainer.checkpointer.load(
             args.train.checkpoint.load_path,
             state,
-            trainable_only=bool(getattr(args.model, "lora_config", None)),
+            trainable_only=trainable_only,
             parallel_state=self.parallel_state,
         )
+
+        hiermoe_state = state["extra_state"].get("hiermoe")
+        assert_hiermoe_checkpoint_layout_compatible(hiermoe_state)
+        assert_hiermoe_trainable_only_checkpoint_safe(trainable_only, hiermoe_state, "load")
+        load_hiermoe_state_dict(hiermoe_state)
 
         self.trainer.state.global_step = state["extra_state"]["global_step"]
         self.trainer.start_epoch = self.trainer.state.global_step // args.train_steps
@@ -129,6 +141,9 @@ class CheckpointerCallback(Callback):
         channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
         channel_loss_state = channel_loss_callback.state_dict() if channel_loss_callback is not None else {}
 
+        trainable_only = bool(getattr(args.model, "lora_config", None))
+        hiermoe_state = hiermoe_state_dict()
+        assert_hiermoe_trainable_only_checkpoint_safe(trainable_only, hiermoe_state, "save")
         ckpt_state = {
             "model": self.trainer.model,
             "optimizer": self.trainer.optimizer,
@@ -139,6 +154,7 @@ class CheckpointerCallback(Callback):
                 "environ_meter": self.trainer.environ_meter.state_dict(),
                 "channel_loss_callback": channel_loss_state,
                 "torch_rng_state": torch.get_rng_state(),
+                "hiermoe": hiermoe_state,
             },
         }
 
@@ -155,7 +171,7 @@ class CheckpointerCallback(Callback):
             save_checkpoint_path,
             ckpt_state,
             save_async=args.train.checkpoint.save_async,
-            trainable_only=bool(getattr(args.model, "lora_config", None)),
+            trainable_only=trainable_only,
             save_to_lowest_rank=args.train.checkpoint.dcp_save_to_lowest_rank,
             parallel_state=self.parallel_state,
         )

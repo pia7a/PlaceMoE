@@ -41,6 +41,7 @@ Our guiding principles when building VeOmni are:
 - **FSDP2** backend for training.
 - **Sequence Parallelism** with [Deepspeed Ulysess](https://arxiv.org/abs/2309.14509), support with non-async and async mode.
 - **Experts Parallelism** support large MOE model training, like [Qwen3-Moe](https://veomni.readthedocs.io/en/latest/key_features/ep_fsdp2.html).
+- **PlaceMoE** jointly optimizes replica allocation, hierarchical expert placement, and source-aware dispatch for NPU MoE training. See the [usage guide](docs/key_features/placemoe.md).
 - Efficient **GroupGemm** kernel for Moe model, [Liger-Kernel](https://github.com/linkedin/Liger-Kernel).
 - Compatible with HuggingFace Transformers models. [Qwen3](https://veomni.readthedocs.io/en/latest/examples/qwen3.html), [Qwen3-VL](https://veomni.readthedocs.io/en/latest/examples/qwen3_vl.html), Qwen3-Moe, etc
 - Dynamic batching strategy, Omnidata processing
