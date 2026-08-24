@@ -581,6 +581,24 @@ def _open_preparation_store(
     )
 
 
+def _read_coordinated_payload(
+    store: Any,
+    key: str,
+    *,
+    acknowledgment_prefix: str,
+    nnodes: int,
+    node_rank: int,
+) -> bytes:
+    """Keep the server store alive until every client has read its payload."""
+
+    payload = store.get(key)
+    if node_rank == 0:
+        store.wait([f"{acknowledgment_prefix}/{rank}" for rank in range(1, nnodes)])
+    else:
+        store.set(f"{acknowledgment_prefix}/{node_rank}", "1")
+    return payload
+
+
 def _coordinate_cache_decision(
     inspection: CacheInspection,
     *,
@@ -602,7 +620,14 @@ def _coordinate_cache_decision(
         inspections = [CacheInspection(**json.loads(store.get(key).decode("utf-8"))) for key in inspection_keys]
         store.set(decision_key, json.dumps(asdict(decide_cache_action(inspections, force=force)), sort_keys=True))
     store.wait([decision_key])
-    return CacheDecision(**json.loads(store.get(decision_key).decode("utf-8")))
+    payload = _read_coordinated_payload(
+        store,
+        decision_key,
+        acknowledgment_prefix=f"{prefix}/decision-read",
+        nnodes=nnodes,
+        node_rank=node_rank,
+    )
+    return CacheDecision(**json.loads(payload.decode("utf-8")))
 
 
 def _coordinate_stage_result(
@@ -650,7 +675,14 @@ def _coordinate_stage_result(
         }
         store.set(final_key, json.dumps(final, sort_keys=True))
     store.wait([final_key])
-    final = json.loads(store.get(final_key).decode("utf-8"))
+    payload = _read_coordinated_payload(
+        store,
+        final_key,
+        acknowledgment_prefix=f"{prefix}/final-read",
+        nnodes=nnodes,
+        node_rank=node_rank,
+    )
+    final = json.loads(payload.decode("utf-8"))
     return int(final["return_code"]), str(final["detail"])
 
 

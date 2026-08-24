@@ -18,6 +18,7 @@ from veomni.distributed.moe.hiermoe.placemoe.preparation import (
 class _FakeStore:
     def __init__(self, values=None) -> None:
         self.values = dict(values or {})
+        self.wait_calls = []
 
     def set(self, key, value) -> None:
         self.values[key] = value.encode("utf-8") if isinstance(value, str) else value
@@ -26,6 +27,7 @@ class _FakeStore:
         return self.values[key]
 
     def wait(self, keys) -> None:
+        self.wait_calls.append(tuple(keys))
         assert all(key in self.values for key in keys)
 
 
@@ -83,7 +85,12 @@ def test_stage_result_rejects_different_generated_artifacts() -> None:
             "inspection": {"state": "valid", "detail": "scope matches", "digest": "def"},
         }
     ).encode("utf-8")
-    store = _FakeStore({"placemoe-prepare/runtime/result/1": peer_result})
+    store = _FakeStore(
+        {
+            "placemoe-prepare/runtime/result/1": peer_result,
+            "placemoe-prepare/runtime/final-read/1": b"1",
+        }
+    )
 
     return_code, detail = cli._coordinate_stage_result(
         CacheInspection("valid", "scope matches", "abc"),
@@ -96,6 +103,61 @@ def test_stage_result_rejects_different_generated_artifacts() -> None:
 
     assert return_code == 2
     assert "differ across nodes" in detail
+    assert ("placemoe-prepare/runtime/final-read/1",) in store.wait_calls
+
+
+def test_cache_decision_client_acknowledges_payload_read() -> None:
+    prefix = "placemoe-prepare/runtime"
+    peer_inspection = json.dumps({"state": "valid", "detail": "scope matches", "digest": "abc"}).encode("utf-8")
+    decision = json.dumps({"action": "reuse", "detail": "valid on every node"}).encode("utf-8")
+    store = _FakeStore(
+        {
+            f"{prefix}/inspection/0": peer_inspection,
+            f"{prefix}/decision": decision,
+        }
+    )
+
+    result = cli._coordinate_cache_decision(
+        CacheInspection("valid", "scope matches", "abc"),
+        force=False,
+        stage="runtime",
+        nnodes=2,
+        node_rank=1,
+        store=store,
+    )
+
+    assert result.action == "reuse"
+    assert store.values[f"{prefix}/decision-read/1"] == b"1"
+
+
+def test_stage_result_client_acknowledges_payload_read() -> None:
+    prefix = "placemoe-prepare/runtime"
+    peer_result = json.dumps(
+        {
+            "return_code": 0,
+            "inspection": {"state": "valid", "detail": "scope matches", "digest": "abc"},
+        }
+    ).encode("utf-8")
+    final = json.dumps({"return_code": 0, "detail": "valid on every node"}).encode("utf-8")
+    store = _FakeStore(
+        {
+            f"{prefix}/result/0": peer_result,
+            f"{prefix}/final": final,
+        }
+    )
+
+    return_code, detail = cli._coordinate_stage_result(
+        CacheInspection("valid", "scope matches", "abc"),
+        return_code=0,
+        stage="runtime",
+        nnodes=2,
+        node_rank=1,
+        store=store,
+    )
+
+    assert return_code == 0
+    assert detail == "valid on every node"
+    assert store.values[f"{prefix}/final-read/1"] == b"1"
 
 
 def test_preflight_rejects_different_node_inputs() -> None:
