@@ -37,6 +37,10 @@ usage/checkpoint_conversion.md
 usage/trainer.md
 usage/agent_workflow.md
 usage/hdfs_fuse_patch.md
+usage/placemoe_container_quickstart.md
+usage/placemoe_pretraining.md
+usage/placemoe_image_distribution.md
+usage/placemoe_veomni_bridge.md
 testing.md
 ```
 

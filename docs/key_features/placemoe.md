@@ -151,3 +151,14 @@ not part of the training interface.
 - PlaceMoE requires one complete EP group, `ep_size == NNODES *
   NPROC_PER_NODE`, and `ep_fsdp_size == 1`. FSDP CPU offload is unsupported
   while physical expert migration is enabled.
+
+## Further reading
+
+- [Container quick start](../usage/placemoe_container_quickstart.md) and its
+  [Chinese version](../usage/placemoe_container_quickstart_zh.md)
+- [Pre-training and configuration reference](../usage/placemoe_pretraining.md)
+  and its [Chinese version](../usage/placemoe_pretraining_zh.md)
+- [Validated Ascend image distribution](../usage/placemoe_image_distribution.md)
+  and its [Chinese version](../usage/placemoe_image_distribution_zh.md)
+- [Integration with a model-modified VeOmni fork](../usage/placemoe_veomni_bridge.md)
+  and its [Chinese version](../usage/placemoe_veomni_bridge_zh.md)

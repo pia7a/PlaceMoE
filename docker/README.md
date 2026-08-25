@@ -94,6 +94,11 @@ The ascend images split into two groups:
   **hand-maintained**. They use `pip install -e .[npu_aarch64]` and build
   `torchcodec` from source against CANN, which doesn't map onto the uv-based
   template, so they're intentionally left out of the matrix.
+- **`Dockerfile.placemoe_9.0.0_torch_npu2.9.0_910b.arm`** — the validated
+  PlaceMoE image recipe. It pins the public CANN 9 / PyTorch 2.9 Ascend base by
+  digest and installs the current checkout into an isolated
+  system-site-packages virtual environment. It is hand-maintained and
+  intentionally excluded from the generated matrix.
 
 The ascend template reuses the same context as CUDA plus two ascend-specific
 knobs in the `matrix.yaml` image entry:
