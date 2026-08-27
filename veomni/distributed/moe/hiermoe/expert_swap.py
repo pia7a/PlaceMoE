@@ -2971,14 +2971,12 @@ class ExpertSwapManager:
             )
         if _COST_MODEL_VERIFY and (
             self.expert_swap_mode != "step"
-            or self.expert_swap_selector != "hiermoe_greedy_cover_p1"
             or self.expert_swap_max_pairs_per_layer != 0
             or _ONLINE_FREEZE_COST_MODE != "off"
             or _FORWARD_REUSE_COVER
         ):
             raise ValueError(
-                "Cost-model verification requires step mode, the hiermoe_greedy_cover_p1 "
-                "selector, zero swaps, and all placement experiments disabled."
+                "Cost-model verification requires step mode, zero swaps, and all placement experiments disabled."
             )
         if _ONLINE_LUT_UPDATE and (
             not self.fixed_pipeline_overlap
@@ -2998,9 +2996,7 @@ class ExpertSwapManager:
                 "routing, and all other online planners disabled."
             )
         if _HOT_UPDATE and (
-            not self.fixed_pipeline_overlap
-            or self.expert_swap_mode != "step"
-            or self.expert_swap_selector != "hiermoe_greedy_cover_p1"
+            self.expert_swap_mode != "step"
             or _ABLATION_REPLAY_MODE not in {"off", "static"}
             or _ONLINE_LUT_UPDATE
             or _CPU_PLANNER_MODE != "off"
@@ -3008,9 +3004,7 @@ class ExpertSwapManager:
             or _ONLINE_FREEZE_COST_MODE != "off"
             or _COST_MODEL_VERIFY
         ):
-            raise ValueError(
-                "PlaceMoE hot updates require fixed-pipeline step mode and all other online planners disabled."
-            )
+            raise ValueError("PlaceMoE hot updates require step mode and all other online planners disabled.")
         if _HOT_UPDATE and not _HOT_UPDATE_WORK_ROOT:
             raise ValueError("PlaceMoE hot-update work root must not be empty.")
         if _FORWARD_REUSE_COVER and (
@@ -3625,10 +3619,15 @@ class ExpertSwapManager:
         executor.shutdown(wait=True, cancel_futures=False)
 
     def placement_planning_enabled(self) -> bool:
-        return self._online_lut_update or (
-            not self._initial_layout_path
-            and self._ablation_replay_mode != "static"
-            and (self.expert_swap_max_pairs_per_layer > 0 or self.redundant_slot_increment_per_device > 0)
+        return (
+            self._hot_update
+            or self._cost_model_verify
+            or self._online_lut_update
+            or (
+                not self._initial_layout_path
+                and self._ablation_replay_mode != "static"
+                and (self.expert_swap_max_pairs_per_layer > 0 or self.redundant_slot_increment_per_device > 0)
+            )
         )
 
     def layer_calibration_enabled(self) -> bool:
@@ -5847,7 +5846,7 @@ class ExpertSwapManager:
             canonical_physical_slots=canonical_slots,
             is_identity=bool(is_identity),
         )
-        if (self._hot_update or self._forward_reuse_cover_patch_remap) and slot_layout_enabled:
+        if self._hot_update or (self._forward_reuse_cover_patch_remap and slot_layout_enabled):
             if previous_source_lut is not None and tuple(previous_source_lut.shape) == (self.ep_size, num_experts):
                 registered_layer.source_logical_to_physical = previous_source_lut.detach().cpu().clone()
             else:
@@ -7672,8 +7671,8 @@ class ExpertSwapManager:
         local_expert_token_rows: list[torch.Tensor] = []
         layer_row_ranges: list[tuple[GreedyCommunicationPlanner, int, int]] = []
         row_start = 0
-        communication_event_names = (
-            (
+        if int(self.hierarchy.selected_dim) == 3:
+            communication_event_names = (
                 "stage1_a2a",
                 "stage2_a2a",
                 "stage3_a2a",
@@ -7681,9 +7680,10 @@ class ExpertSwapManager:
                 "combine_stage2_a2a",
                 "combine_stage1_a2a",
             )
-            if int(self.hierarchy.selected_dim) == 3
-            else ("stage1_a2a", "stage2_a2a", "combine_stage2_a2a", "combine_stage1_a2a")
-        )
+        elif int(self.hierarchy.selected_dim) == 2:
+            communication_event_names = ("stage1_a2a", "stage2_a2a", "combine_stage2_a2a", "combine_stage1_a2a")
+        else:
+            communication_event_names = ("stage2_a2a", "combine_stage2_a2a")
         for layer in ordered_layers:
             timings = [timing for timing in layer.cost_model_timings if int(timing.step) == int(step)]
             if not all(
@@ -7700,7 +7700,9 @@ class ExpertSwapManager:
                 forward_compute_constant=0.0,
             )
             if not isinstance(planner, GreedyCommunicationPlanner):
-                raise RuntimeError("Cost-model verification requires GreedyCommunicationPlanner.")
+                # Cost verification needs the exact hierarchical traffic
+                # feature extractor, independently of the runtime selector.
+                planner = self._cpu_exact_planner_for_layer(layer)
             routes = [timing.physical_routes for timing in timings]
             if all(route.shape == routes[0].shape for route in routes):
                 stacked_routes = torch.stack(routes, dim=0)
@@ -8169,13 +8171,22 @@ class ExpertSwapManager:
                         "actual_stage3_a2a_ms": [row[2] + row[3] for row in actual_stage_rows],
                     }
                 )
-            else:
+            elif int(self.hierarchy.selected_dim) == 2:
                 if any(len(row) != 4 for row in actual_stage_rows):
                     raise RuntimeError("Two-stage cost samples require four dispatch/combine A2A timings.")
                 offline_samples.update(
                     {
                         "actual_stage1_a2a_ms": [row[0] + row[3] for row in actual_stage_rows],
                         "actual_stage2_a2a_ms": [row[1] + row[2] for row in actual_stage_rows],
+                    }
+                )
+            else:
+                if any(len(row) != 2 for row in actual_stage_rows):
+                    raise RuntimeError("One-stage cost samples require two dispatch/combine A2A timings.")
+                offline_samples.update(
+                    {
+                        "actual_stage1_a2a_ms": [0.0 for _row in actual_stage_rows],
+                        "actual_stage2_a2a_ms": [row[0] + row[1] for row in actual_stage_rows],
                     }
                 )
             report["offline_scorer_samples"] = offline_samples
@@ -10803,6 +10814,7 @@ class ExpertSwapManager:
                     layer_keys=tuple(layer.key for layer in layers),
                     ep_size=self.ep_size,
                     ranks_per_node=min(self.ep_size, self.hierarchy.local_world_size),
+                    hierarchy_group_sizes=tuple(int(size) for size in self.hierarchy.group_sizes),
                     num_experts=layers[0].num_experts,
                     slots_per_rank=layers[0].num_local_experts,
                     primary_slots_per_rank=primary_slots,

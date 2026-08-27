@@ -16,12 +16,13 @@ from veomni.distributed.moe.hiermoe.placemoe.preparation import (
 
 
 def _source(tmp_path: Path, *, ep_size: int = 16, ranks_per_node: int = 8) -> dict:
+    hierarchy = [ep_size] if ep_size == ranks_per_node else [ranks_per_node, ep_size]
     return {
         "model": {"model_path": "/models/Qwen3-VL-30B-A3B-Instruct"},
         "train": {
             "accelerator": {"ep_size": ep_size},
             "hiermoe": {
-                "hierarchy_group_sizes": [ranks_per_node, ep_size],
+                "hierarchy_group_sizes": hierarchy,
                 "placemoe": {
                     "enabled": True,
                     "base_directory": str(tmp_path),
@@ -51,11 +52,12 @@ def _spec(tmp_path: Path, *, ep_size: int = 16, ranks_per_node: int = 8):
 
 
 def _runtime_payload(*, ep_size: int = 16, ranks_per_node: int = 8) -> dict:
+    hierarchy = [ep_size] if ep_size == ranks_per_node else [ranks_per_node, ep_size]
     return {
         "schema_version": 2,
         "source": "bench_hiermoe_perf_model",
         "a2a": {"alpha": 1.0, "beta": 1.0e-8},
-        "inter": [{"alpha": 1.0, "beta": 2.0e-8}],
+        "inter": [] if ep_size == ranks_per_node else [{"alpha": 1.0, "beta": 2.0e-8}],
         "intra": {"alpha": 1.0, "beta": 2.0e-9},
         "state_move": {
             "intra": {"alpha": 1.0, "beta": 2.0e-9},
@@ -74,7 +76,7 @@ def _runtime_payload(*, ep_size: int = 16, ranks_per_node: int = 8) -> dict:
         "metadata": {
             "ep_size": ep_size,
             "ranks_per_node": ranks_per_node,
-            "hierarchy_group_sizes": [ranks_per_node, ep_size],
+            "hierarchy_group_sizes": hierarchy,
             "device_type": "npu",
             "backend": "hccl",
             "dtype": "bf16",
@@ -130,6 +132,17 @@ def test_preparation_spec_resolves_artifacts_from_training_yaml(tmp_path) -> Non
     assert spec.runtime_artifact == tmp_path / "calibration/runtime.json"
     assert spec.planner_artifact == tmp_path / "calibration/planner.json"
     assert spec.hierarchy_group_sizes == (8, 16)
+
+
+def test_preparation_spec_accepts_single_node_rank_hierarchy(tmp_path) -> None:
+    spec = _spec(tmp_path, ep_size=8, ranks_per_node=8)
+
+    assert spec.ep_size == 8
+    assert spec.ranks_per_node == 8
+    assert spec.hierarchy_group_sizes == (8,)
+
+    _write_runtime(spec)
+    assert inspect_runtime_cache(spec.runtime_artifact, spec).state == "valid"
 
 
 def test_runtime_cache_requires_matching_topology(tmp_path) -> None:

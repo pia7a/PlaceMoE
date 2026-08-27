@@ -6,6 +6,10 @@ and the source-aware mapping from logical expert requests to those copies. The
 runtime performs hierarchical token-deduplicated communication and overlaps
 replica-gradient synchronization with backward computation.
 
+The canonical planner supports both a rank-only single-node hierarchy and
+multi-node hierarchies. A zero replica budget is also valid: PlaceMoE then
+optimizes the unique base-copy layout and skips replica-gradient synchronization.
+
 PlaceMoE does not modify the router output or the logical model. It only changes
 where each logical expert is materialized and which physical copy serves a
 request. The current production validation covers `fused_npu`; unsupported
@@ -77,6 +81,11 @@ periodic updates while retaining an optional `initial_artifact`.
 `failure_policy: raise` is recommended for validation and production rollout.
 Use `continue` only when continuing with the current valid layout is explicitly
 preferred over failing the training job.
+
+For one node, use `hierarchy_group_sizes: [ep_size]`. For multiple homogeneous
+nodes, use `[ranks_per_node, ep_size]`. Set
+`redundant_slot_increment_per_device: 0` to run placement without expert
+replication.
 
 ## Calibration and launch
 

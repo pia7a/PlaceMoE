@@ -631,6 +631,41 @@ class GreedyCommunicationPlanner:
                 "Hierarchical source counts must have shape "
                 f"[{self.ep_size}, batch, packed_width], got {tuple(source_unique_counts.shape)}."
             )
+        if int(self.hierarchy.selected_dim) == 1:
+            widths = self._count_widths()
+            if widths != (self.ep_size,):
+                raise ValueError(f"Unexpected one-stage packed widths {widths}.")
+            unique_rank = source_unique_counts.permute(1, 0, 2).unsqueeze(1).contiguous()
+            assignment_rank = source_assignment_counts.permute(1, 0, 2).unsqueeze(1).contiguous()
+            stage = self._stage_traffic_features(
+                unique_rank,
+                assignment_rank,
+                hidden_bytes=int(self.payload_bytes),
+                metadata_bytes=3 * 4,
+            )
+            zero = torch.zeros_like(stage["full_endpoint_bytes"])
+            beta = float(self.perf_model.intra.beta)
+            return {
+                "stage_unique_endpoint_link_units": (
+                    2.0 * beta * float(self.payload_bytes) * stage["unique_endpoint_tokens"]
+                ),
+                "stage_payload_endpoint_link_units": beta * stage["full_endpoint_bytes"],
+                "stage_payload_edge_link_units": beta * stage["full_edge_bytes"],
+                "stage_shared_node_endpoint_link_units": beta * stage["full_endpoint_bytes"],
+                "stage_remote_payload_endpoint_link_units": beta * stage["remote_full_endpoint_bytes"],
+                "stage_remote_payload_edge_link_units": beta * stage["remote_full_edge_bytes"],
+                "stage_self_payload_link_units": beta * stage["self_endpoint_bytes"],
+                "stage1_payload_endpoint_bytes": zero,
+                "stage2_payload_endpoint_bytes": stage["full_endpoint_bytes"],
+                "stage1_remote_payload_endpoint_bytes": zero,
+                "stage2_remote_payload_endpoint_bytes": stage["remote_full_endpoint_bytes"],
+                "stage1_payload_edge_bytes": zero,
+                "stage2_payload_edge_bytes": stage["full_edge_bytes"],
+                "stage1_payload_total_bytes": zero,
+                "stage2_payload_total_bytes": stage["full_total_bytes"],
+                "stage1_max_active_peers": zero,
+                "stage2_max_active_peers": stage["max_active_peers"],
+            }
         if int(self.hierarchy.selected_dim) == 3:
             return self._hierarchical3d_traffic_features(source_unique_counts, source_assignment_counts)
         if int(self.hierarchy.selected_dim) != 2 or len(self.hierarchy.group_sizes) < 2:
@@ -764,6 +799,34 @@ class GreedyCommunicationPlanner:
             raise ValueError("Traffic counts must be two-dimensional.")
         if int(unique_counts.shape[0]) != int(assignment_counts.shape[0]):
             raise ValueError("Unique and assignment traffic counts must have the same batch size.")
+        if int(self.hierarchy.selected_dim) == 1 and len(self.hierarchy.group_sizes) == 1:
+            if int(unique_counts.shape[1]) != self.ep_size or int(assignment_counts.shape[1]) != self.ep_size:
+                raise ValueError("Single-stage traffic counts must contain one column per EP rank.")
+            if source_rank < 0 or source_rank >= self.ep_size:
+                raise ValueError(f"Invalid source rank {source_rank} for EP size {self.ep_size}.")
+            batch = int(unique_counts.shape[0])
+
+            def endpoint_rows(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                send = values.new_zeros((batch, self.ep_size))
+                send[:, int(source_rank)] = values.sum(dim=1)
+                return send, values
+
+            unique_send, unique_receive = endpoint_rows(unique_counts)
+            assignment_send, assignment_receive = endpoint_rows(assignment_counts)
+            empty = unique_counts.new_zeros((batch, self.ep_size))
+            return torch.cat(
+                (
+                    empty,
+                    empty,
+                    empty,
+                    empty,
+                    unique_send,
+                    unique_receive,
+                    assignment_send,
+                    assignment_receive,
+                ),
+                dim=1,
+            )
         if int(self.hierarchy.selected_dim) != 2 or len(self.hierarchy.group_sizes) < 2:
             raise ValueError("Traffic endpoint scoring currently requires a two-stage hierarchy.")
         intra_size = int(self.hierarchy.group_sizes[0])
@@ -894,7 +957,7 @@ class GreedyCommunicationPlanner:
         # PlacementCost only uses this rank diagnostically. Preserve the
         # actual destination-rank bottleneck rather than the byte magnitude.
         peak_rank = (hidden_bytes * unique_stage2_receive + float(2 * 4) * assignment_stage2_receive).argmax(dim=1)
-        selected_dim = torch.full_like(peak_rank, 2)
+        selected_dim = torch.full_like(peak_rank, int(self.hierarchy.selected_dim))
         return communication, compute, units, peak_rank, peak_compute_rank, selected_dim
 
     def _global_traffic_action_costs(

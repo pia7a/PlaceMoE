@@ -31,6 +31,18 @@ class Hierarchy:
         return max(1, len(self.group_sizes))
 
 
+def expected_hierarchy_group_sizes(ep_size: int, ranks_per_node: int) -> tuple[int, ...]:
+    """Return the portable EP hierarchy for one or more homogeneous nodes."""
+
+    ep_size = int(ep_size)
+    ranks_per_node = int(ranks_per_node)
+    if ep_size <= 0 or ranks_per_node <= 0 or ep_size % ranks_per_node:
+        raise ValueError("ep_size and ranks_per_node must be positive, with ranks_per_node dividing ep_size.")
+    if ep_size == ranks_per_node:
+        return (ep_size,)
+    return (ranks_per_node, ep_size)
+
+
 def infer_hierarchy(
     ep_size: int,
     topology: str = "auto",

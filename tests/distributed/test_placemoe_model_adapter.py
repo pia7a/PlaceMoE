@@ -26,12 +26,22 @@ from veomni.distributed.moe.hiermoe.topology import Hierarchy
 from veomni.distributed.parallel_plan import _is_hiermoe_redundant_slot_expert_param as parallel_slot_param
 from veomni.models.module_utils import _is_hiermoe_redundant_slot_expert_param as checkpoint_slot_param
 from veomni.ops.kernels.moe import _make_moe_experts_adapter
+from veomni.utils.accelerator_timing import AcceleratorEvent
 
 
 class _SplitProjectionExperts(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.num_experts = 4
+        self.gate_proj = nn.Parameter(torch.ones(2, 3, 2))
+        self.up_proj = nn.Parameter(torch.full((2, 3, 2), 2.0))
+        self.down_proj = nn.Parameter(torch.full((2, 2, 3), 3.0))
+
+
+class _SingleRankExperts(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.num_experts = 2
         self.gate_proj = nn.Parameter(torch.ones(2, 3, 2))
         self.up_proj = nn.Parameter(torch.full((2, 3, 2), 2.0))
         self.down_proj = nn.Parameter(torch.full((2, 2, 3), 3.0))
@@ -147,3 +157,150 @@ def test_hot_update_seeds_source_mapping_without_initial_artifact(monkeypatch) -
     layer = manager.layers["layers.0.mlp.experts"]
     assert layer.source_logical_to_physical is not None
     assert layer.source_logical_to_physical.tolist() == [[0, 1, 3, 4], [0, 1, 3, 4]]
+
+
+def test_zero_replica_hot_update_constructs_manager_and_seeds_mapping(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE", True)
+    monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE_WORK_ROOT", str(tmp_path))
+    monkeypatch.setattr(expert_swap_module, "_FORWARD_REUSE_COVER", False)
+    monkeypatch.setattr(expert_swap_module, "_FORWARD_REUSE_COVER_PATCH_REMAP", False)
+    monkeypatch.setattr(expert_swap_module, "_ABLATION_REPLAY_MODE", "off")
+    monkeypatch.setattr(expert_swap_module, "_COST_MODEL_VERIFY", False)
+
+    manager = ExpertSwapManager(
+        ep_group=None,
+        ep_size=2,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=0,
+        redundant_slot_increment_per_device=0,
+        max_replica_rounds=0,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=2, group_sizes=(2,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="step",
+        expert_swap_selector="current_joint",
+        fixed_pipeline_overlap=False,
+    )
+    module = _SplitProjectionExperts()
+    manager.register_layer("layers.0.mlp.experts", module)
+
+    layer = manager.layers["layers.0.mlp.experts"]
+    assert manager.placement_planning_enabled()
+    assert layer.source_logical_to_physical is not None
+    assert layer.source_logical_to_physical.tolist() == [list(range(4)), list(range(4))]
+    assert not manager.gradient_overlap_enabled
+
+
+def test_zero_replica_cost_model_calibration_accepts_current_joint(monkeypatch) -> None:
+    monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE", False)
+    monkeypatch.setattr(expert_swap_module, "_COST_MODEL_VERIFY", True)
+    monkeypatch.setattr(expert_swap_module, "_FORWARD_REUSE_COVER", False)
+    monkeypatch.setattr(expert_swap_module, "_ONLINE_FREEZE_COST_MODE", "off")
+
+    manager = ExpertSwapManager(
+        ep_group=None,
+        ep_size=2,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=0,
+        redundant_slot_increment_per_device=0,
+        max_replica_rounds=0,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=2, group_sizes=(2,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="step",
+        expert_swap_selector="current_joint",
+        fixed_pipeline_overlap=False,
+    )
+
+    assert manager._cost_model_verify
+    assert manager.placement_planning_enabled()
+
+
+def test_rank_only_replication_keeps_gradient_overlap_without_fixed_pipeline(monkeypatch) -> None:
+    ep_group = object()
+    gradient_group = object()
+    monkeypatch.setattr(
+        expert_swap_module,
+        "_create_expert_swap_process_group",
+        lambda *_args, **_kwargs: gradient_group,
+    )
+    monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE", False)
+    monkeypatch.setattr(expert_swap_module, "_COST_MODEL_VERIFY", False)
+
+    manager = ExpertSwapManager(
+        ep_group=ep_group,
+        ep_size=4,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=0,
+        redundant_slot_increment_per_device=1,
+        max_replica_rounds=0,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=4, group_sizes=(4,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="step",
+        expert_swap_selector="hiermoe_greedy_cover_p1",
+        fixed_pipeline_overlap=False,
+    )
+
+    assert manager.gradient_overlap_enabled
+    assert manager._pipeline_grad_group is gradient_group
+    assert not manager.fixed_pipeline_overlap
+
+
+def test_rank_only_cost_model_collects_direct_a2a_observations(monkeypatch) -> None:
+    monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE", False)
+    monkeypatch.setattr(expert_swap_module, "_COST_MODEL_VERIFY", True)
+    monkeypatch.setattr(expert_swap_module, "_FORWARD_REUSE_COVER", False)
+    monkeypatch.setattr(expert_swap_module, "_ONLINE_FREEZE_COST_MODE", "off")
+    monkeypatch.setattr(expert_swap_module, "synchronize", lambda: None)
+    manager = ExpertSwapManager(
+        ep_group=None,
+        ep_size=1,
+        ep_rank=0,
+        expert_swap_interval=1,
+        expert_swap_max_pairs_per_layer=0,
+        redundant_slot_increment_per_device=0,
+        max_replica_rounds=0,
+        smooth_max_gamma=10.0,
+        hierarchy=Hierarchy(ep_size=1, group_sizes=(1,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        expert_swap_mode="step",
+        expert_swap_selector="current_joint",
+        fixed_pipeline_overlap=False,
+    )
+    manager.register_layer("layers.0.mlp.experts", _SingleRankExperts())
+    layer = manager.layers["layers.0.mlp.experts"]
+    routes = torch.tensor([[0], [1]], dtype=torch.long)
+    layer.latest_physical_routes = routes
+    layer.latest_hidden_size = 3
+    layer.latest_bytes_per_element = 4
+
+    def event(milliseconds: float) -> AcceleratorEvent:
+        return AcceleratorEvent(device_type="cpu", event=None, wall_time=milliseconds / 1000.0)
+
+    manager.record_layer_timing(
+        layer_key=layer.key,
+        step=1,
+        selected_experts=routes,
+        tokens_per_local_expert=torch.tensor([1, 1]),
+        dispatch_start=event(0.0),
+        dispatch_end=event(2.0),
+        compute_start=event(2.0),
+        compute_end=event(5.0),
+        combine_start=event(5.0),
+        combine_end=event(7.0),
+        communication_events={
+            "stage2_a2a": (event(0.5), event(1.5)),
+            "combine_stage2_a2a": (event(5.5), event(6.5)),
+        },
+    )
+
+    observations = manager._cost_model_step_observations([layer], step=1)
+
+    assert observations["actual_stage_a2a_names"] == ["stage2_a2a", "combine_stage2_a2a"]
+    assert observations["actual_stage_a2a_ms"][0] == pytest.approx([1.0, 1.0])
+    assert observations["traffic_features"]["stage1_payload_endpoint_bytes"] == [0.0]
+    assert observations["traffic_features"]["stage2_payload_endpoint_bytes"][0] > 0.0

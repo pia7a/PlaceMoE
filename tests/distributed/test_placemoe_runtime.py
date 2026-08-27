@@ -22,7 +22,7 @@ import pytest
 import torch
 
 from placemoe import planner as placemoe_planner
-
+from veomni.distributed.moe.hiermoe import all_to_all as all_to_all_module
 from veomni.distributed.moe.hiermoe import expert_swap as expert_swap_module
 from veomni.distributed.moe.hiermoe.expert_swap import ExpertSwapManager
 from veomni.distributed.moe.hiermoe.placemoe import (
@@ -49,6 +49,64 @@ def test_hot_update_uses_canonical_placemoe_cli(monkeypatch):
     path = _runtime_manager()._hot_update_builder_path()
 
     assert Path(path).resolve() == Path(placemoe_planner.__file__).resolve()
+
+
+def test_hot_update_enables_route_capture_without_redundant_slots():
+    manager = _runtime_manager()
+    manager._hot_update = True
+    manager._online_lut_update = False
+    manager._initial_layout_path = ""
+    manager._ablation_replay_mode = "off"
+    manager.expert_swap_max_pairs_per_layer = 0
+    manager.redundant_slot_increment_per_device = 0
+
+    assert manager.placement_planning_enabled()
+
+
+def test_planner_uses_only_intra_node_cost_for_single_node_hierarchy():
+    args = SimpleNamespace(
+        hierarchy_group_sizes=(4,),
+        ep_size=4,
+        ranks_per_node=4,
+        inter_ms_per_byte=9.0,
+        intra_ms_per_byte=2.0,
+        mid_ms_per_byte=None,
+        hidden_size=8,
+        bytes_per_element=2,
+        communication_phase_multiplier=3.0,
+        compute_phase_multiplier=4.0,
+        compute_ms_per_assignment=5.0,
+    )
+
+    hierarchy, omegas, gamma = placemoe_planner._hierarchy_coefficients(args)
+
+    assert hierarchy == (4,)
+    assert omegas == (96.0,)
+    assert gamma == 20.0
+
+
+def test_rank_only_dispatch_records_one_stage_a2a_events(monkeypatch):
+    monkeypatch.setattr(all_to_all_module, "_HIERMOE_INTERNAL_TIMING", True)
+    monkeypatch.setattr(all_to_all_module, "_hiermoe_internal_event", object)
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    selected = torch.tensor([[0], [1]], dtype=torch.long)
+    weights = torch.ones((2, 1), dtype=torch.float32)
+
+    permuted, context, _counts = all_to_all_module.rank_dedup_dispatch(
+        hidden,
+        selected,
+        weights,
+        num_experts=2,
+        ep_group=None,
+        layer_key="layers.0.experts",
+    )
+    output = all_to_all_module.rank_dedup_combine(permuted, context)
+
+    assert torch.equal(output, hidden)
+    assert context.layer_key == "layers.0.experts"
+    assert context.internal_timing_events is not None
+    assert "stage2_a2a" in context.internal_timing_events
+    assert "combine_stage2_a2a" in context.internal_timing_events
 
 
 def test_hot_update_validates_canonical_artifact(tmp_path):
@@ -145,7 +203,7 @@ def test_hot_update_passes_calibration_coefficients_to_planner(monkeypatch, tmp_
         placement_version=3,
     )
     manager.layers = {layer.key: layer}
-    manager.hierarchy = SimpleNamespace(local_world_size=1)
+    manager.hierarchy = SimpleNamespace(local_world_size=1, group_sizes=(1,))
     manager._hot_update_controller = HotUpdateController(100, 20, 500)
     manager._hot_update_last_source_step = -1
     manager._hot_update_last_snapshot_ms = 0.0
@@ -183,6 +241,7 @@ def test_hot_update_passes_calibration_coefficients_to_planner(monkeypatch, tmp_
         "--communication-phase-multiplier": "4.5",
         "--compute-ms-per-assignment": "5.25",
         "--compute-phase-multiplier": "6.5",
+        "--hierarchy-group-sizes": "1",
     }
     for flag, value in expected.items():
         assert command[command.index(flag) + 1] == value

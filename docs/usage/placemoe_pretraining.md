@@ -69,8 +69,9 @@ train:
 ```
 
 The preset automatically enables hierarchical token deduplication,
-source-aware dispatch, step-boundary installation, and replica-gradient
-overlap. It disables the historical swap/cover planners. The remaining values
+source-aware dispatch, and step-boundary installation. Replica-gradient
+overlap is enabled when the replica budget is positive. It disables the
+historical swap/cover planners. The remaining values
 are deployment inputs and must not be copied blindly:
 
 - `ep_size`, `hierarchy_group_sizes`, and slot capacity describe the cluster
@@ -81,9 +82,16 @@ are deployment inputs and must not be copied blindly:
   coefficients used by every planner process; and
 - model and dataset paths use the existing VeOmni schema.
 
+For a single node, use the rank-only hierarchy `[8]` with `ep_size: 8`. For
+multiple homogeneous nodes, use `[ranks_per_node, ep_size]`, such as
+`[8, 16]`. Setting `redundant_slot_increment_per_device: 0` is supported:
+PlaceMoE then optimizes the layout of the single base copy of each expert,
+without replica-gradient synchronization.
+
 An initial `L,M` artifact is optional. Without one, the initial mapping routes
-to the canonical owners and the first full layout update creates replicas from
-profiled routes. Therefore a positive `layout_interval_steps` is required when
+to the canonical owners and the first full update constructs a layout from
+profiled routes; it also creates replicas when the replica budget is positive.
+Therefore a positive `layout_interval_steps` is required when
 `initial_artifact` is empty.
 
 ## 3. Prepare calibration artifacts
@@ -108,6 +116,10 @@ MASTER_ADDR=192.168.0.10 MASTER_PORT=29501 \
   --config configs/my_train.yaml \
   --entrypoint tasks/train_vlm.py
 ```
+
+On one 8-NPU node, set `NNODES=1`, `NODE_RANK=0`, `NPROC_PER_NODE=8`, and
+configure `hierarchy_group_sizes: [8]`. The same `prepare` command calibrates
+the rank-only topology and the model.
 
 The model stage performs 5 default-layout steps: 2 warm-up steps, 1 fitting
 step, and 2 held-out validation steps. The accepted JSON is written at the

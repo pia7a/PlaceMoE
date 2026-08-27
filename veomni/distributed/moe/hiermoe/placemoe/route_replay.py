@@ -25,7 +25,7 @@ import torch
 
 from ..greedy_planner import GreedyCommunicationPlanner
 from ..perf_model import HierMoEPerfModel
-from ..topology import Hierarchy
+from ..topology import Hierarchy, expected_hierarchy_group_sizes
 
 
 @dataclass(frozen=True)
@@ -106,17 +106,27 @@ class HybridEvaluator:
 
     def __init__(self, args: argparse.Namespace) -> None:
         hierarchy_group_sizes = tuple(
-            int(size) for size in (getattr(args, "hierarchy_group_sizes", ()) or (args.ranks_per_node, args.ep_size))
+            int(size)
+            for size in (
+                getattr(args, "hierarchy_group_sizes", ())
+                or expected_hierarchy_group_sizes(args.ep_size, args.ranks_per_node)
+            )
         )
-        if hierarchy_group_sizes[-1] != args.ep_size or len(hierarchy_group_sizes) not in {2, 3}:
-            raise ValueError("Hybrid evaluator requires a two- or three-stage EP hierarchy.")
+        if hierarchy_group_sizes[-1] != args.ep_size or len(hierarchy_group_sizes) not in {1, 2, 3}:
+            raise ValueError("Hybrid evaluator requires a one-, two-, or three-stage EP hierarchy.")
+        if len(hierarchy_group_sizes) == 1 and hierarchy_group_sizes != expected_hierarchy_group_sizes(
+            args.ep_size, args.ranks_per_node
+        ):
+            raise ValueError("A one-stage evaluator hierarchy requires all EP ranks to be on one node.")
         hierarchy = Hierarchy(
             ep_size=args.ep_size,
             group_sizes=hierarchy_group_sizes,
             source="placemoe-route-replay",
         )
         mid_ms_per_byte = getattr(args, "mid_ms_per_byte", None)
-        if len(hierarchy_group_sizes) == 3:
+        if len(hierarchy_group_sizes) == 1:
+            self.level_ms_per_byte = (float(args.intra_ms_per_byte),)
+        elif len(hierarchy_group_sizes) == 3:
             self.level_ms_per_byte = (
                 float(args.inter_ms_per_byte),
                 float(args.inter_ms_per_byte if mid_ms_per_byte is None else mid_ms_per_byte),

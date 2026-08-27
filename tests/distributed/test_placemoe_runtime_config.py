@@ -294,6 +294,31 @@ def test_placemoe_preset_selects_canonical_hiermoe_runtime() -> None:
     assert config.max_slot_op_search_rounds == 0
 
 
+def test_placemoe_preset_supports_zero_replica_placement() -> None:
+    config = HierMoEConfig(
+        placemoe=PlaceMoEArguments(enabled=True),
+        redundant_slot_increment_per_device=0,
+    )
+
+    assert config.enable
+    assert config.expert_swap
+    assert config.expert_swap_selector == "current_joint"
+    assert config.expert_swap_max_pairs_per_layer == 0
+    assert config.max_slot_op_search_rounds == 0
+    assert not config.fixed_pipeline_overlap
+
+
+def test_rank_only_placemoe_preset_uses_topology_independent_gradient_overlap() -> None:
+    config = HierMoEConfig(
+        hierarchy_group_sizes=[8],
+        placemoe=PlaceMoEArguments(enabled=True),
+        redundant_slot_increment_per_device=1,
+    )
+
+    assert config.expert_swap_selector == "hiermoe_greedy_cover_p1"
+    assert not config.fixed_pipeline_overlap
+
+
 def test_scheduler_coalesces_equal_intervals_into_full_update() -> None:
     scheduler = HotUpdateScheduler(100, 100, 500)
 

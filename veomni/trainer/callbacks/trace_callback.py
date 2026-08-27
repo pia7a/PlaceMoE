@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List
 
 from tqdm import trange
@@ -41,8 +44,12 @@ class MoERouterMonitorCallback(Callback):
     def __init__(self, trainer: "BaseTrainer") -> None:
         super().__init__(trainer)
         self.monitor = None
+        self.timing_jsonl_path: Path | None = None
 
         args: "VeOmniArguments" = self.trainer.args
+        timing_dir = os.environ.get("VERL_MOE_TIMING_DIR")
+        if timing_dir:
+            self.timing_jsonl_path = Path(timing_dir) / f"moe_timing_rank{args.train.global_rank}.jsonl"
         if args.train.moe_load_balance_monitor_interval <= 0:
             logger.info_rank0("MoE router monitor disabled (moe_load_balance_monitor_interval=0).")
             return
@@ -94,7 +101,12 @@ class MoERouterMonitorCallback(Callback):
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
-        if self.monitor is None or state.global_step % args.train.moe_load_balance_monitor_interval != 0:
+        interval = max(1, int(args.train.moe_load_balance_monitor_interval))
+        if state.global_step % interval != 0:
+            return
+
+        self._write_timing_payload(state)
+        if self.monitor is None:
             return
 
         # compute_metrics runs an all-reduce across EP/DP groups, so every rank
@@ -122,6 +134,28 @@ class MoERouterMonitorCallback(Callback):
             f"min_vio max={metrics['moe/min_vio/max']:.4f} avg={metrics['moe/min_vio/avg']:.4f}, "
             f"avg_vio max={metrics['moe/avg_vio/max']:.4f} avg={metrics['moe/avg_vio/avg']:.4f}."
         )
+
+    def _write_timing_payload(self, state: TrainerState) -> None:
+        if self.timing_jsonl_path is None:
+            return
+
+        from ...distributed.moe.timing import flush_moe_timing_spans
+
+        payload = flush_moe_timing_spans()
+        if not payload:
+            return
+        args: "VeOmniArguments" = self.trainer.args
+        payload.update(
+            {
+                "step": int(state.global_step),
+                "rank": int(args.train.global_rank),
+                "num_records": 0,
+                "note": "Accelerator-event spans cover EP MoE communication and expert compute.",
+            }
+        )
+        self.timing_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.timing_jsonl_path.open("a", encoding="utf-8") as writer:
+            writer.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         if self.monitor is not None:
@@ -188,6 +222,12 @@ class EnvironMeterCallback(Callback):
         super().__init__(trainer)
 
         args: "VeOmniArguments" = self.trainer.args
+        profile_dir = os.environ.get("VERL_MOE_PROFILE_DIR")
+        self.env_metrics_jsonl_path = (
+            Path(profile_dir) / "env_metrics" / "env_metrics_rank0.jsonl"
+            if profile_dir and args.train.global_rank == 0
+            else None
+        )
         self.lora_config = trainer.model.get_lora_config() if hasattr(trainer.model, "get_lora_config") else None
         self.freeze_vit = getattr(args.train, "freeze_vit", None) if self.lora_config is None else None
         self.trainer.environ_meter = helper.EnvironMeter(
@@ -216,6 +256,7 @@ class EnvironMeterCallback(Callback):
             lora_config=self.lora_config,
             freeze_vit=self.freeze_vit,
         )
+        step_env_metrics["step_time_s"] = delta_time
 
         step_train_metrics = {
             "total_loss": loss,
@@ -236,6 +277,30 @@ class EnvironMeterCallback(Callback):
 
         self.trainer.step_train_metrics = step_train_metrics
         self.trainer.step_env_metrics = step_env_metrics
+        self._write_env_metrics(state, step_env_metrics)
+
+    def _write_env_metrics(self, state: TrainerState, metrics: Dict[str, Any]) -> None:
+        enabled = os.environ.get("VEOMNI_ENV_METRICS_JSONL_ENABLE", "1").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "y",
+        }
+        if self.env_metrics_jsonl_path is None or not enabled:
+            return
+
+        payload = {"step": int(state.global_step), **metrics}
+        self.env_metrics_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.env_metrics_jsonl_path.open("a", encoding="utf-8") as writer:
+            writer.write(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    default=lambda value: value.item() if hasattr(value, "item") else str(value),
+                )
+                + "\n"
+            )
 
 
 class TqdmCallback(Callback):

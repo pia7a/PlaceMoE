@@ -33,6 +33,7 @@ import yaml
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.distributed.moe.hiermoe.perf_model import HierMoEPerfModel
+from veomni.distributed.moe.hiermoe.topology import expected_hierarchy_group_sizes
 from veomni.distributed.moe.runtime_bridge import MOE_RUNTIME_BRIDGE_API_VERSION, load_moe_runtime_bridge
 from veomni.utils.device import get_device_type, get_torch_device
 
@@ -486,10 +487,8 @@ def _calibrate_runtime_command(args: argparse.Namespace) -> int:
         output_path = Path(args.output).expanduser().resolve()
         hierarchy = _parse_hierarchy_csv(args.hierarchy_group_sizes_csv)
         nnodes, node_rank, nproc_per_node, master_addr, master_port = _distributed_environment()
-        if nnodes < 2:
-            raise ModelCalibrationError("portable PlaceMoE runtime calibration currently requires at least 2 nodes")
         ep_size = nnodes * nproc_per_node
-        expected_hierarchy = (nproc_per_node, ep_size)
+        expected_hierarchy = expected_hierarchy_group_sizes(ep_size, nproc_per_node)
         if hierarchy != expected_hierarchy:
             raise ModelCalibrationError(
                 f"portable PlaceMoE calibration requires hierarchy_group_sizes={expected_hierarchy}, got {hierarchy}"
@@ -802,7 +801,7 @@ def _calibrate_model_command(args: argparse.Namespace) -> int:
             int(value)
             for value in _mapping(_mapping(source.get("train")).get("hiermoe")).get("hierarchy_group_sizes", ())
         )
-        expected_hierarchy = (nproc_per_node, ep_size)
+        expected_hierarchy = expected_hierarchy_group_sizes(ep_size, nproc_per_node)
         if hierarchy != expected_hierarchy:
             raise ModelCalibrationError(
                 f"model calibration requires hierarchy_group_sizes={expected_hierarchy}, got {hierarchy}"

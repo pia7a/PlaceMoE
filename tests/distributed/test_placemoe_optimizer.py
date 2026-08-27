@@ -16,6 +16,8 @@ import numpy as np
 import pytest
 import torch
 
+from veomni.distributed.moe.hiermoe.greedy_planner import GreedyCommunicationPlanner
+from veomni.distributed.moe.hiermoe.perf_model import HierMoEPerfModel
 from veomni.distributed.moe.hiermoe.placemoe import (
     CommunityMappingConfig,
     LayerPlan,
@@ -48,6 +50,7 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     uniform_copy_statistics,
     validate_placemoe_artifact,
 )
+from veomni.distributed.moe.hiermoe.topology import Hierarchy
 
 
 def _profile():
@@ -600,6 +603,50 @@ def test_explicit_two_level_hierarchy_is_bitwise_legacy_compatible():
     assert explicit_mapping.sweeps == legacy_mapping.sweeps
     assert explicit_mapping.changes == legacy_mapping.changes
     assert explicit_mapping.peak_rank_load == legacy_mapping.peak_rank_load
+
+
+def test_single_node_hierarchy_places_base_copies_across_ranks():
+    config = PlacementConfig(
+        ep_size=4,
+        ranks_per_node=4,
+        slots_per_rank=1,
+        node_omega=0.25,
+        rank_omega=0.25,
+        gamma=1.0,
+        hierarchy_group_sizes=(4,),
+        level_omegas=(0.25,),
+        node_exchange_limit=4,
+        rank_exchange_limit=2,
+        seed=7,
+    )
+    logical_instances = np.arange(4, dtype=np.int64)
+    demand = np.eye(4, dtype=np.float64) * 10.0
+    affinity = np.zeros((4, 4, 4), dtype=np.float64)
+
+    result = place_instances(demand, affinity, logical_instances, config)
+
+    np.testing.assert_array_equal(np.bincount(result.instance_ranks, minlength=4), [1, 1, 1, 1])
+    assert result.node_objective == 0.0
+    assert result.rank_objective == result.level_objectives[0]
+
+
+def test_single_node_traffic_features_use_rank_stage_only():
+    planner = GreedyCommunicationPlanner(
+        hierarchy=Hierarchy(ep_size=4, group_sizes=(4,), source="test"),
+        perf_model=HierMoEPerfModel.default(),
+        hidden_size=8,
+        bytes_per_element=2,
+        slots_per_rank=1,
+    )
+    unique = torch.eye(4, dtype=torch.float32).view(4, 1, 4)
+    assignments = 2.0 * unique
+
+    features = planner._hierarchical_traffic_features(unique, assignments)
+
+    assert features["stage1_payload_endpoint_bytes"].item() == 0.0
+    assert features["stage1_payload_edge_bytes"].item() == 0.0
+    assert features["stage2_payload_endpoint_bytes"].item() > 0.0
+    assert features["stage_payload_endpoint_link_units"].item() > 0.0
 
 
 def test_three_level_placement_and_mapping_preserve_capacity_and_copy_identity():

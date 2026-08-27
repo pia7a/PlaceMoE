@@ -11,9 +11,86 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 
 _PLAN_FIELDS = ("slot_to_logical", "owner_slots", "source_logical_to_physical")
+
+
+@pytest.mark.parametrize(("redundant_slots", "copies_per_expert"), [(0, 1), (1, 2)])
+def test_single_node_planner_builds_valid_layout(
+    tmp_path: Path,
+    redundant_slots: int,
+    copies_per_expert: int,
+) -> None:
+    route_root = tmp_path / "routes"
+    samples = (
+        torch.tensor([[0, 1], [0, 2]], dtype=torch.int64),
+        torch.tensor([[1, 2], [1, 3]], dtype=torch.int64),
+        torch.tensor([[2, 3], [0, 2]], dtype=torch.int64),
+        torch.tensor([[0, 3], [1, 3]], dtype=torch.int64),
+    )
+    for step in (1, 2):
+        step_root = route_root / f"step{step:04d}"
+        step_root.mkdir(parents=True)
+        for rank, routes in enumerate(samples):
+            torch.save(
+                {"ep_size": 4, "routes": routes},
+                step_root / f"layer00_call0_rank{rank:02d}.pt",
+            )
+    output_layout = tmp_path / "layout.json"
+    output_report = tmp_path / "report.json"
+    command = [
+        sys.executable,
+        "-m",
+        "placemoe.planner",
+        "--route-root",
+        str(route_root),
+        "--optimize-steps",
+        "1",
+        "--validation-steps",
+        "2",
+        "--layers",
+        "1",
+        "--expected-total-layers",
+        "1",
+        "--workers",
+        "1",
+        "--candidate-workers",
+        "1",
+        "--ep-size",
+        "4",
+        "--ranks-per-node",
+        "4",
+        "--hierarchy-group-sizes",
+        "4",
+        "--num-experts",
+        "4",
+        "--redundant-slots-per-rank",
+        str(redundant_slots),
+        "--replica-candidate-limit",
+        "1",
+        "--partition-restarts",
+        "1",
+        "--alternations",
+        "1",
+        "--disable-community-block-candidates",
+        "--output-layout",
+        str(output_layout),
+        "--output-report",
+        str(output_report),
+    ]
+
+    subprocess.run(command, check=True, cwd=Path(__file__).resolve().parents[2])
+
+    layout = json.loads(output_layout.read_text(encoding="utf-8"))
+    report = json.loads(output_report.read_text(encoding="utf-8"))
+    layer = next(iter(layout["layers"].values()))
+    assert sorted(layer["slot_to_logical"]) == sorted(list(range(4)) * copies_per_expert)
+    assert len(set(layer["owner_slots"])) == 4
+    assert all(len(set(row)) == 4 for row in layer["source_logical_to_physical"])
+    assert report["aggregate"]["active_replica_slots"] == 4 * redundant_slots
+    assert report["aggregate"]["empty_slots"] == 0
 
 
 def _required_path(name: str) -> Path:

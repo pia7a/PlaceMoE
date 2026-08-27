@@ -164,9 +164,15 @@ These values are examples, not portable tuning defaults:
 - planner worker counts must fit the host CPU allocation; and
 - model and data fields continue to use the normal VeOmni schema.
 
+For one node, set `ep_size` to the local rank count and use a single hierarchy
+entry, for example `ep_size: 8` with `hierarchy_group_sizes: [8]`. A redundant
+slot budget of `0` is valid and keeps layout optimization enabled while
+disabling expert replication and replica-gradient synchronization.
+
 When `initial_artifact` is empty, PlaceMoE initially uses the default layout
-and creates replicas after collecting routes for the first full layout
-update. A mapping-only update cannot create replicas, so
+and applies the first full layout update after collecting routes. With a
+positive replica budget, that update also creates the replicas. A mapping-only
+update cannot change the physical layout, so
 `layout_interval_steps` must be positive in this mode. To keep a precomputed
 layout and mapping static, provide `initial_artifact` and set both update
 intervals to `0`.

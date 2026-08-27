@@ -108,7 +108,7 @@ def _config() -> dict:
         "model": {"model_path": "/models/demo-moe"},
         "train": {
             "accelerator": {"ep_size": 4},
-            "optimizer": {"lr": 1.0e-5},
+            "optimizer": {"lr": 1.0e-5, "lr_min": 1.0e-7},
             "hiermoe": {
                 "hierarchy_group_sizes": [2, 4],
                 "redundant_slot_increment_per_device": 1,
@@ -175,6 +175,9 @@ def test_materialized_config_isolated_short_default_layout_run(tmp_path) -> None
     assert result["train"]["num_train_epochs"] == 1
     assert result["train"]["checkpoint"]["load_path"] is None
     assert result["train"]["optimizer"]["lr"] == 0.0
+    assert result["train"]["optimizer"]["lr_min"] == 0.0
+    assert result["train"]["optimizer"]["lr_warmup_ratio"] == 0.0
+    assert result["train"]["optimizer"]["lr_decay_style"] == "constant"
     assert result["train"]["hiermoe"]["enable"] is True
     assert result["train"]["hiermoe"]["token_dedup"] is True
     assert result["train"]["hiermoe"]["expert_swap"] is True
@@ -183,6 +186,38 @@ def test_materialized_config_isolated_short_default_layout_run(tmp_path) -> None
     assert result["train"]["hiermoe"]["redundant_slot_increment_per_device"] == 1
     assert result["train"]["hiermoe"]["placemoe"]["hot_update"]["enabled"] is False
     assert source["train"]["optimizer"]["lr"] == 1.0e-5
+    assert source["train"]["optimizer"]["lr_min"] == 1.0e-7
+
+
+def test_materialized_config_preserves_zero_replica_budget(tmp_path) -> None:
+    source = _config()
+    source["train"]["hiermoe"]["redundant_slot_increment_per_device"] = 0
+
+    result = materialize_model_calibration_config(
+        source,
+        runtime_perf_model=tmp_path / "runtime.json",
+        work_directory=tmp_path,
+        schedule=ModelCalibrationSchedule(),
+    )
+
+    hiermoe = result["train"]["hiermoe"]
+    assert hiermoe["redundant_slot_increment_per_device"] == 0
+    assert hiermoe["expert_swap_selector"] == "current_joint"
+    assert hiermoe["fixed_pipeline_overlap"] is False
+
+
+def test_materialized_single_node_config_does_not_enable_two_level_pipeline(tmp_path) -> None:
+    source = _config()
+    source["train"]["hiermoe"]["hierarchy_group_sizes"] = [4]
+
+    result = materialize_model_calibration_config(
+        source,
+        runtime_perf_model=tmp_path / "runtime.json",
+        work_directory=tmp_path,
+        schedule=ModelCalibrationSchedule(),
+    )
+
+    assert result["train"]["hiermoe"]["fixed_pipeline_overlap"] is False
 
 
 def test_builds_scoped_accepted_artifact_from_fit_and_held_out_steps(tmp_path) -> None:
@@ -218,6 +253,30 @@ def test_builds_scoped_accepted_artifact_from_fit_and_held_out_steps(tmp_path) -
         "joint": True,
     }
     assert artifact["held_out_validation"]["basis"].startswith("serialized variable-cost")
+
+
+def test_builds_single_node_artifact_from_intra_node_calibration(tmp_path) -> None:
+    config = _config()
+    config["train"]["hiermoe"]["hierarchy_group_sizes"] = [4]
+    runtime_model = _runtime_model()
+    runtime_model["metadata"]["ranks_per_node"] = 4
+    runtime_model["metadata"]["hierarchy_group_sizes"] = [4]
+    runtime_model["inter"] = []
+
+    artifact = build_planner_calibration_artifact(
+        training_config=config,
+        runtime_perf_model=runtime_model,
+        runtime_perf_model_sha256="runtime-sha",
+        training_log_text=_training_log(_report(2), _report(3), _report(4)),
+        training_log_sha256="training-sha",
+        phase_timing_summaries=_phase_summaries(tmp_path),
+        ranks_per_node=4,
+        schedule=ModelCalibrationSchedule(),
+    )
+
+    assert artifact["status"] == "accepted"
+    assert artifact["scope"]["hierarchy_group_sizes"] == [4]
+    assert artifact["coefficients"]["inter_ms_per_byte"] == artifact["coefficients"]["intra_ms_per_byte"]
 
 
 def test_rejects_artifact_when_held_out_error_exceeds_threshold(tmp_path) -> None:

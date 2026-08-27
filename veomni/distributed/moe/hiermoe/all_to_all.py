@@ -2205,6 +2205,9 @@ def rank_dedup_dispatch(
         ep_size,
         physical_experts=physical_experts,
     )
+    internal_timing_events: dict[str, tuple[AcceleratorEvent, AcceleratorEvent]] | None = (
+        {} if _HIERMOE_INTERNAL_TIMING else None
+    )
 
     split_exchange = _start_exchange_split_sizes_many(
         [unique_send_splits, assignment_send_splits], ep_group, hidden_states.device
@@ -2212,6 +2215,7 @@ def rank_dedup_dispatch(
 
     send_meta_weights = _pack_meta_weights(send_meta, send_weights)
     unique_recv_splits, assignment_recv_splits = split_exchange.wait()
+    rank_a2a_start = _hiermoe_internal_event()
     recv_hidden, recv_meta_weights = _call_all_to_all_pair(
         ep_group,
         send_hidden,
@@ -2221,6 +2225,7 @@ def rank_dedup_dispatch(
         assignment_recv_splits,
         assignment_send_splits,
     )
+    _finish_hiermoe_internal_event(internal_timing_events, "stage2_a2a", rank_a2a_start)
     recv_meta, recv_weights = _unpack_meta_weights(recv_meta_weights, meta_cols=3, weight_dtype=routing_weights.dtype)
 
     source_ranks = _repeat_ranks(assignment_recv_splits, hidden_states.device)
@@ -2265,6 +2270,8 @@ def rank_dedup_dispatch(
         selected_dim=selected_dim,
         dedup_ratio_dispatch=dedup_ratio,
         dedup_ratio_combine=dedup_ratio,
+        internal_timing_events=internal_timing_events,
+        layer_key=layer_key,
     )
     if state is not None and state.expert_swap_manager is not None and layer_key is not None:
         state.expert_swap_manager.record_local_expert_token_counts(layer_key, tokens_per_local_expert)
@@ -2566,7 +2573,9 @@ def rank_dedup_combine(expert_outputs: torch.Tensor, ctx: RankDedupDispatchConte
         ctx.recv_source_token_indices,
         ctx.assignment_recv_splits,
     )
+    rank_a2a_start = _hiermoe_internal_event()
     partial_outputs = _call_all_to_all(ctx.ep_group, combine_input, ctx.unique_send_splits, combine_input_splits)
+    _finish_hiermoe_internal_event(ctx.internal_timing_events, "combine_stage2_a2a", rank_a2a_start)
 
     return _index_add_dim0_cast_output(
         partial_outputs,

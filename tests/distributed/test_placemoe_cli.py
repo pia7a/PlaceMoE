@@ -78,6 +78,48 @@ def test_cli_exposes_runtime_calibration_and_prepare_commands() -> None:
     assert not prepare.force_model
 
 
+def test_runtime_calibration_launches_single_node_rank_hierarchy(tmp_path, monkeypatch) -> None:
+    output = tmp_path / "runtime.json"
+    monkeypatch.setattr(cli, "_distributed_environment", lambda: (1, 0, 4, "127.0.0.1", 29500))
+
+    def run(command, *, environment, log_path) -> int:
+        assert "--nnodes=1" in command
+        assert "--nproc-per-node=4" in command
+        assert "--hierarchy-group-sizes-csv" in command
+        assert command[command.index("--hierarchy-group-sizes-csv") + 1] == "4"
+        output.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "source": "bench_hiermoe_perf_model",
+                    "status": "accepted",
+                    "inter": [],
+                    "intra": {"alpha": 1.0, "beta": 2.0e-9},
+                    "metadata": {
+                        "ep_size": 4,
+                        "ranks_per_node": 4,
+                        "hierarchy_group_sizes": [4],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr(cli, "_stream_training", run)
+    args = cli.build_parser().parse_args(
+        [
+            "calibrate-runtime",
+            "--output",
+            str(output),
+            "--hierarchy-group-sizes-csv",
+            "4",
+        ]
+    )
+
+    assert cli._calibrate_runtime_command(args) == 0
+
+
 def test_stage_result_rejects_different_generated_artifacts() -> None:
     peer_result = json.dumps(
         {
@@ -208,7 +250,7 @@ def test_prepare_reuses_valid_artifacts_without_running_calibrators(tmp_path, mo
                 "schema_version": 2,
                 "source": "bench_hiermoe_perf_model",
                 "a2a": {"alpha": 1.0, "beta": 1.0e-8},
-                "inter": [{"alpha": 1.0, "beta": 2.0e-8}],
+                "inter": [],
                 "intra": {"alpha": 1.0, "beta": 2.0e-9},
                 "state_move": {
                     "intra": {"alpha": 1.0, "beta": 2.0e-9},
@@ -227,7 +269,7 @@ def test_prepare_reuses_valid_artifacts_without_running_calibrators(tmp_path, mo
                 "metadata": {
                     "ep_size": 2,
                     "ranks_per_node": 2,
-                    "hierarchy_group_sizes": [2, 2],
+                    "hierarchy_group_sizes": [2],
                     "device_type": "npu",
                     "backend": "hccl",
                     "dtype": "bf16",
@@ -247,7 +289,7 @@ def test_prepare_reuses_valid_artifacts_without_running_calibrators(tmp_path, mo
                     "model_id": "Qwen",
                     "ep_size": 2,
                     "ranks_per_node": 2,
-                    "hierarchy_group_sizes": [2, 2],
+                    "hierarchy_group_sizes": [2],
                 },
                 "coefficients": {
                     "inter_ms_per_byte": 1.0e-8,
@@ -279,7 +321,7 @@ train:
   accelerator:
     ep_size: 2
   hiermoe:
-    hierarchy_group_sizes: [2, 2]
+    hierarchy_group_sizes: [2]
     placemoe:
       enabled: true
       base_directory: {tmp_path}
@@ -330,7 +372,7 @@ train:
   accelerator:
     ep_size: 2
   hiermoe:
-    hierarchy_group_sizes: [2, 2]
+    hierarchy_group_sizes: [2]
     placemoe:
       enabled: true
       base_directory: {tmp_path}
@@ -352,7 +394,7 @@ train:
                     "schema_version": 2,
                     "source": "bench_hiermoe_perf_model",
                     "a2a": {"alpha": 1.0, "beta": 1.0e-8},
-                    "inter": [{"alpha": 1.0, "beta": 2.0e-8}],
+                    "inter": [],
                     "intra": {"alpha": 1.0, "beta": 2.0e-9},
                     "state_move": {
                         "intra": {"alpha": 1.0, "beta": 2.0e-9},
@@ -371,7 +413,7 @@ train:
                     "metadata": {
                         "ep_size": 2,
                         "ranks_per_node": 2,
-                        "hierarchy_group_sizes": [2, 2],
+                        "hierarchy_group_sizes": [2],
                         "device_type": "npu",
                         "backend": "hccl",
                         "dtype": "bf16",
@@ -397,7 +439,7 @@ train:
                         "model_id": "Qwen",
                         "ep_size": 2,
                         "ranks_per_node": 2,
-                        "hierarchy_group_sizes": [2, 2],
+                        "hierarchy_group_sizes": [2],
                     },
                     "coefficients": {
                         "inter_ms_per_byte": 1.0e-8,
