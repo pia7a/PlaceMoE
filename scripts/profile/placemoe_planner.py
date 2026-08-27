@@ -62,6 +62,7 @@ from veomni.distributed.moe.hiermoe.placemoe import (
     uniform_copy_statistics,
     validate_placemoe_artifact,
 )
+from veomni.distributed.moe.hiermoe.topology import expected_hierarchy_group_sizes
 
 
 @dataclass(frozen=True)
@@ -333,14 +334,24 @@ def _hierarchy_coefficients(
     """Return the runtime hierarchy, per-stage affinity weights, and compute weight."""
 
     hierarchy_group_sizes = tuple(
-        int(size) for size in (getattr(args, "hierarchy_group_sizes", ()) or (args.ranks_per_node, args.ep_size))
+        int(size)
+        for size in (
+            getattr(args, "hierarchy_group_sizes", ())
+            or expected_hierarchy_group_sizes(args.ep_size, args.ranks_per_node)
+        )
     )
-    if hierarchy_group_sizes[-1] != args.ep_size or len(hierarchy_group_sizes) not in {2, 3}:
-        raise ValueError("PlaceMoE requires a two- or three-stage EP hierarchy.")
+    if hierarchy_group_sizes[-1] != args.ep_size or len(hierarchy_group_sizes) not in {1, 2, 3}:
+        raise ValueError("PlaceMoE requires a one-, two-, or three-stage EP hierarchy.")
+    if len(hierarchy_group_sizes) == 1 and hierarchy_group_sizes != expected_hierarchy_group_sizes(
+        args.ep_size, args.ranks_per_node
+    ):
+        raise ValueError("A one-stage PlaceMoE hierarchy requires all EP ranks to be on one node.")
     if any(lhs <= 0 or rhs % lhs for lhs, rhs in zip(hierarchy_group_sizes, hierarchy_group_sizes[1:], strict=False)):
         raise ValueError("Hierarchy group sizes must form an increasing divisibility chain.")
     middle = getattr(args, "mid_ms_per_byte", None)
-    if len(hierarchy_group_sizes) == 3:
+    if len(hierarchy_group_sizes) == 1:
+        link_coefficients = (float(args.intra_ms_per_byte),)
+    elif len(hierarchy_group_sizes) == 3:
         link_coefficients = (
             float(args.inter_ms_per_byte),
             float(args.inter_ms_per_byte if middle is None else middle),
@@ -1535,7 +1546,8 @@ def _preloaded_replay_payload(
             "layer_keys": list(args.layer_keys),
             "update_mode": getattr(args, "update_mode", "full"),
             "hierarchy_group_sizes": list(
-                getattr(args, "hierarchy_group_sizes", ()) or (args.ranks_per_node, args.ep_size)
+                getattr(args, "hierarchy_group_sizes", ())
+                or expected_hierarchy_group_sizes(args.ep_size, args.ranks_per_node)
             ),
         },
     )

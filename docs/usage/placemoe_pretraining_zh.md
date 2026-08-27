@@ -66,8 +66,9 @@ train:
         worker_threads: 1
 ```
 
-该 preset 会自动启用分层 token deduplication、source-aware dispatch、step
-boundary 安装和 replica-gradient overlap，并禁用历史 swap/cover planners。
+该 preset 会自动启用分层 token deduplication、source-aware dispatch 和 step
+boundary 安装；副本预算为正时还会启用 replica-gradient overlap。它会禁用历史
+swap/cover planners。
 其余参数都是部署输入，不能盲目复制：
 
 - `ep_size`、`hierarchy_group_sizes` 和 slot capacity 描述集群与副本预算；
@@ -76,8 +77,14 @@ boundary 安装和 replica-gradient overlap，并禁用历史 swap/cover planner
   系数；
 - 模型和数据集路径继续使用已有 VeOmni schema。
 
+单节点配置应使用仅含 rank 层级的 `[8]`，并设置 `ep_size: 8`；多个同构节点使用
+`[ranks_per_node, ep_size]`，例如 `[8, 16]`。系统支持将
+`redundant_slot_increment_per_device` 设为 `0`：此时 PlaceMoE 仍会优化每个专家
+唯一 base copy 的布局，但不执行 replica-gradient synchronization。
+
 初始 `L,M` artifact 是可选的。若未提供，初始 mapping 会将请求路由到 canonical
-owner，第一个完整布局更新再根据已采集 routes 创建副本。因此，当
+owner，第一个完整更新再根据已采集 routes 构建布局；若副本预算为正，该更新还会
+创建专家副本。因此，当
 `initial_artifact` 为空时，`layout_interval_steps` 必须为正数。
 
 ## 3. 准备校准文件
@@ -100,6 +107,10 @@ MASTER_ADDR=192.168.0.10 MASTER_PORT=29501 \
   --config configs/my_train.yaml \
   --entrypoint tasks/train_vlm.py
 ```
+
+在单台 8-NPU 节点上，将 `NNODES=1`、`NODE_RANK=0`、
+`NPROC_PER_NODE=8`，并配置 `hierarchy_group_sizes: [8]`。同一个
+`prepare` 命令会完成 rank-only 拓扑和模型校准。
 
 模型校准阶段默认运行 5 个默认布局 step：2 个 warm-up step、1 个拟合 step 和
 2 个 held-out 验证 step。通过验证的 JSON 会写入每个节点上的配置路径。文本模型

@@ -15,6 +15,8 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from ..topology import expected_hierarchy_group_sizes
+
 
 _CALIBRATION_MARKER = "HierMoE cost model calibration report: "
 _VALIDATION_MARKER = "HierMoE cost model validation report: "
@@ -119,11 +121,7 @@ def _runtime_profile(
     hierarchy_group_sizes: Sequence[int],
 ) -> tuple[float, float, Mapping[str, Any]]:
     hierarchy = tuple(int(value) for value in hierarchy_group_sizes)
-    if len(hierarchy) != 2:
-        raise ModelCalibrationError(
-            "portable model calibration currently requires a 2-level hierarchy such as [8, 16]"
-        )
-    runtime_hierarchy = (int(ranks_per_node), int(ep_size))
+    runtime_hierarchy = expected_hierarchy_group_sizes(ep_size, ranks_per_node)
     if hierarchy != runtime_hierarchy:
         raise ModelCalibrationError(
             f"planner runtime requires hierarchy_group_sizes={runtime_hierarchy}, got {hierarchy}"
@@ -157,11 +155,18 @@ def _runtime_profile(
         mismatches.append(f"hierarchy={actual_hierarchy}, expected {hierarchy}")
     if mismatches:
         raise ModelCalibrationError("runtime performance model scope mismatch: " + "; ".join(mismatches))
-    inter_rows = payload.get("inter")
-    if not isinstance(inter_rows, list) or not inter_rows:
-        raise ModelCalibrationError("runtime performance model has no inter-node coefficients")
-    inter_beta = _positive(_mapping(inter_rows[0], "inter[0]").get("beta"), "inter[0].beta")
     intra_beta = _positive(_mapping(payload.get("intra"), "intra").get("beta"), "intra.beta")
+    inter_rows = payload.get("inter")
+    if not isinstance(inter_rows, list):
+        raise ModelCalibrationError("runtime performance model inter coefficients must be a list")
+    if len(hierarchy) == 1:
+        if inter_rows:
+            raise ModelCalibrationError("single-node runtime performance model must not contain inter-node stages")
+        inter_beta = intra_beta
+    else:
+        if not inter_rows:
+            raise ModelCalibrationError("runtime performance model has no inter-node coefficients")
+        inter_beta = _positive(_mapping(inter_rows[0], "inter[0]").get("beta"), "inter[0].beta")
     return inter_beta, intra_beta, metadata
 
 
@@ -633,6 +638,9 @@ def materialize_model_calibration_config(
     if not isinstance(optimizer, dict):
         raise ModelCalibrationError("train.optimizer must be a mapping")
     optimizer["lr"] = 0.0
+    optimizer["lr_min"] = 0.0
+    optimizer["lr_warmup_ratio"] = 0.0
+    optimizer["lr_decay_style"] = "constant"
     wandb = train.setdefault("wandb", {})
     if isinstance(wandb, dict):
         wandb["enable"] = False
@@ -658,6 +666,8 @@ def materialize_model_calibration_config(
         raise ModelCalibrationError("train.hiermoe must be a mapping")
     if not hiermoe.get("hierarchy_group_sizes"):
         raise ModelCalibrationError("train.hiermoe.hierarchy_group_sizes must be explicit during calibration")
+    hierarchy_levels = len(hiermoe["hierarchy_group_sizes"])
+    redundant_slots = max(0, int(hiermoe.get("redundant_slot_increment_per_device", 0) or 0))
     hiermoe.update(
         {
             "enable": True,
@@ -667,14 +677,13 @@ def materialize_model_calibration_config(
             "expert_swap_interval": 1,
             "expert_swap_max_pairs_per_layer": 0,
             "expert_swap_mode": "step",
-            "expert_swap_selector": "hiermoe_greedy_cover_p1",
+            "expert_swap_selector": "hiermoe_greedy_cover_p1" if redundant_slots > 0 else "current_joint",
             "max_slot_op_search_rounds": 0,
+            "fixed_pipeline_overlap": redundant_slots > 0 and hierarchy_levels == 2,
         }
     )
     hiermoe["perf_model_path"] = str(runtime_perf_model)
-    hiermoe["redundant_slot_increment_per_device"] = max(
-        1, int(hiermoe.get("redundant_slot_increment_per_device", 0) or 0)
-    )
+    hiermoe["redundant_slot_increment_per_device"] = redundant_slots
     hiermoe["log_interval"] = 1
     existing_placemoe = hiermoe.get("placemoe")
     resources = existing_placemoe.get("resources", {}) if isinstance(existing_placemoe, Mapping) else {}

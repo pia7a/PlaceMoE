@@ -43,6 +43,7 @@ class PlannerCommandSpec:
     layer_keys: Sequence[str]
     ep_size: int
     ranks_per_node: int
+    hierarchy_group_sizes: Sequence[int]
     num_experts: int
     slots_per_rank: int
     primary_slots_per_rank: int
@@ -88,6 +89,8 @@ def build_planner_command(
         str(spec.ep_size),
         "--ranks-per-node",
         str(spec.ranks_per_node),
+        "--hierarchy-group-sizes",
+        ",".join(str(value) for value in spec.hierarchy_group_sizes),
         "--num-experts",
         str(spec.num_experts),
         "--slots-per-rank",

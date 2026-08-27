@@ -142,7 +142,7 @@ def test_hot_update_passes_calibration_coefficients_to_planner(monkeypatch, tmp_
         placement_version=3,
     )
     manager.layers = {layer.key: layer}
-    manager.hierarchy = SimpleNamespace(local_world_size=1)
+    manager.hierarchy = SimpleNamespace(local_world_size=1, group_sizes=(1,))
     manager._hot_update_controller = HotUpdateController(100, 20, 500)
     manager._hot_update_last_source_step = -1
     manager._hot_update_last_snapshot_ms = 0.0
@@ -180,6 +180,7 @@ def test_hot_update_passes_calibration_coefficients_to_planner(monkeypatch, tmp_
         "--communication-phase-multiplier": "4.5",
         "--compute-ms-per-assignment": "5.25",
         "--compute-phase-multiplier": "6.5",
+        "--hierarchy-group-sizes": "1",
     }
     for flag, value in expected.items():
         assert command[command.index(flag) + 1] == value

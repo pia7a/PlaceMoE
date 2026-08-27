@@ -157,8 +157,13 @@ train:
 - planner worker 数量必须符合宿主机 CPU 资源；
 - 模型和数据配置继续沿用普通 VeOmni YAML 的定义。
 
-当 `initial_artifact` 为空时，PlaceMoE 先使用默认布局，并在第一次完整布局更新前
-收集路由数据。mapping-only 更新不能创建专家副本，因此此时
+单节点应将 `ep_size` 设为本地 rank 数，并只配置一个层级，例如
+`ep_size: 8` 与 `hierarchy_group_sizes: [8]`。冗余槽位预算可以设为 `0`；此时
+系统仍会优化专家布局，但不会创建专家副本或执行副本梯度同步。
+
+当 `initial_artifact` 为空时，PlaceMoE 先使用默认布局，收集路由数据后再执行第一
+次完整布局更新；若副本预算为正，该更新还会创建专家副本。mapping-only 更新不能
+改变物理布局，因此此时
 `layout_interval_steps` 必须为正数。若要静态使用预先生成的布局和映射，需要
 设置 `initial_artifact`，并将两个更新间隔都设为 `0`。
 

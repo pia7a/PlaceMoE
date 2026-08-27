@@ -77,7 +77,9 @@ def _placement_hierarchy(config: PlacementConfig) -> tuple[tuple[int, ...], tupl
     if any(lhs <= 0 or rhs % lhs for lhs, rhs in zip(runtime_sizes, runtime_sizes[1:], strict=False)):
         raise ValueError("Hierarchy group sizes must form an increasing divisibility chain.")
     level_sizes = (*reversed(runtime_sizes[:-1]), 1)
-    if level_sizes[0] != config.ranks_per_node:
+    if len(runtime_sizes) == 1 and config.num_nodes != 1:
+        raise ValueError("A one-stage hierarchy requires all EP ranks to be on one node.")
+    if len(runtime_sizes) > 1 and level_sizes[0] != config.ranks_per_node:
         raise ValueError("The coarsest proper hierarchy group must match ranks_per_node.")
     omegas = tuple(float(value) for value in config.level_omegas)
     if len(omegas) != len(level_sizes):
@@ -407,11 +409,13 @@ def _place_instances_multilevel(
         raise RuntimeError("Hierarchical placement violates rank capacity.")
     if not rank_placement_is_unique(instance_ranks, logical_instances, ep_size=config.ep_size):
         raise RuntimeError("Hierarchical placement retains duplicate expert copies on one rank.")
+    node_objective = objectives[0] if len(objectives) > 1 else 0.0
+    rank_objective = sum(objectives[1:]) if len(objectives) > 1 else objectives[0]
     return PlacementResult(
         instance_ranks=instance_ranks,
         repaired=repaired,
-        node_objective=objectives[0],
-        rank_objective=sum(objectives[1:]),
+        node_objective=node_objective,
+        rank_objective=rank_objective,
         level_objectives=tuple(objectives),
     )
 
@@ -433,7 +437,7 @@ def place_instances(
         raise ValueError("Copy affinity must have shape [source_rank, instance, instance].")
     if logical_instances.shape != (config.total_slots,):
         raise ValueError("Logical instances must fill the physical slot capacity, including empty items.")
-    if len(_placement_hierarchy(config)[0]) > 2:
+    if len(_placement_hierarchy(config)[0]) != 2:
         return _place_instances_multilevel(demand_by_source, affinity_by_source, logical_instances, config)
     demand = demand_by_source.sum(axis=0)
     affinity = affinity_by_source.sum(axis=0)

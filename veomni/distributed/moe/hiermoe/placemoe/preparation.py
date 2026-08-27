@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from ..topology import expected_hierarchy_group_sizes
 from .calibration import ModelCalibrationError, sha256_path, validate_runtime_performance_model
 
 
@@ -150,7 +151,7 @@ def build_preparation_spec(
             f"config ep_size={ep_size}, world_size={world_size}"
         )
     hierarchy = tuple(int(value) for value in hiermoe.get("hierarchy_group_sizes", ()) or ())
-    expected_hierarchy = (int(nproc_per_node), ep_size)
+    expected_hierarchy = expected_hierarchy_group_sizes(ep_size, nproc_per_node)
     if hierarchy != expected_hierarchy:
         raise ModelCalibrationError(
             f"PlaceMoE preparation requires hierarchy_group_sizes={expected_hierarchy}, got {hierarchy}"

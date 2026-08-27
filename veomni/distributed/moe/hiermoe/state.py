@@ -154,11 +154,29 @@ def configure_hiermoe(
     active = bool(config.enable and config.token_dedup and ep_size > 1)
     placement_enabled = bool(
         config.expert_swap
-        and (int(config.expert_swap_max_pairs_per_layer) > 0 or int(config.redundant_slot_increment_per_device) > 0)
+        and (
+            placemoe_config.enabled
+            or int(config.expert_swap_max_pairs_per_layer) > 0
+            or int(config.redundant_slot_increment_per_device) > 0
+        )
     )
     placement_planning_enabled = bool(
-        config.expert_swap and (int(config.expert_swap_max_pairs_per_layer) > 0 or max_replica_rounds > 0)
+        config.expert_swap
+        and (placemoe_config.enabled or int(config.expert_swap_max_pairs_per_layer) > 0 or max_replica_rounds > 0)
     )
+    fixed_pipeline_overlap = bool(config.fixed_pipeline_overlap and int(hierarchy.selected_dim) == 2)
+    if (
+        placemoe_config.enabled
+        and int(config.redundant_slot_increment_per_device) > 0
+        and int(hierarchy.selected_dim) != 2
+    ):
+        logger.info_rank0(
+            "PlaceMoE hierarchy=%s uses the topology-independent replica-gradient overlap; "
+            "the fixed six-window pipeline is only enabled for two-level communication.",
+            hierarchy.group_sizes,
+        )
+    elif config.fixed_pipeline_overlap and not fixed_pipeline_overlap:
+        raise ValueError("HierMoE fixed_pipeline_overlap requires a two-level communication hierarchy.")
 
     if config.enable and ep_size <= 1:
         logger.warning_rank0("HierMoE is enabled but EP size is <= 1; falling back to the original MoE path.")
@@ -206,7 +224,7 @@ def configure_hiermoe(
             redundant_slot_increment_per_device=int(config.redundant_slot_increment_per_device),
             max_replica_rounds=max_replica_rounds,
             smooth_max_gamma=float(config.smooth_max_gamma),
-            fixed_pipeline_overlap=bool(config.fixed_pipeline_overlap),
+            fixed_pipeline_overlap=fixed_pipeline_overlap,
             hierarchy=hierarchy,
             perf_model=perf_model,
             expert_swap_mode=str(config.expert_swap_mode),
@@ -237,7 +255,7 @@ def configure_hiermoe(
         log_interval=max(1, int(config.log_interval)),
         hierarchy=hierarchy,
         perf_model=perf_model,
-        fixed_pipeline_overlap=bool(config.fixed_pipeline_overlap),
+        fixed_pipeline_overlap=fixed_pipeline_overlap,
         activation_checkpointing_enabled=bool(activation_checkpointing_enabled),
         active=active,
         communication_mode=str(config.communication_mode),
@@ -264,7 +282,7 @@ def configure_hiermoe(
             config.expert_swap_max_pairs_per_layer,
             config.expert_swap_mode,
             config.expert_swap_selector,
-            config.fixed_pipeline_overlap,
+            fixed_pipeline_overlap,
             config.redundant_slot_increment_per_device,
             config.max_slot_op_search_rounds,
             int(config.redundant_slot_increment_per_device) * ep_size,

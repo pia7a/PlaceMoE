@@ -686,9 +686,11 @@ class HierMoEConfig:
             self.communication_mode = "hierarchical"
             self.expert_swap = True
             self.expert_swap_max_pairs_per_layer = 0
-            self.expert_swap_selector = "hiermoe_greedy_cover_p1"
+            has_redundant_slots = self.redundant_slot_increment_per_device > 0
+            self.expert_swap_selector = "hiermoe_greedy_cover_p1" if has_redundant_slots else "current_joint"
             self.expert_swap_mode = "step"
-            self.fixed_pipeline_overlap = True
+            hierarchy_levels = len(self.hierarchy_group_sizes)
+            self.fixed_pipeline_overlap = has_redundant_slots and hierarchy_levels in {0, 2}
             self.max_slot_op_search_rounds = 0
         if self.communication_mode not in {"auto", "direct", "hierarchical"}:
             raise ValueError("train.hiermoe.communication_mode must be auto, direct, or hierarchical.")
@@ -951,6 +953,7 @@ class TrainingArguments:
             and (
                 self.hiermoe.expert_swap_max_pairs_per_layer > 0
                 or self.hiermoe.redundant_slot_increment_per_device > 0
+                or self.hiermoe.placemoe.enabled
             )
         )
         if placement_enabled and self.accelerator.fsdp_config.offload:
