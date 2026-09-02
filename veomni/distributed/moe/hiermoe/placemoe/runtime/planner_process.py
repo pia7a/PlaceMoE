@@ -125,9 +125,9 @@ def build_planner_command(
         "--output-report",
         spec.output_report,
     ]
-    if spec.kind is UpdateKind.MAPPING_ONLY:
-        if not spec.input_layout:
-            raise ValueError("mapping-only planning requires input_layout.")
+    if spec.kind is UpdateKind.MAPPING_ONLY and not spec.input_layout:
+        raise ValueError("mapping-only planning requires input_layout.")
+    if spec.input_layout:
         command.extend(("--input-layout", spec.input_layout))
     if resources.fast_approx:
         command.append("--fast-approx")

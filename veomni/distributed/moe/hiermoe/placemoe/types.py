@@ -145,6 +145,11 @@ class LayerPlan:
         counts = self.copy_counts
         if bool((counts[: topology.num_experts] < 1).any()):
             raise ValueError("Every logical expert must retain at least one physical copy.")
+        layout_by_rank = self.slot_to_logical.reshape(topology.ep_size, topology.slots_per_rank)
+        for rank_layout in layout_by_rank:
+            active_rank_layout = rank_layout[rank_layout != EMPTY_EXPERT]
+            if np.unique(active_rank_layout).size != active_rank_layout.size:
+                raise ValueError("Layout duplicates a logical expert within one rank.")
         if additional_copies is not None and int(counts.sum()) - topology.num_experts != additional_copies:
             raise ValueError("Layout does not use the requested additional-copy budget.")
         mapping = self.source_logical_to_physical

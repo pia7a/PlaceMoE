@@ -10672,6 +10672,7 @@ class ExpertSwapManager:
         self,
         layers: Sequence[ExpertLayerState],
         path: str,
+        update_mode: str,
     ) -> None:
         plans: dict[str, LayerPlan] = {}
         for layer in layers:
@@ -10690,7 +10691,7 @@ class ExpertSwapManager:
                 num_experts=layers[0].num_experts,
                 slots_per_rank=layers[0].num_local_experts,
             ),
-            source={"algorithm": "placemoe-v1", "update_mode": "mapping"},
+            source={"algorithm": "placemoe-v1", "update_mode": update_mode},
         )
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
@@ -10789,13 +10790,13 @@ class ExpertSwapManager:
         submitted_at = time.perf_counter()
         process: subprocess.Popen[bytes] | None = None
         if self.ep_rank == 0:
+            os.makedirs(job_dir, exist_ok=True)
             builder = self._hot_update_builder_path()
             if not os.path.isfile(builder):
                 raise RuntimeError(f"PlaceMoE planner does not exist: {builder}.")
             primary_slots = layers[0].num_experts // self.ep_size
             redundant_slots = layers[0].num_local_experts - primary_slots
-            if update_mode == "mapping":
-                self._write_hot_update_current_layout(layers, input_layout_path)
+            self._write_hot_update_current_layout(layers, input_layout_path, update_mode)
             resources = self._hot_update_resources
             calibration = PlaceMoECalibration(
                 inter_ms_per_byte=_HOT_UPDATE_INTER_MS_PER_BYTE,

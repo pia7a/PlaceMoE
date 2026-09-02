@@ -98,13 +98,13 @@ class _CapacityPlan:
 
 _FAST_APPROX_LIMITS = {
     "replica_candidate_limit": 1,
-    "partition_restarts": 1,
-    "alternations": 1,
-    "lut_iterations": 1,
-    "partition_iterations": 2,
-    "assignment_iterations": 2,
-    "community_shortlist": 1,
-    "community_sweeps": 1,
+    "partition_restarts": 2,
+    "alternations": 2,
+    "lut_iterations": 2,
+    "partition_iterations": 8,
+    "assignment_iterations": 4,
+    "community_shortlist": 2,
+    "community_sweeps": 2,
 }
 
 
@@ -135,7 +135,10 @@ def _parse_args() -> argparse.Namespace:
         "--input-layout",
         type=Path,
         default=None,
-        help="Current PlaceMoE artifact required by --update-mode mapping.",
+        help=(
+            "Current PlaceMoE artifact. Required by --update-mode mapping; under full search, "
+            "the current L/M pair is retained as an exact incumbent candidate."
+        ),
     )
     parser.add_argument("--optimize-steps", type=_parse_int_list, default=(1,))
     parser.add_argument("--validation-steps", type=_parse_int_list, default=(2,))
@@ -241,8 +244,8 @@ def _parse_args() -> argparse.Namespace:
         "--fast-approx",
         action="store_true",
         help=(
-            "Use a bounded approximate search: one allocation, one normalized proposal, "
-            "one community proposal, one L/M alternation, and no legacy proposals."
+            "Use a quality-preserving bounded search: one replica allocation, two partition "
+            "restarts, two normalized/community proposals, two L/M alternations, and no legacy proposals."
         ),
     )
     parser.add_argument("--partition-restarts", type=int, default=3)
@@ -392,6 +395,31 @@ def _is_e2e_eligible(
     return bool(
         layer_start == 0 and layers == expected_total_layers and validation_total_ms <= comparison_validation_ms
     )
+
+
+def _selected_replica_summary(
+    rows: list[dict[str, object]],
+    *,
+    num_experts: int,
+    capacity: _CapacityPlan,
+) -> dict[str, object]:
+    """Report actual selected replica use without hiding mixed per-layer budgets."""
+
+    active_by_layer = [sum(int(value) for value in row["copy_counts"]) - num_experts for row in rows]
+    empty_by_layer = [capacity.reserved_replicas - active for active in active_by_layer]
+    uniform = len(set(active_by_layer)) == 1
+    return {
+        "replica_slots": capacity.active_replicas,
+        "reserved_replica_slots": capacity.reserved_replicas,
+        "requested_active_replica_slots": capacity.active_replicas,
+        "requested_empty_slots": capacity.empty_slots,
+        "active_replica_slots": active_by_layer[0] if uniform else None,
+        "empty_slots": empty_by_layer[0] if uniform else None,
+        "selected_active_replica_slots_by_layer": active_by_layer,
+        "selected_empty_slots_by_layer": empty_by_layer,
+        "selected_active_replica_slots_min": min(active_by_layer),
+        "selected_active_replica_slots_max": max(active_by_layer),
+    }
 
 
 def _source_statistics(
@@ -1693,10 +1721,24 @@ def _plan_fixed_mapping_layer(
         validation_samples,
         current_plan.source_logical_to_physical,
     )
+    selection_reason = "optimize_routes"
+    if validation_cost.total_ms > current_validation_cost.total_ms:
+        best = next(
+            candidate
+            for candidate in result.candidates
+            if np.array_equal(
+                candidate.plan.source_logical_to_physical,
+                current_plan.source_logical_to_physical,
+            )
+        )
+        optimize_cost = evaluated[best.plan.source_logical_to_physical.tobytes()]
+        validation_cost = current_validation_cost
+        selection_reason = "incumbent_validation_fallback"
     layer_ms = (time.perf_counter() - layer_started) * 1000.0
     row: dict[str, object] = {
         "layer": layer,
         "strategy": "placemoe_fixed_layout_mapping",
+        "selection_reason": selection_reason,
         "candidate_count": len(result.candidates),
         "candidates": [
             {
@@ -2073,12 +2115,47 @@ def _plan_layer(
                 alternations=0,
             )
         )
+    current_plan: LayerPlan | None = None
+    if args.input_layout is not None:
+        layer_offset = layer - args.layer_start
+        layer_key = args.layer_keys[layer_offset] if args.layer_keys else args.layer_name_template.format(layer=layer)
+        current_plan = args.input_plans[layer_key]
+        current_key = current_plan.source_logical_to_physical.tobytes()
+        current_cost = cost_cache.get(current_key)
+        if current_cost is None:
+            current_cost = evaluator.evaluate(optimize_samples, current_plan.source_logical_to_physical)
+            cost_cache[current_key] = current_cost
+        active_slots = np.flatnonzero(current_plan.slot_to_logical >= 0)
+        candidates.append(
+            _Candidate(
+                strategy="placemoe_current_incumbent",
+                layout=current_plan.slot_to_logical.copy(),
+                owners=current_plan.owner_slots.copy(),
+                lut=current_plan.source_logical_to_physical.copy(),
+                lut_instances=current_plan.source_logical_to_physical.copy(),
+                logical_instances=current_plan.slot_to_logical[active_slots].copy(),
+                instance_ranks=active_slots // topology.slots_per_rank,
+                optimize_cost=current_cost,
+                planner_ms=0.0,
+                alternations=0,
+            )
+        )
     if not candidates:
         raise RuntimeError(f"No feasible recursive classifier candidate for layer {layer}.")
     best = min(candidates, key=lambda item: item.optimize_cost.total_ms)
     validation_cost = evaluator.evaluate(validation_samples, best.lut)
     comparison_validation_cost: HybridCost | None = None
-    if args.comparison_layout == "mirrored-r2":
+    selection_reason = "optimize_routes"
+    if current_plan is not None:
+        comparison_validation_cost = evaluator.evaluate(
+            validation_samples,
+            current_plan.source_logical_to_physical,
+        )
+        if validation_cost.total_ms > comparison_validation_cost.total_ms:
+            best = next(candidate for candidate in candidates if candidate.strategy == "placemoe_current_incumbent")
+            validation_cost = comparison_validation_cost
+            selection_reason = "incumbent_validation_fallback"
+    elif args.comparison_layout == "mirrored-r2":
         if args.ep_size % 2 or args.ep_size * args.slots_per_rank != 2 * args.num_experts:
             raise ValueError("mirrored-r2 comparison requires an even EP size and exactly two full expert copies.")
         r2_plan = mirrored_r2_plan(topology)
@@ -2089,6 +2166,7 @@ def _plan_layer(
     row: dict[str, object] = {
         "layer": layer,
         "strategy": best.strategy,
+        "selection_reason": selection_reason,
         "candidate_count": len(candidates),
         "candidates": [
             {
@@ -2132,9 +2210,9 @@ def main() -> None:
     if not args.layer_keys and "{layer}" not in args.layer_name_template:
         raise ValueError("--layer-name-template must contain the '{layer}' placeholder.")
     capacity = _validate_configuration(args)
-    if args.update_mode == "mapping":
-        if args.input_layout is None:
-            raise ValueError("--input-layout is required by --update-mode mapping.")
+    if args.update_mode == "mapping" and args.input_layout is None:
+        raise ValueError("--input-layout is required by --update-mode mapping.")
+    if args.input_layout is not None:
         payload = json.loads(args.input_layout.read_text(encoding="utf-8"))
         args.input_plans = validate_placemoe_artifact(payload)
         topology = payload["topology"]
@@ -2157,19 +2235,13 @@ def main() -> None:
         if set(args.input_plans) != expected_keys:
             raise ValueError("Input layout layer keys do not match the requested planner layers.")
         active_copy_counts = {
-            int(plan.copy_counts[: args.num_experts].sum()) - args.num_experts for plan in args.input_plans.values()
+            name: int(plan.copy_counts[: args.num_experts].sum()) - args.num_experts
+            for name, plan in args.input_plans.items()
         }
-        if len(active_copy_counts) != 1:
-            raise ValueError("All input-layout layers must use the same replica budget.")
-        active_replicas = active_copy_counts.pop()
-        capacity = _CapacityPlan(
-            primary_slots_per_rank=capacity.primary_slots_per_rank,
-            reserved_replicas=capacity.reserved_replicas,
-            active_replicas=active_replicas,
-            empty_slots=capacity.reserved_replicas - active_replicas,
-        )
-    elif args.input_layout is not None:
-        raise ValueError("--input-layout is only valid with --update-mode mapping.")
+        if args.update_mode == "full" and any(
+            active_replicas > capacity.active_replicas for active_replicas in active_copy_counts.values()
+        ):
+            raise ValueError("Input layout replica budget exceeds the requested full-search budget.")
     if args.workers <= 0 or args.candidate_workers <= 0 or args.worker_threads <= 0:
         raise ValueError("workers, candidate-workers, and worker-threads must be positive.")
     layer_ids = tuple(range(args.layer_start, args.layer_start + args.layers))
@@ -2188,7 +2260,12 @@ def main() -> None:
     rows = [item[4] for item in results]
 
     validation_total = sum(float(row["validation"]["total_ms"]) for row in rows)
-    if args.update_mode == "mapping":
+    replica_summary = _selected_replica_summary(
+        rows,
+        num_experts=args.num_experts,
+        capacity=capacity,
+    )
+    if args.input_layout is not None:
         comparison_ms = sum(float(row["comparison_validation"]["total_ms"]) for row in rows)
     elif args.comparison_layout == "mirrored-r2":
         comparison_ms = sum(float(row["comparison_validation"]["total_ms"]) for row in rows)
@@ -2206,10 +2283,7 @@ def main() -> None:
         "aggregate": {
             "search_mode": args.search_budget["mode"],
             "search_budget": args.search_budget,
-            "replica_slots": capacity.active_replicas,
-            "reserved_replica_slots": capacity.reserved_replicas,
-            "active_replica_slots": capacity.active_replicas,
-            "empty_slots": capacity.empty_slots,
+            **replica_summary,
             "optimize_total_ms": sum(float(row["optimize"]["total_ms"]) for row in rows),
             "validation_total_ms": validation_total,
             "planner_total_ms": sum(float(row["planner_ms"]) for row in rows),

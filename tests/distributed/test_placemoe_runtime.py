@@ -101,13 +101,13 @@ def test_fast_approx_caps_every_search_dimension():
     assert args.search_budget["mode"] == "fast_approx"
     assert args.search_budget["effective"] == {
         "replica_candidate_limit": 1,
-        "partition_restarts": 1,
-        "alternations": 1,
-        "lut_iterations": 1,
-        "partition_iterations": 2,
-        "assignment_iterations": 2,
-        "community_shortlist": 1,
-        "community_sweeps": 1,
+        "partition_restarts": 2,
+        "alternations": 2,
+        "lut_iterations": 2,
+        "partition_iterations": 8,
+        "assignment_iterations": 4,
+        "community_shortlist": 2,
+        "community_sweeps": 2,
     }
     assert not args.search_budget["calibrated_proposals"]
     assert args.search_budget["normalized_proposals"]
@@ -156,7 +156,7 @@ def test_mapping_search_budget_reports_only_the_lut_search():
 
     assert args.search_budget["update_mode"] == "mapping"
     assert args.search_budget["requested"] == {"lut_iterations": 6}
-    assert args.search_budget["effective"] == {"lut_iterations": 1}
+    assert args.search_budget["effective"] == {"lut_iterations": 2}
     assert not args.search_budget["calibrated_proposals"]
     assert not args.search_budget["normalized_proposals"]
     assert not args.search_budget["community_proposals"]
@@ -188,11 +188,11 @@ def test_rank_only_dispatch_records_one_stage_a2a_events(monkeypatch):
 
 
 def test_hot_update_validates_canonical_artifact(tmp_path):
-    topology = PlaceMoETopology(ep_size=1, ranks_per_node=1, num_experts=2, slots_per_rank=3)
+    topology = PlaceMoETopology(ep_size=1, ranks_per_node=1, num_experts=2, slots_per_rank=2)
     plan = LayerPlan(
-        slot_to_logical=[0, 1, 0],
+        slot_to_logical=[0, 1],
         owner_slots=[0, 1],
-        source_logical_to_physical=[[2, 1]],
+        source_logical_to_physical=[[0, 1]],
     )
     payload = build_placemoe_artifact({"layers.0.experts": plan}, topology)
     layout_path = tmp_path / "layout.json"
@@ -214,11 +214,11 @@ def test_hot_update_rejects_legacy_artifact(tmp_path):
 
 
 def test_hot_update_rejects_non_placemoe_schema_v2_artifact(tmp_path):
-    topology = PlaceMoETopology(ep_size=1, ranks_per_node=1, num_experts=2, slots_per_rank=3)
+    topology = PlaceMoETopology(ep_size=1, ranks_per_node=1, num_experts=2, slots_per_rank=2)
     plan = LayerPlan(
-        slot_to_logical=[0, 1, 0],
+        slot_to_logical=[0, 1],
         owner_slots=[0, 1],
-        source_logical_to_physical=[[2, 1]],
+        source_logical_to_physical=[[0, 1]],
     )
     payload = build_placemoe_artifact({"layers.0.experts": plan}, topology)
     payload["source"]["algorithm"] = "legacy-structured"
@@ -288,6 +288,7 @@ def test_hot_update_passes_calibration_coefficients_to_planner(monkeypatch, tmp_
     manager._hot_update_last_snapshot_ms = 0.0
     manager._capture_hot_update_routes = lambda *_args: 1.0
     manager._hot_update_builder_path = lambda: "/bin/true"
+    manager._write_hot_update_current_layout = lambda _layers, path, _mode: Path(path).write_text("{}")
     manager._hot_update_event = lambda *_args, **_kwargs: None
     monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE_WORK_ROOT", str(tmp_path))
     monkeypatch.setattr(expert_swap_module, "_HOT_UPDATE_INTER_MS_PER_BYTE", 1.25)
@@ -325,6 +326,7 @@ def test_hot_update_passes_calibration_coefficients_to_planner(monkeypatch, tmp_
     for flag, value in expected.items():
         assert command[command.index(flag) + 1] == value
     assert "--fast-approx" in command
+    assert command[command.index("--input-layout") + 1].endswith("current_layout.json")
 
 
 def test_canonical_hot_update_keeps_current_pair_when_planner_fails(monkeypatch) -> None:

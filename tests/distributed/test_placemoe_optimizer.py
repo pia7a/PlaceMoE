@@ -111,9 +111,9 @@ def test_bounded_replica_allocation_uses_exact_budget_and_deterministic_order():
 def test_layer_plan_validates_budget_mapping_and_runtime_round_trip():
     topology = PlaceMoETopology(ep_size=2, ranks_per_node=1, num_experts=4, slots_per_rank=3)
     plan = LayerPlan(
-        slot_to_logical=[0, 1, 0, 2, 3, 3],
-        owner_slots=[0, 1, 3, 4],
-        source_logical_to_physical=[[0, 1, 3, 4], [2, 1, 3, 5]],
+        slot_to_logical=[0, 1, 2, 0, 2, 3],
+        owner_slots=[0, 1, 2, 5],
+        source_logical_to_physical=[[0, 1, 2, 5], [3, 1, 4, 5]],
     )
     plan.validate(topology, additional_copies=2)
     restored = LayerPlan.from_runtime_payload(plan.to_runtime_payload())
@@ -130,6 +130,18 @@ def test_layer_plan_rejects_mapping_to_wrong_expert():
     )
     with pytest.raises(ValueError, match="wrong logical expert"):
         plan.validate(topology, additional_copies=0)
+
+
+def test_layer_plan_rejects_duplicate_expert_within_one_rank():
+    topology = PlaceMoETopology(ep_size=2, ranks_per_node=1, num_experts=4, slots_per_rank=3)
+    plan = LayerPlan(
+        slot_to_logical=[0, 1, 0, 2, 3, -1],
+        owner_slots=[0, 1, 3, 4],
+        source_logical_to_physical=[[0, 1, 3, 4], [2, 1, 3, 4]],
+    )
+
+    with pytest.raises(ValueError, match="within one rank"):
+        plan.validate(topology)
 
 
 def test_partition_respects_capacity_and_refines_the_calibrated_objective():
@@ -716,7 +728,7 @@ def test_materialize_plan_rewrites_mapping_to_relocated_slots():
         affinity=np.zeros((2, 4, 4), dtype=np.float64),
     )
     logical_instances = np.array([0, 1, 2, 3, 0, 3])
-    instance_ranks = np.array([1, 0, 0, 1, 0, 1])
+    instance_ranks = np.array([1, 0, 1, 1, 0, 0])
     instance_mapping = np.array([[4, 1, 2, 5], [0, 1, 2, 3]])
     plan = materialize_plan(
         logical_instances,
@@ -821,9 +833,9 @@ def test_mirrored_r2_seed_is_a_valid_default_order_plan():
 def test_artifact_schema_round_trip_validates_every_layer_plan():
     topology = PlaceMoETopology(ep_size=2, ranks_per_node=1, num_experts=4, slots_per_rank=3)
     plan = LayerPlan(
-        slot_to_logical=[0, 1, 0, 2, 3, 3],
-        owner_slots=[0, 1, 3, 4],
-        source_logical_to_physical=[[0, 1, 3, 4], [2, 1, 3, 5]],
+        slot_to_logical=[0, 1, 2, 0, 2, 3],
+        owner_slots=[0, 1, 2, 5],
+        source_logical_to_physical=[[0, 1, 2, 5], [3, 1, 4, 5]],
     )
     payload = build_placemoe_artifact({"layers.0.experts": plan}, topology, source={"route_root": "/tmp/routes"})
     restored = validate_placemoe_artifact(payload)
