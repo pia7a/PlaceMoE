@@ -45,6 +45,8 @@ class MoERouterMonitorCallback(Callback):
         super().__init__(trainer)
         self.monitor = None
         self.timing_jsonl_path: Path | None = None
+        self.calibration_timing_rows: list[dict[str, Any]] = []
+        self.auto_calibration_finished = False
 
         args: "VeOmniArguments" = self.trainer.args
         timing_dir = os.environ.get("VERL_MOE_TIMING_DIR")
@@ -102,10 +104,15 @@ class MoERouterMonitorCallback(Callback):
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
         interval = max(1, int(args.train.moe_load_balance_monitor_interval))
-        if state.global_step % interval != 0:
+        auto_calibration = bool(
+            args.train.hiermoe.placemoe.calibration.auto_generate and not self.auto_calibration_finished
+        )
+        if state.global_step % interval != 0 and not auto_calibration:
             return
 
         self._write_timing_payload(state)
+        if state.global_step % interval != 0:
+            return
         if self.monitor is None:
             return
 
@@ -136,26 +143,47 @@ class MoERouterMonitorCallback(Callback):
         )
 
     def _write_timing_payload(self, state: TrainerState) -> None:
-        if self.timing_jsonl_path is None:
+        auto_calibration = bool(
+            self.trainer.args.train.hiermoe.placemoe.calibration.auto_generate and not self.auto_calibration_finished
+        )
+        if self.timing_jsonl_path is None and not auto_calibration:
             return
 
         from ...distributed.moe.timing import flush_moe_timing_spans
 
         payload = flush_moe_timing_spans()
-        if not payload:
-            return
-        args: "VeOmniArguments" = self.trainer.args
-        payload.update(
-            {
-                "step": int(state.global_step),
-                "rank": int(args.train.global_rank),
-                "num_records": 0,
-                "note": "Accelerator-event spans cover EP MoE communication and expert compute.",
-            }
-        )
-        self.timing_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.timing_jsonl_path.open("a", encoding="utf-8") as writer:
-            writer.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        if payload:
+            args: "VeOmniArguments" = self.trainer.args
+            payload.update(
+                {
+                    "step": int(state.global_step),
+                    "rank": int(args.train.global_rank),
+                    "num_records": 0,
+                    "note": "Accelerator-event spans cover EP MoE communication and expert compute.",
+                }
+            )
+            calibration = self.trainer.args.train.hiermoe.placemoe.calibration
+            timing_start = int(calibration.warmup_steps) + 1
+            timing_end = timing_start + int(calibration.validation_steps)
+            if auto_calibration and timing_start <= int(state.global_step) <= timing_end:
+                self.calibration_timing_rows.append(
+                    {
+                        "step": payload["step"],
+                        "rank": payload["rank"],
+                        "span_layers": payload.get("span_layers", []),
+                    }
+                )
+            if self.timing_jsonl_path is not None:
+                self.timing_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+                with self.timing_jsonl_path.open("a", encoding="utf-8") as writer:
+                    writer.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        if auto_calibration:
+            from ...distributed.moe.hiermoe.state import maybe_finalize_placemoe_calibration
+
+            self.auto_calibration_finished = maybe_finalize_placemoe_calibration(
+                int(state.global_step),
+                self.calibration_timing_rows,
+            )
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         if self.monitor is not None:

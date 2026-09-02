@@ -96,7 +96,18 @@ class _CapacityPlan:
     empty_slots: int
 
 
-_FAST_APPROX_LIMITS = {
+_FULL_SEARCH_DEFAULTS = {
+    "replica_candidate_limit": 64,
+    "partition_restarts": 3,
+    "alternations": 3,
+    "lut_iterations": 6,
+    "partition_iterations": 24,
+    "assignment_iterations": 12,
+    "community_shortlist": 2,
+    "community_sweeps": 4,
+}
+
+_FAST_APPROX_DEFAULTS = {
     "replica_candidate_limit": 1,
     "partition_restarts": 2,
     "alternations": 2,
@@ -237,26 +248,26 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--replica-candidate-limit",
         type=int,
-        default=64,
+        default=None,
         help="Maximum exact-budget replica allocations evaluated per logical partition.",
     )
     parser.add_argument(
         "--fast-approx",
         action="store_true",
         help=(
-            "Use a quality-preserving bounded search: one replica allocation, two partition "
-            "restarts, two normalized/community proposals, two L/M alternations, and no legacy proposals."
+            "Use compact search defaults and disable calibrated/legacy proposals. Explicit search-budget "
+            "arguments override the fast defaults."
         ),
     )
-    parser.add_argument("--partition-restarts", type=int, default=3)
-    parser.add_argument("--alternations", type=int, default=3)
-    parser.add_argument("--lut-iterations", type=int, default=6)
-    parser.add_argument("--partition-iterations", type=int, default=24)
-    parser.add_argument("--assignment-iterations", type=int, default=12)
+    parser.add_argument("--partition-restarts", type=int, default=None)
+    parser.add_argument("--alternations", type=int, default=None)
+    parser.add_argument("--lut-iterations", type=int, default=None)
+    parser.add_argument("--partition-iterations", type=int, default=None)
+    parser.add_argument("--assignment-iterations", type=int, default=None)
     parser.add_argument("--hyperedge-token-sample", type=int, default=16384)
     parser.add_argument("--structured-shortlist", type=int, default=2)
-    parser.add_argument("--community-shortlist", type=int, default=2)
-    parser.add_argument("--community-sweeps", type=int, default=4)
+    parser.add_argument("--community-shortlist", type=int, default=None)
+    parser.add_argument("--community-sweeps", type=int, default=None)
     parser.add_argument(
         "--include-community-block-candidates",
         action="store_true",
@@ -331,20 +342,19 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _configure_search(args: argparse.Namespace) -> None:
-    """Validate the requested search budget and apply the fast approximation cap."""
+    """Resolve mode-specific defaults while preserving explicit search budgets."""
 
-    search_fields = tuple(_FAST_APPROX_LIMITS)
-    defaults = {"community_shortlist": 2, "community_sweeps": 4}
-    requested = {name: int(getattr(args, name, defaults.get(name))) for name in search_fields}
+    defaults = _FAST_APPROX_DEFAULTS if args.fast_approx else _FULL_SEARCH_DEFAULTS
+    search_fields = tuple(defaults)
+    requested = {
+        name: int(defaults[name] if getattr(args, name, None) is None else getattr(args, name))
+        for name in search_fields
+    }
     for name, value in requested.items():
-        if not hasattr(args, name):
-            setattr(args, name, value)
+        setattr(args, name, value)
     invalid = [name for name, value in requested.items() if value < 0 or (name != "community_sweeps" and value == 0)]
     if invalid:
         raise ValueError(f"Planner search limits must be positive: {', '.join(invalid)}.")
-    if args.fast_approx:
-        for name, limit in _FAST_APPROX_LIMITS.items():
-            setattr(args, name, min(requested[name], limit))
     update_mode = str(getattr(args, "update_mode", "full"))
     mapping_only = update_mode == "mapping"
     reported_fields = ("lut_iterations",) if mapping_only else search_fields

@@ -37,7 +37,7 @@ _PLANNER_COEFFICIENTS = {
     "compute_ms_per_assignment",
     "compute_multiplier",
 }
-_PLANNER_VALIDATION_CHECKS = {"communication", "compute", "joint"}
+_PLANNER_VALIDATION_COMPONENTS = {"communication", "compute", "joint"}
 
 
 @dataclass(frozen=True)
@@ -279,7 +279,7 @@ def inspect_planner_cache(
     *,
     runtime_artifact_sha256: str,
 ) -> CacheInspection:
-    """Check a planner artifact's status, scope, coefficients, and dependency hash."""
+    """Check a planner artifact's structure, scope, coefficients, and dependency hash."""
 
     if not path.exists():
         return CacheInspection("missing", str(path))
@@ -291,8 +291,6 @@ def inspect_planner_cache(
             raise ModelCalibrationError("artifact_type must be 'placemoe_planner_calibration'")
         if int(payload.get("schema_version", 0) or 0) < 1:
             raise ModelCalibrationError("schema_version must be at least 1")
-        if payload.get("status") != "accepted":
-            raise ModelCalibrationError(f"status is {payload.get('status')!r}, expected 'accepted'")
         scope_mismatches = _scope_mismatches(_mapping(payload.get("scope"), "planner scope"), spec)
         if scope_mismatches:
             raise ModelCalibrationError("scope mismatch: " + "; ".join(scope_mismatches))
@@ -307,15 +305,18 @@ def inspect_planner_cache(
         ]
         if invalid_coefficients:
             raise ModelCalibrationError(f"non-positive or non-finite coefficients {invalid_coefficients}")
-        checks = _mapping(
-            _mapping(payload.get("held_out_validation"), "held_out_validation").get("checks"),
-            "held_out_validation.checks",
-        )
-        missing_checks = sorted(_PLANNER_VALIDATION_CHECKS - set(checks))
-        if missing_checks:
-            raise ModelCalibrationError(f"held-out validation is missing checks {missing_checks}")
-        if not all(bool(checks[name]) for name in _PLANNER_VALIDATION_CHECKS):
-            raise ModelCalibrationError("held-out validation checks did not all pass")
+        validation = _mapping(payload.get("held_out_validation"), "held_out_validation")
+        missing_components = sorted(_PLANNER_VALIDATION_COMPONENTS - set(validation))
+        if missing_components:
+            raise ModelCalibrationError(f"held-out validation is missing MAPE components {missing_components}")
+        invalid_mapes = [
+            name
+            for name in sorted(_PLANNER_VALIDATION_COMPONENTS)
+            if not math.isfinite(float(_mapping(validation[name], name).get("mape_percent")))
+            or float(_mapping(validation[name], name).get("mape_percent")) < 0.0
+        ]
+        if invalid_mapes:
+            raise ModelCalibrationError(f"invalid held-out MAPE values {invalid_mapes}")
         provenance = _mapping(payload.get("provenance"), "planner provenance")
         actual_runtime_sha256 = str(provenance.get("runtime_perf_model_sha256") or "")
         if actual_runtime_sha256 != runtime_artifact_sha256:
@@ -334,7 +335,7 @@ def inspect_planner_cache(
     except (OSError, TypeError, ValueError, json.JSONDecodeError, ModelCalibrationError) as error:
         return CacheInspection("invalid", str(error))
     digest = sha256_path(path)
-    return CacheInspection("valid", "scope and dependency match", digest)
+    return CacheInspection("valid", "scope, MAPE diagnostics, and dependencies match", digest)
 
 
 def decide_cache_action(

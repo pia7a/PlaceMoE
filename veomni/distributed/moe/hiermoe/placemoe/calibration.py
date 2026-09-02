@@ -49,22 +49,6 @@ class ModelCalibrationSchedule:
         return self.warmup_steps + 1 + self.validation_steps
 
 
-@dataclass(frozen=True)
-class CalibrationThresholds:
-    compute_mape_percent: float = 5.0
-    communication_mape_percent: float = 10.0
-    joint_mape_percent: float = 10.0
-
-    def __post_init__(self) -> None:
-        for name, value in (
-            ("compute_mape_percent", self.compute_mape_percent),
-            ("communication_mape_percent", self.communication_mape_percent),
-            ("joint_mape_percent", self.joint_mape_percent),
-        ):
-            if not math.isfinite(value) or value <= 0.0:
-                raise ValueError(f"{name} must be finite and positive")
-
-
 def parse_cost_model_reports(text: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Extract the fit report and ordered held-out reports from trainer output."""
 
@@ -111,6 +95,20 @@ def _positive(value: Any, name: str) -> float:
     if not math.isfinite(result) or result <= 0.0:
         raise ModelCalibrationError(f"{name} must be finite and positive, got {value!r}")
     return result
+
+
+def _json_safe(value: Any) -> Any:
+    """Normalize diagnostics to values accepted by strict RFC-compliant JSON encoders."""
+
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, Mapping):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _runtime_profile(
@@ -238,6 +236,313 @@ def _diagnostics(actual: Sequence[float], predicted: Sequence[float]) -> dict[st
     }
 
 
+def _distribution_summary(values: Sequence[float]) -> dict[str, float]:
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 1 or array.size == 0 or not np.isfinite(array).all():
+        raise ModelCalibrationError("diagnostic distributions require finite non-empty samples")
+    return {
+        "min": float(array.min()),
+        "p05": float(np.percentile(array, 5.0)),
+        "median": float(np.median(array)),
+        "p95": float(np.percentile(array, 95.0)),
+        "max": float(array.max()),
+        "mean": float(array.mean()),
+    }
+
+
+def _pearson_correlation(lhs: Sequence[float], rhs: Sequence[float]) -> float | None:
+    x = np.asarray(lhs, dtype=np.float64)
+    y = np.asarray(rhs, dtype=np.float64)
+    if x.ndim != 1 or y.ndim != 1 or x.size == 0 or x.shape != y.shape:
+        raise ModelCalibrationError("correlation diagnostics require non-empty paired samples")
+    if not np.isfinite(x).all() or not np.isfinite(y).all():
+        raise ModelCalibrationError("correlation diagnostics contain non-finite samples")
+    x = x - x.mean()
+    y = y - y.mean()
+    denominator = float(np.sqrt((x @ x) * (y @ y)))
+    if denominator <= 0.0:
+        return None
+    return float((x @ y) / denominator)
+
+
+def _extended_diagnostics(actual: Sequence[float], predicted: Sequence[float]) -> dict[str, Any]:
+    truth = np.asarray(actual, dtype=np.float64)
+    estimate = np.asarray(predicted, dtype=np.float64)
+    result: dict[str, Any] = dict(_diagnostics(truth, estimate))
+    absolute_error = np.abs(estimate - truth)
+    truth_sum = float(np.abs(truth).sum())
+    result.update(
+        {
+            "mae_ms": float(absolute_error.mean()),
+            "median_absolute_error_ms": float(np.median(absolute_error)),
+            "wape_percent": float(absolute_error.sum() / truth_sum) * 100.0 if truth_sum > 0.0 else None,
+            "actual_ms": _distribution_summary(truth),
+            "predicted_ms": _distribution_summary(estimate),
+        }
+    )
+    return result
+
+
+def _variable_cost_diagnostics(
+    raw_actual: Sequence[float],
+    variable_prediction: Sequence[float],
+    *,
+    intercept_ms: float,
+) -> dict[str, Any]:
+    raw = np.asarray(raw_actual, dtype=np.float64)
+    predicted = np.asarray(variable_prediction, dtype=np.float64)
+    variable_truth = np.maximum(0.0, raw - float(intercept_ms))
+    result = _extended_diagnostics(variable_truth, predicted)
+    denominator = np.maximum(np.abs(variable_truth), 1.0e-6)
+    absolute_percentage_error = np.abs(predicted - variable_truth) / denominator * 100.0
+    result.update(
+        {
+            "zero_truth_sample_count": int(np.count_nonzero(variable_truth == 0.0)),
+            "zero_truth_fraction": float(np.mean(variable_truth == 0.0)),
+            "truth_below_0_1_ms_sample_count": int(np.count_nonzero(variable_truth < 0.1)),
+            "truth_below_1_ms_sample_count": int(np.count_nonzero(variable_truth < 1.0)),
+            "absolute_percentage_error_percent": _distribution_summary(absolute_percentage_error),
+        }
+    )
+    return result
+
+
+def _component_diagnostic_context(
+    raw_actual: Sequence[float],
+    variable_prediction: Sequence[float],
+    *,
+    intercept_ms: float,
+    features: Mapping[str, Sequence[float]],
+) -> dict[str, Any]:
+    raw_prediction = [float(value) + float(intercept_ms) for value in variable_prediction]
+    feature_arrays = {str(name): np.asarray(values, dtype=np.float64) for name, values in features.items()}
+    feature_names = list(feature_arrays)
+    feature_matrix = np.column_stack([feature_arrays[name] for name in feature_names])
+    centered = feature_matrix - feature_matrix.mean(axis=0)
+    norms = np.linalg.norm(centered, axis=0)
+    normalized = np.divide(centered, norms, out=np.zeros_like(centered), where=norms > 0.0)
+    matrix_rank = int(np.linalg.matrix_rank(normalized))
+    feature_count = len(feature_names)
+    return {
+        "fit_intercept_ms": float(intercept_ms),
+        "raw_affine": _extended_diagnostics(raw_actual, raw_prediction),
+        "serialized_variable": _variable_cost_diagnostics(
+            raw_actual,
+            variable_prediction,
+            intercept_ms=intercept_ms,
+        ),
+        "feature_target_pearson": {
+            str(name): _pearson_correlation(values, raw_actual) for name, values in features.items()
+        },
+        "feature_ranges": {str(name): _distribution_summary(values) for name, values in features.items()},
+        "feature_distinct_value_counts": {
+            name: int(np.unique(values).size) for name, values in feature_arrays.items()
+        },
+        "feature_pair_pearson": {
+            f"{lhs}__vs__{rhs}": _pearson_correlation(feature_arrays[lhs], feature_arrays[rhs])
+            for lhs, rhs in itertools.combinations(feature_names, 2)
+        },
+        "feature_matrix": {
+            "feature_count": feature_count,
+            "centered_rank": matrix_rank,
+            "full_rank": matrix_rank == feature_count,
+        },
+    }
+
+
+def _feature_distribution_shift(
+    reference: Mapping[str, Sequence[float]], observed: Mapping[str, Sequence[float]]
+) -> dict[str, Any]:
+    if set(reference) != set(observed):
+        raise ModelCalibrationError("feature-shift diagnostics require matching feature names")
+    result: dict[str, Any] = {}
+    for name in reference:
+        fit_values = np.asarray(reference[name], dtype=np.float64)
+        validation_values = np.asarray(observed[name], dtype=np.float64)
+        if fit_values.size == 0 or validation_values.size == 0:
+            raise ModelCalibrationError("feature-shift diagnostics require non-empty samples")
+        fit_min = float(fit_values.min())
+        fit_max = float(fit_values.max())
+        below = int(np.count_nonzero(validation_values < fit_min))
+        above = int(np.count_nonzero(validation_values > fit_max))
+        result[str(name)] = {
+            "fit_min": fit_min,
+            "fit_max": fit_max,
+            "validation_sample_count": int(validation_values.size),
+            "below_fit_range_sample_count": below,
+            "above_fit_range_sample_count": above,
+            "outside_fit_range_sample_count": below + above,
+            "outside_fit_range_fraction": float((below + above) / validation_values.size),
+        }
+    return result
+
+
+def _runtime_message_coverage(
+    runtime_metadata: Mapping[str, Any], validation_reports: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    requested = [float(value) for value in runtime_metadata.get("message_bytes_requested", ())]
+    if not requested:
+        return {
+            "available": False,
+            "reason": "runtime metadata has no message_bytes_requested",
+        }
+    requested_min = min(requested)
+    requested_max = max(requested)
+    result: dict[str, Any] = {
+        "available": True,
+        "comparison_basis": "endpoint payload bytes versus runtime requested message bytes (heuristic)",
+        "requested_bytes": _distribution_summary(requested),
+    }
+    for stage, key in (
+        ("stage1", "stage1_payload_endpoint_bytes"),
+        ("stage2", "stage2_payload_endpoint_bytes"),
+    ):
+        observed = [float(value) for report in validation_reports for value in _offline_samples(report).get(key, ())]
+        if not observed:
+            result[stage] = {"available": False, "reason": f"validation reports have no {key}"}
+            continue
+        below = sum(value < requested_min for value in observed)
+        above = sum(value > requested_max for value in observed)
+        result[stage] = {
+            "available": True,
+            "observed_bytes": _distribution_summary(observed),
+            "below_requested_range_sample_count": int(below),
+            "above_requested_range_sample_count": int(above),
+            "outside_requested_range_sample_count": int(below + above),
+            "outside_requested_range_fraction": float((below + above) / len(observed)),
+        }
+    return result
+
+
+def _sample_alignment_context(validation_reports: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    expert_count_samples = 0
+    expert_count_mismatches = 0
+    expert_count_max_delta = 0.0
+    expert_count_missing_steps: list[int] = []
+    route_samples = 0
+    route_mismatches = 0
+    route_max_delta = 0.0
+    route_missing_steps: list[int] = []
+    destination_rank_samples = 0
+    destination_rank_mismatch_samples = 0
+    destination_rank_mismatches = 0
+    destination_rank_max_delta = 0.0
+    destination_rank_missing_steps: list[int] = []
+    per_step: list[dict[str, Any]] = []
+    for report in validation_reports:
+        step = int(report.get("step", -1))
+        samples = _offline_samples(report)
+        assignments = [float(value) for value in samples.get("paired_assignments", ())]
+        expert_counts = samples.get("paired_expert_token_counts")
+        if isinstance(expert_counts, list) and len(expert_counts) == len(assignments):
+            deltas = [
+                abs(sum(float(value) for value in row) - assignment)
+                for row, assignment in zip(expert_counts, assignments, strict=True)
+            ]
+            expert_count_samples += len(deltas)
+            expert_count_mismatches += sum(delta > 0.5 for delta in deltas)
+            expert_count_max_delta = max(expert_count_max_delta, max(deltas, default=0.0))
+        else:
+            expert_count_missing_steps.append(step)
+
+        raw_alignment = report.get("sample_alignment")
+        step_alignment: dict[str, Any] = {"step": step, "available": False}
+        if isinstance(raw_alignment, Mapping):
+            source = [float(value) for value in raw_alignment.get("source_assignment_totals", ())]
+            destination = [float(value) for value in raw_alignment.get("destination_assignment_totals", ())]
+            if source and len(source) == len(destination):
+                deltas = [abs(lhs - rhs) for lhs, rhs in zip(source, destination, strict=True)]
+                mismatches = sum(delta > 0.5 for delta in deltas)
+                route_samples += len(deltas)
+                route_mismatches += mismatches
+                route_max_delta = max(route_max_delta, max(deltas, default=0.0))
+                step_alignment = {
+                    "step": step,
+                    "available": True,
+                    "ep_size": int(raw_alignment.get("ep_size", 0) or 0),
+                    "layer_count": len(raw_alignment.get("layer_keys", ())),
+                    "row_count_per_rank": int(raw_alignment.get("row_count_per_rank", 0) or 0),
+                    "sample_count": len(deltas),
+                    "mismatch_sample_count": int(mismatches),
+                    "max_abs_delta": float(max(deltas, default=0.0)),
+                }
+            else:
+                route_missing_steps.append(step)
+
+            rank_mismatch_counts = [int(value) for value in raw_alignment.get("destination_rank_mismatch_counts", ())]
+            rank_max_deltas = [float(value) for value in raw_alignment.get("destination_rank_max_abs_deltas", ())]
+            if rank_mismatch_counts and len(rank_mismatch_counts) == len(rank_max_deltas):
+                mismatch_row_indices = [index for index, value in enumerate(rank_mismatch_counts) if value > 0]
+                mismatch_rows = len(mismatch_row_indices)
+                row_layer_indices = list(raw_alignment.get("row_layer_indices", ()))
+                row_call_indices = list(raw_alignment.get("row_call_indices", ()))
+                layer_keys = list(raw_alignment.get("layer_keys", ()))
+                mismatch_examples = []
+                for row_index in mismatch_row_indices[:20]:
+                    layer_index = int(row_layer_indices[row_index]) if row_index < len(row_layer_indices) else None
+                    layer_key = (
+                        str(layer_keys[layer_index])
+                        if layer_index is not None and 0 <= layer_index < len(layer_keys)
+                        else None
+                    )
+                    mismatch_examples.append(
+                        {
+                            "row_index": row_index,
+                            "layer_index": layer_index,
+                            "layer_key": layer_key,
+                            "call_index": int(row_call_indices[row_index])
+                            if row_index < len(row_call_indices)
+                            else None,
+                            "mismatched_rank_count": rank_mismatch_counts[row_index],
+                            "max_abs_delta": rank_max_deltas[row_index],
+                        }
+                    )
+                destination_rank_samples += len(rank_mismatch_counts)
+                destination_rank_mismatch_samples += mismatch_rows
+                destination_rank_mismatches += sum(rank_mismatch_counts)
+                destination_rank_max_delta = max(destination_rank_max_delta, max(rank_max_deltas, default=0.0))
+                step_alignment["destination_rank_alignment"] = {
+                    "available": True,
+                    "sample_count": len(rank_mismatch_counts),
+                    "mismatch_sample_count": int(mismatch_rows),
+                    "mismatched_rank_count": int(sum(rank_mismatch_counts)),
+                    "max_abs_delta": float(max(rank_max_deltas, default=0.0)),
+                    "mismatch_examples": mismatch_examples,
+                    "mismatch_examples_truncated": len(mismatch_row_indices) > len(mismatch_examples),
+                }
+            else:
+                destination_rank_missing_steps.append(step)
+        else:
+            route_missing_steps.append(step)
+            destination_rank_missing_steps.append(step)
+        per_step.append(step_alignment)
+    return {
+        "expert_count_sums": {
+            "available": not expert_count_missing_steps,
+            "sample_count": int(expert_count_samples),
+            "mismatch_sample_count": int(expert_count_mismatches),
+            "max_abs_delta": float(expert_count_max_delta),
+            "missing_steps": expert_count_missing_steps,
+        },
+        "route_assignment_conservation": {
+            "available": not route_missing_steps,
+            "sample_count": int(route_samples),
+            "mismatch_sample_count": int(route_mismatches),
+            "max_abs_delta": float(route_max_delta),
+            "missing_steps": route_missing_steps,
+        },
+        "destination_rank_assignment_alignment": {
+            "available": not destination_rank_missing_steps,
+            "sample_count": int(destination_rank_samples),
+            "mismatch_sample_count": int(destination_rank_mismatch_samples),
+            "mismatched_rank_count": int(destination_rank_mismatches),
+            "max_abs_delta": float(destination_rank_max_delta),
+            "missing_steps": destination_rank_missing_steps,
+        },
+        "per_step": per_step,
+    }
+
+
 def _offline_samples(report: Mapping[str, Any]) -> Mapping[str, Any]:
     return _mapping(report.get("offline_scorer_samples"), "offline_scorer_samples")
 
@@ -271,32 +576,19 @@ def _forward_compute_rows(report: Mapping[str, Any]) -> tuple[list[list[float]],
     return [[float(value)] for value in assignments], [float(value) for value in measured]
 
 
-def load_local_phase_timing_summary(
-    timing_directory: Path,
+def summarize_phase_timing_rows(
+    rows: Sequence[Mapping[str, Any]],
     *,
     expected_ranks: Sequence[int],
     expected_steps: Sequence[int],
+    timing_file_count: int | None = None,
 ) -> dict[str, Any]:
-    """Load and validate one node's forward/backward timing matrix.
-
-    Each node produces one summary. The CLI exchanges these summaries after
-    torchrun exits so rank 0 can recover the critical path across all ranks.
-    """
+    """Validate in-memory forward/backward spans and build a critical-path summary."""
 
     expected_rank_set = {int(value) for value in expected_ranks}
     expected_step_set = {int(value) for value in expected_steps}
     if not expected_rank_set or not expected_step_set:
         raise ModelCalibrationError("phase timing requires non-empty expected ranks and steps")
-    paths = sorted(timing_directory.glob("moe_timing_rank*.jsonl"))
-    if len(paths) != len(expected_rank_set):
-        raise ModelCalibrationError(
-            f"expected {len(expected_rank_set)} local timing files, found {len(paths)} in {timing_directory}"
-        )
-    rows: list[dict[str, Any]] = []
-    for path in paths:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                rows.append(json.loads(line))
     observed_ranks = {int(row["rank"]) for row in rows}
     if observed_ranks != expected_rank_set:
         raise ModelCalibrationError(f"timing ranks are {sorted(observed_ranks)}, expected {sorted(expected_rank_set)}")
@@ -380,9 +672,40 @@ def load_local_phase_timing_summary(
     return {
         "expected_ranks": sorted(expected_rank_set),
         "expected_steps": sorted(expected_step_set),
-        "timing_file_count": len(paths),
+        "timing_file_count": len(expected_rank_set) if timing_file_count is None else int(timing_file_count),
         "critical_rows": critical_rows,
     }
+
+
+def load_local_phase_timing_summary(
+    timing_directory: Path,
+    *,
+    expected_ranks: Sequence[int],
+    expected_steps: Sequence[int],
+) -> dict[str, Any]:
+    """Load and validate one node's forward/backward timing matrix.
+
+    Each node produces one summary. The CLI exchanges these summaries after
+    torchrun exits so rank 0 can recover the critical path across all ranks.
+    """
+
+    paths = sorted(timing_directory.glob("moe_timing_rank*.jsonl"))
+    expected_rank_set = {int(value) for value in expected_ranks}
+    if len(paths) != len(expected_rank_set):
+        raise ModelCalibrationError(
+            f"expected {len(expected_rank_set)} local timing files, found {len(paths)} in {timing_directory}"
+        )
+    rows: list[dict[str, Any]] = []
+    for path in paths:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                rows.append(json.loads(line))
+    return summarize_phase_timing_rows(
+        rows,
+        expected_ranks=expected_ranks,
+        expected_steps=expected_steps,
+        timing_file_count=len(paths),
+    )
 
 
 def merge_phase_timing_summaries(summaries: Sequence[Mapping[str, Any]]) -> tuple[float, float, dict[str, Any]]:
@@ -460,12 +783,10 @@ def build_planner_calibration_artifact(
     phase_timing_summaries: Sequence[Mapping[str, Any]],
     ranks_per_node: int,
     schedule: ModelCalibrationSchedule,
-    thresholds: CalibrationThresholds | None = None,
     model_id: str | None = None,
 ) -> dict[str, Any]:
     """Fit, validate, and serialize a complete PlaceMoE planner artifact."""
 
-    thresholds = thresholds or CalibrationThresholds()
     root = _mapping(training_config, "training config")
     train = _mapping(root.get("train"), "train")
     accelerator = _mapping(train.get("accelerator"), "train.accelerator")
@@ -502,6 +823,36 @@ def build_planner_calibration_artifact(
     )
     compute_features, compute_actual = _forward_compute_rows(calibration)
     (compute_forward,), compute_intercept = _fit_nonnegative(compute_features, compute_actual)
+    fit_communication_feature_values = {
+        "runtime_network_units": [float(row[0]) for row in communication_features],
+        "peak_assignments": [float(row[1]) for row in communication_features],
+    }
+    fit_compute_feature_values = {
+        "paired_assignments": [float(row[0]) for row in compute_features],
+    }
+    fit_diagnostic_context = {
+        "step": int(calibration["step"]),
+        "communication": _component_diagnostic_context(
+            communication_actual,
+            [network_scale * network + route_forward * assignments for network, assignments in communication_features],
+            intercept_ms=communication_intercept,
+            features=fit_communication_feature_values,
+        ),
+        "compute": _component_diagnostic_context(
+            compute_actual,
+            [compute_forward * row[0] for row in compute_features],
+            intercept_ms=compute_intercept,
+            features=fit_compute_feature_values,
+        ),
+        "sample_alignment": _sample_alignment_context([calibration]),
+    }
+    trainer_calibration_report = {
+        "step": int(calibration["step"]),
+        **{
+            name: dict(calibration[name]) if isinstance(calibration.get(name), Mapping) else {"available": False}
+            for name in ("communication", "compute", "joint")
+        },
+    }
     communication_phase, compute_phase, phase_diagnostics = merge_phase_timing_summaries(phase_timing_summaries)
     expected_rank_count = ep_size
     if int(phase_diagnostics["rank_count"]) != expected_rank_count:
@@ -511,10 +862,17 @@ def build_planner_calibration_artifact(
 
     communication_truth: list[float] = []
     communication_prediction: list[float] = []
+    communication_raw_actual: list[float] = []
+    communication_network_feature: list[float] = []
+    communication_assignment_feature: list[float] = []
     compute_truth: list[float] = []
     compute_prediction: list[float] = []
+    compute_raw_actual: list[float] = []
+    compute_assignment_feature: list[float] = []
     joint_truth: list[float] = []
     joint_prediction: list[float] = []
+    per_step_diagnostics: list[dict[str, Any]] = []
+    trainer_validation_reports: list[dict[str, Any]] = []
     for report in validations:
         features, actual = _forward_communication_rows(report, inter_beta, intra_beta)
         predicted_communication = [
@@ -523,12 +881,49 @@ def build_planner_calibration_artifact(
         variable_communication = [max(0.0, value - communication_intercept) for value in actual]
         communication_truth.extend(variable_communication)
         communication_prediction.extend(predicted_communication)
+        communication_raw_actual.extend(actual)
+        communication_network_feature.extend(float(row[0]) for row in features)
+        communication_assignment_feature.extend(float(row[1]) for row in features)
 
         validation_compute_features, validation_compute_actual = _forward_compute_rows(report)
         predicted_compute = [compute_forward * row[0] for row in validation_compute_features]
         variable_compute_samples = [max(0.0, value - compute_intercept) for value in validation_compute_actual]
         compute_truth.extend(variable_compute_samples)
         compute_prediction.extend(predicted_compute)
+        compute_raw_actual.extend(validation_compute_actual)
+        compute_assignment_feature.extend(float(row[0]) for row in validation_compute_features)
+
+        per_step_diagnostics.append(
+            {
+                "step": int(report["step"]),
+                "communication": _component_diagnostic_context(
+                    actual,
+                    predicted_communication,
+                    intercept_ms=communication_intercept,
+                    features={
+                        "runtime_network_units": [float(row[0]) for row in features],
+                        "peak_assignments": [float(row[1]) for row in features],
+                    },
+                ),
+                "compute": _component_diagnostic_context(
+                    validation_compute_actual,
+                    predicted_compute,
+                    intercept_ms=compute_intercept,
+                    features={
+                        "paired_assignments": [float(row[0]) for row in validation_compute_features],
+                    },
+                ),
+            }
+        )
+        trainer_validation_reports.append(
+            {
+                "step": int(report["step"]),
+                **{
+                    name: dict(report[name]) if isinstance(report.get(name), Mapping) else {"available": False}
+                    for name in ("communication", "compute", "joint")
+                },
+            }
+        )
 
         sample_data = _mapping(report.get("sample_data"), "validation sample_data")
         network_joint = _mapping(sample_data.get("network_joint"), "validation sample_data.network_joint")
@@ -553,66 +948,138 @@ def build_planner_calibration_artifact(
         "compute": _diagnostics(compute_truth, compute_prediction),
         "joint": _diagnostics(joint_truth, joint_prediction),
     }
-    checks = {
-        "communication": diagnostics["communication"]["mape_percent"] <= thresholds.communication_mape_percent,
-        "compute": diagnostics["compute"]["mape_percent"] <= thresholds.compute_mape_percent,
-        "joint": diagnostics["joint"]["mape_percent"] <= thresholds.joint_mape_percent,
+    sample_alignment = _sample_alignment_context(validations)
+    runtime_message_coverage = _runtime_message_coverage(runtime_metadata, validations)
+    communication_context = _component_diagnostic_context(
+        communication_raw_actual,
+        communication_prediction,
+        intercept_ms=communication_intercept,
+        features={
+            "runtime_network_units": communication_network_feature,
+            "peak_assignments": communication_assignment_feature,
+        },
+    )
+    compute_context = _component_diagnostic_context(
+        compute_raw_actual,
+        compute_prediction,
+        intercept_ms=compute_intercept,
+        features={"paired_assignments": compute_assignment_feature},
+    )
+    feature_distribution_shift = {
+        "communication": _feature_distribution_shift(
+            fit_communication_feature_values,
+            {
+                "runtime_network_units": communication_network_feature,
+                "peak_assignments": communication_assignment_feature,
+            },
+        ),
+        "compute": _feature_distribution_shift(
+            fit_compute_feature_values,
+            {"paired_assignments": compute_assignment_feature},
+        ),
     }
-    status = "accepted" if all(checks.values()) else "rejected"
-    return {
-        "schema_version": 1,
-        "artifact_type": "placemoe_planner_calibration",
-        "status": status,
-        "scope": {
-            "model_id": _model_identifier(root, model_id),
-            "ep_size": ep_size,
-            "ranks_per_node": int(ranks_per_node),
-            "hierarchy_group_sizes": list(hierarchy),
-        },
-        "coefficients": {
-            "inter_ms_per_byte": max(_COEFFICIENT_FLOOR, network_scale * inter_beta),
-            "intra_ms_per_byte": max(_COEFFICIENT_FLOOR, network_scale * intra_beta),
-            "route_ms_per_assignment": max(_COEFFICIENT_FLOOR, route_forward),
-            "communication_multiplier": communication_phase,
-            "compute_ms_per_assignment": max(_COEFFICIENT_FLOOR, compute_forward),
-            "compute_multiplier": compute_phase,
-        },
-        "fit": {
-            "warmup_steps": schedule.warmup_steps,
-            "calibration_step": schedule.calibration_step,
-            "validation_steps": [int(report["step"]) for report in validations],
-            "total_training_steps": schedule.max_steps,
-            "forward_communication": {
-                "runtime_network_scale": network_scale,
-                "route_ms_per_assignment": route_forward,
-                "intercept_ms_not_used": communication_intercept,
-            },
-            "forward_compute": {
-                "ms_per_assignment": compute_forward,
-                "intercept_ms_not_used": compute_intercept,
-            },
-            "phase_multipliers": {
-                "communication": communication_phase,
-                "compute": compute_phase,
-            },
-            "phase_timing": phase_diagnostics,
-        },
-        "held_out_validation": {
-            "basis": "serialized variable-cost coefficients without constant intercepts",
-            **diagnostics,
-            "thresholds": {
-                "communication_mape_percent": thresholds.communication_mape_percent,
-                "compute_mape_percent": thresholds.compute_mape_percent,
-                "joint_mape_percent": thresholds.joint_mape_percent,
-            },
-            "checks": checks,
-        },
-        "provenance": {
-            "runtime_perf_model_sha256": runtime_perf_model_sha256,
-            "training_log_sha256": training_log_sha256,
-            "runtime_perf_model_metadata": dict(runtime_metadata),
+    outside_runtime_range = sum(
+        int(_mapping(runtime_message_coverage.get(stage), stage).get("outside_requested_range_sample_count", 0))
+        for stage in ("stage1", "stage2")
+        if isinstance(runtime_message_coverage.get(stage), Mapping)
+    )
+    sample_alignment_mismatches = (
+        int(_mapping(sample_alignment["expert_count_sums"], "expert count alignment")["mismatch_sample_count"])
+        + int(
+            _mapping(sample_alignment["route_assignment_conservation"], "route assignment alignment")[
+                "mismatch_sample_count"
+            ]
+        )
+        + int(
+            _mapping(sample_alignment["destination_rank_assignment_alignment"], "destination rank alignment")[
+                "mismatch_sample_count"
+            ]
+        )
+    )
+    outside_fit_range = sum(
+        int(feature["outside_fit_range_sample_count"])
+        for component in feature_distribution_shift.values()
+        for feature in component.values()
+    )
+    diagnostic_context = {
+        "gate_effect": "none",
+        "fit_step": fit_diagnostic_context,
+        "communication": communication_context,
+        "compute": compute_context,
+        "per_step": per_step_diagnostics,
+        "trainer_calibration_report": trainer_calibration_report,
+        "trainer_validation_reports": trainer_validation_reports,
+        "feature_distribution_shift": feature_distribution_shift,
+        "runtime_message_coverage": runtime_message_coverage,
+        "sample_alignment": sample_alignment,
+        "signals": {
+            "communication_raw_affine_r_squared_negative": communication_context["raw_affine"]["r_squared"] < 0.0,
+            "compute_raw_affine_r_squared_negative": compute_context["raw_affine"]["r_squared"] < 0.0,
+            "communication_zero_truth_sample_count": communication_context["serialized_variable"][
+                "zero_truth_sample_count"
+            ],
+            "compute_zero_truth_sample_count": compute_context["serialized_variable"]["zero_truth_sample_count"],
+            "runtime_payload_outside_requested_range_sample_count": outside_runtime_range,
+            "validation_feature_outside_fit_range_sample_count": outside_fit_range,
+            "sample_alignment_mismatch": sample_alignment_mismatches > 0,
+            "fit_communication_feature_matrix_full_rank": fit_diagnostic_context["communication"]["feature_matrix"][
+                "full_rank"
+            ],
+            "runtime_network_scale_is_zero": network_scale == 0.0,
+            "route_coefficient_is_zero": route_forward == 0.0,
+            "compute_coefficient_is_zero": compute_forward == 0.0,
         },
     }
+    return _json_safe(
+        {
+            "schema_version": 1,
+            "artifact_type": "placemoe_planner_calibration",
+            "scope": {
+                "model_id": _model_identifier(root, model_id),
+                "ep_size": ep_size,
+                "ranks_per_node": int(ranks_per_node),
+                "hierarchy_group_sizes": list(hierarchy),
+            },
+            "coefficients": {
+                "inter_ms_per_byte": max(_COEFFICIENT_FLOOR, network_scale * inter_beta),
+                "intra_ms_per_byte": max(_COEFFICIENT_FLOOR, network_scale * intra_beta),
+                "route_ms_per_assignment": max(_COEFFICIENT_FLOOR, route_forward),
+                "communication_multiplier": communication_phase,
+                "compute_ms_per_assignment": max(_COEFFICIENT_FLOOR, compute_forward),
+                "compute_multiplier": compute_phase,
+            },
+            "fit": {
+                "warmup_steps": schedule.warmup_steps,
+                "calibration_step": schedule.calibration_step,
+                "validation_steps": [int(report["step"]) for report in validations],
+                "total_training_steps": schedule.max_steps,
+                "forward_communication": {
+                    "runtime_network_scale": network_scale,
+                    "route_ms_per_assignment": route_forward,
+                    "intercept_ms_not_used": communication_intercept,
+                },
+                "forward_compute": {
+                    "ms_per_assignment": compute_forward,
+                    "intercept_ms_not_used": compute_intercept,
+                },
+                "phase_multipliers": {
+                    "communication": communication_phase,
+                    "compute": compute_phase,
+                },
+                "phase_timing": phase_diagnostics,
+            },
+            "held_out_validation": {
+                "basis": "serialized variable-cost coefficients without constant intercepts",
+                **diagnostics,
+                "diagnostic_context": diagnostic_context,
+            },
+            "provenance": {
+                "runtime_perf_model_sha256": runtime_perf_model_sha256,
+                "training_log_sha256": training_log_sha256,
+                "runtime_perf_model_metadata": dict(runtime_metadata),
+            },
+        }
+    )
 
 
 def materialize_model_calibration_config(
@@ -717,13 +1184,13 @@ def sha256_path(path: Path) -> str:
 
 
 __all__ = [
-    "CalibrationThresholds",
     "ModelCalibrationError",
     "ModelCalibrationSchedule",
     "build_planner_calibration_artifact",
     "load_local_phase_timing_summary",
     "materialize_model_calibration_config",
     "merge_phase_timing_summaries",
+    "summarize_phase_timing_rows",
     "parse_cost_model_reports",
     "sha256_path",
     "validate_runtime_performance_model",

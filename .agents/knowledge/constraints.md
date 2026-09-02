@@ -77,6 +77,7 @@ Core entry points:
    - Expert computation: `EPGroupGemm` runs fused expert MLP on grouped tokens per rank.
    - Device mesh: `init_parallel_state()` builds `[ep × ep_fsdp]` submesh; accessed via `ParallelState.extra_parallel_mesh("ep")`, `ep_group`, `ep_rank`.
    - In FSDP2: expert modules get `fully_shard()` on the `ep_fsdp` submesh with `Shard(1)` placement so hidden-dim sharding composes with EP's dim-0 sharding.
+   - Route decoding must use the same slot stride as Forward. With reserved empty slots, compact identity dispatch emits IDs using `base_num_local_experts`; normalize those IDs to the expanded `num_local_experts` encoding before planner feature extraction. Dividing compact IDs directly by the expanded stride silently corrupts per-rank traffic features.
 
 ## Data Pipeline
 

@@ -37,6 +37,14 @@ class CPUAffinityPlan:
     candidate_workers: int
     worker_threads: int
     fast_approx: bool
+    replica_candidate_limit: int | None
+    partition_restarts: int | None
+    alternations: int | None
+    lut_iterations: int | None
+    partition_iterations: int | None
+    assignment_iterations: int | None
+    community_shortlist: int | None
+    community_sweeps: int | None
 
     def planner_resources(self) -> PlaceMoEPlannerResources:
         return PlaceMoEPlannerResources(
@@ -44,6 +52,14 @@ class CPUAffinityPlan:
             candidate_workers=self.candidate_workers,
             worker_threads=self.worker_threads,
             fast_approx=self.fast_approx,
+            replica_candidate_limit=self.replica_candidate_limit,
+            partition_restarts=self.partition_restarts,
+            alternations=self.alternations,
+            lut_iterations=self.lut_iterations,
+            partition_iterations=self.partition_iterations,
+            assignment_iterations=self.assignment_iterations,
+            community_shortlist=self.community_shortlist,
+            community_sweeps=self.community_sweeps,
             planner_cpu_ids=format_cpu_ids(self.planner_cpu_ids),
             training_cpu_ids=format_cpu_ids(self.training_cpu_ids),
         )
@@ -201,6 +217,14 @@ def _build_plan(
         candidate_workers=candidate_workers,
         worker_threads=worker_threads,
         fast_approx=resources.fast_approx,
+        replica_candidate_limit=resources.replica_candidate_limit,
+        partition_restarts=resources.partition_restarts,
+        alternations=resources.alternations,
+        lut_iterations=resources.lut_iterations,
+        partition_iterations=resources.partition_iterations,
+        assignment_iterations=resources.assignment_iterations,
+        community_shortlist=resources.community_shortlist,
+        community_sweeps=resources.community_sweeps,
     )
 
 

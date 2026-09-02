@@ -38,7 +38,6 @@ from veomni.distributed.moe.runtime_bridge import MOE_RUNTIME_BRIDGE_API_VERSION
 from veomni.utils.device import get_device_type, get_torch_device
 
 from .calibration import (
-    CalibrationThresholds,
     ModelCalibrationError,
     ModelCalibrationSchedule,
     build_planner_calibration_artifact,
@@ -312,6 +311,54 @@ def run_doctor(config_path: Path, *, require_npu: bool) -> list[CheckResult]:
                 )
         else:
             results.append(CheckResult("calibration_schema", "FAIL", "artifact is unavailable"))
+    elif is_training_config and runtime.enabled and runtime.calibration.auto_generate:
+        accelerator = _mapping(train.get("accelerator"))
+        ep_size = int(accelerator.get("ep_size", 0) or 0)
+        hierarchy = tuple(int(value) for value in hiermoe.get("hierarchy_group_sizes", ()) or ())
+        issues = []
+        if not bool(hiermoe.get("enable", False)):
+            issues.append("train.hiermoe.enable must be true")
+        if not bool(hiermoe.get("token_dedup", True)):
+            issues.append("train.hiermoe.token_dedup must be true")
+        if not bool(hiermoe.get("expert_swap", True)):
+            issues.append("train.hiermoe.expert_swap must be true")
+        if ep_size <= 1:
+            issues.append("train.accelerator.ep_size must be greater than 1")
+        if not hierarchy:
+            issues.append("train.hiermoe.hierarchy_group_sizes must be explicit")
+        world_size_text = os.environ.get("WORLD_SIZE", "").strip()
+        if not world_size_text:
+            nnodes = os.environ.get("NNODES", "").strip()
+            nproc_per_node = os.environ.get("NPROC_PER_NODE", "").strip()
+            if nnodes and nproc_per_node:
+                try:
+                    world_size_text = str(int(nnodes) * int(nproc_per_node))
+                except ValueError:
+                    issues.append("NNODES and NPROC_PER_NODE must be integers")
+        try:
+            world_size = int(world_size_text) if world_size_text else None
+        except ValueError:
+            issues.append("WORLD_SIZE must be an integer")
+            world_size = None
+        if world_size is not None and world_size != ep_size:
+            issues.append(f"exactly one EP group is required (world_size={world_size}, ep_size={ep_size})")
+        status = "FAIL" if issues else ("PASS" if world_size is not None else "WARN")
+        detail = (
+            "; ".join(issues)
+            if issues
+            else (
+                f"in-training report-only calibration -> {runtime.calibration.output}"
+                if world_size is not None
+                else "static prerequisites pass; set WORLD_SIZE or NNODES/NPROC_PER_NODE to verify one EP group"
+            )
+        )
+        results.append(
+            CheckResult(
+                "calibration",
+                status,
+                detail,
+            )
+        )
     elif is_training_config and runtime.enabled:
         missing_coefficients = sorted(coefficient_names - set(raw_calibration))
         results.append(
@@ -818,11 +865,6 @@ def _calibrate_model_command(args: argparse.Namespace) -> int:
             warmup_steps=int(args.warmup_steps),
             validation_steps=int(args.validation_steps),
         )
-        thresholds = CalibrationThresholds(
-            compute_mape_percent=float(args.compute_mape_threshold),
-            communication_mape_percent=float(args.communication_mape_threshold),
-            joint_mape_percent=float(args.joint_mape_threshold),
-        )
         work_root = (
             Path(args.work_directory).expanduser().resolve()
             if args.work_directory
@@ -919,15 +961,13 @@ def _calibrate_model_command(args: argparse.Namespace) -> int:
                 phase_timing_summaries=phase_summaries,
                 ranks_per_node=nproc_per_node,
                 schedule=schedule,
-                thresholds=thresholds,
                 model_id=args.model_id,
             )
             artifact["provenance"]["calibration_input_sha256"] = fingerprint_calibration_inputs(source, entrypoint)
-            artifact_content = json.dumps(artifact, indent=2, sort_keys=True) + "\n"
+            artifact_content = json.dumps(artifact, indent=2, sort_keys=True, allow_nan=False) + "\n"
             _atomic_write(output_path, artifact_content)
-            status = str(artifact["status"])
-            return_code = 0 if status == "accepted" else 2
-            message = f"PlaceMoE planner calibration {status}: {output_path}"
+            return_code = 0
+            message = f"PlaceMoE planner calibration generated: {output_path}"
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError, ModelCalibrationError) as error:
             return_code = 2
             message = str(error)
@@ -1003,9 +1043,6 @@ def _prepare_command(args: argparse.Namespace) -> int:
                     "force": bool(args.force_model),
                     "warmup_steps": args.warmup_steps,
                     "validation_steps": args.validation_steps,
-                    "compute_mape_threshold": args.compute_mape_threshold,
-                    "communication_mape_threshold": args.communication_mape_threshold,
-                    "joint_mape_threshold": args.joint_mape_threshold,
                 },
             }
         except Exception as error:
@@ -1069,9 +1106,6 @@ def _prepare_command(args: argparse.Namespace) -> int:
             model_id=spec.model_id,
             warmup_steps=args.warmup_steps,
             validation_steps=args.validation_steps,
-            compute_mape_threshold=args.compute_mape_threshold,
-            communication_mape_threshold=args.communication_mape_threshold,
-            joint_mape_threshold=args.joint_mape_threshold,
         )
         runtime_sha256 = sha256_path(spec.runtime_artifact)
         model_code, _model_ran = _run_preparation_stage(
@@ -1110,9 +1144,6 @@ def _add_model_fit_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--validation-steps", type=int, default=2, help="held-out validation steps after fitting (default: 2)"
     )
-    parser.add_argument("--compute-mape-threshold", type=float, default=5.0)
-    parser.add_argument("--communication-mape-threshold", type=float, default=10.0)
-    parser.add_argument("--joint-mape-threshold", type=float, default=10.0)
 
 
 def build_parser() -> argparse.ArgumentParser:

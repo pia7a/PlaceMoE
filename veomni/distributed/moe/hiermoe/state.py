@@ -15,6 +15,7 @@
 import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -112,6 +113,26 @@ def _resolve_placemoe_runtime_config(inline_placemoe: Any) -> PlaceMoERuntimeCon
     return PlaceMoERuntimeConfig.from_training_config(inline_placemoe)
 
 
+def _require_readable_runtime_perf_model(path: Any) -> str:
+    """Resolve the topology performance model before an in-training calibration starts."""
+
+    configured = str(path or "").strip()
+    if not configured:
+        raise ValueError("PlaceMoE in-training calibration requires a readable runtime performance model.")
+    candidate = Path(configured).expanduser()
+    try:
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_file():
+            raise OSError("not a regular file")
+        with resolved.open("rb") as handle:
+            handle.read(1)
+    except OSError as error:
+        raise ValueError(
+            f"PlaceMoE in-training calibration requires a readable runtime performance model, got {candidate}."
+        ) from error
+    return str(resolved)
+
+
 def configure_hiermoe(
     config: Any,
     ep_group: dist.ProcessGroup | None,
@@ -137,6 +158,36 @@ def configure_hiermoe(
     )
     inline_placemoe = getattr(config, "placemoe", None)
     placemoe_config = _resolve_placemoe_runtime_config(inline_placemoe)
+    from .all_to_all import configure_hiermoe_internal_timing
+
+    configured_internal_timing = str(os.environ.get("VEOMNI_HIERMOE_INTERNAL_TIMING", "")).lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "y",
+    }
+    if placemoe_config.calibration.auto_generate:
+        if not placemoe_config.enabled or not config.enable or not config.token_dedup or not config.expert_swap:
+            raise ValueError(
+                "PlaceMoE in-training calibration requires the canonical PlaceMoE, HierMoE, token-dedup, "
+                "and expert-swap paths to be enabled."
+            )
+        if ep_size <= 1:
+            raise ValueError("PlaceMoE in-training calibration requires ep_size greater than 1.")
+        if not tuple(config.hierarchy_group_sizes):
+            raise ValueError("PlaceMoE in-training calibration requires explicit hierarchy_group_sizes.")
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else ep_size
+        if world_size != ep_size:
+            raise ValueError(
+                "PlaceMoE in-training calibration currently requires exactly one EP group "
+                f"(world_size={world_size}, ep_size={ep_size})."
+            )
+        os.environ["VEOMNI_PLACEMOE_AUTO_CALIBRATION"] = "1"
+        configure_hiermoe_internal_timing(True)
+    else:
+        os.environ["VEOMNI_PLACEMOE_AUTO_CALIBRATION"] = "0"
+        configure_hiermoe_internal_timing(configured_internal_timing)
     expected_calibration_scope: dict[str, Any] = {
         "ep_size": ep_size,
         "ranks_per_node": hierarchy.local_world_size,
@@ -150,6 +201,16 @@ def configure_hiermoe(
         if placemoe_config.source_path and placemoe_config.runtime_perf_model
         else config.perf_model_path
     )
+    if placemoe_config.calibration.auto_generate:
+        perf_model_path = _require_readable_runtime_perf_model(perf_model_path)
+        output_path = os.path.realpath(placemoe_config.calibration.output)
+        conflicting_inputs = {
+            "runtime_perf_model": perf_model_path,
+            "initial_artifact": placemoe_config.initial_artifact,
+        }
+        for input_name, input_path in conflicting_inputs.items():
+            if input_path and output_path == os.path.realpath(str(input_path)):
+                raise ValueError(f"calibration.output must not overwrite {input_name}: {output_path}.")
     perf_model = HierMoEPerfModel.from_path(perf_model_path)
     active = bool(config.enable and config.token_dedup and ep_size > 1)
     placement_enabled = bool(
@@ -235,6 +296,7 @@ def configure_hiermoe(
             replica_slot_capacity=int(config.redundant_slot_increment_per_device) * ep_size,
             planner_route_sample_size=int(config.planner_route_sample_size),
             greedy_max_copies_per_expert=int(config.greedy_max_copies_per_expert),
+            runtime_perf_model_path=str(perf_model_path or ""),
             debug_validate=bool(config.debug_validate),
         )
 
@@ -546,6 +608,20 @@ def maybe_run_hiermoe_expert_swap(step: int) -> str | None:
         return state.expert_swap_pair
     state.expert_swap_pair = state.expert_swap_manager.maybe_swap(step)
     return state.expert_swap_pair
+
+
+def maybe_finalize_placemoe_calibration(
+    trainer_step: int,
+    local_timing_rows: list[dict[str, Any]],
+) -> bool:
+    state = _STATE
+    if state is None or state.expert_swap_manager is None:
+        return False
+    state.expert_swap_manager.finalize_auto_calibration(
+        trainer_step=int(trainer_step),
+        local_timing_rows=local_timing_rows,
+    )
+    return bool(state.expert_swap_manager._auto_calibration_finalized)
 
 
 def maybe_log_hiermoe_metrics(step: int) -> None:

@@ -26,6 +26,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from importlib.util import find_spec
+from pathlib import Path
 from threading import Event, Lock
 from typing import Any, Iterable, Sequence
 
@@ -2845,6 +2846,7 @@ class ExpertSwapManager:
         planner_route_sample_size: int = 1024,
         fixed_pipeline_overlap: bool = False,
         greedy_max_copies_per_expert: int = 4,
+        runtime_perf_model_path: str = "",
         debug_validate: bool = False,
     ) -> None:
         self.ep_group = ep_group
@@ -2873,6 +2875,8 @@ class ExpertSwapManager:
         self.perf_model = perf_model
         self.expert_swap_mode = str(expert_swap_mode)
         self.expert_swap_selector = str(expert_swap_selector)
+        auto_calibration = _PLACEMOE_RUNTIME_CONFIG.calibration.auto_generate
+        cost_model_verify = bool(_COST_MODEL_VERIFY or auto_calibration)
         if self.expert_swap_selector not in {
             "current_joint",
             "hiermoe_exact_p1",
@@ -2969,7 +2973,7 @@ class ExpertSwapManager:
                 "the hiermoe_greedy_cover_p1 selector, zero swaps, and one initialization "
                 "round for every redundant slot."
             )
-        if _COST_MODEL_VERIFY and (
+        if cost_model_verify and (
             self.expert_swap_mode != "step"
             or self.expert_swap_max_pairs_per_layer != 0
             or _ONLINE_FREEZE_COST_MODE != "off"
@@ -2988,7 +2992,7 @@ class ExpertSwapManager:
             or _CPU_PLANNER_MODE != "off"
             or _NPU_LAYER_OWNER_BLOCKING
             or _ONLINE_FREEZE_COST_MODE != "off"
-            or _COST_MODEL_VERIFY
+            or cost_model_verify
         ):
             raise ValueError(
                 "Online LUT correction requires a preloaded static layout, fixed-pipeline "
@@ -3002,7 +3006,7 @@ class ExpertSwapManager:
             or _CPU_PLANNER_MODE != "off"
             or _NPU_LAYER_OWNER_BLOCKING
             or _ONLINE_FREEZE_COST_MODE != "off"
-            or _COST_MODEL_VERIFY
+            or (_COST_MODEL_VERIFY and not auto_calibration)
         ):
             raise ValueError("PlaceMoE hot updates require step mode and all other online planners disabled.")
         if _HOT_UPDATE and not _HOT_UPDATE_WORK_ROOT:
@@ -3049,15 +3053,31 @@ class ExpertSwapManager:
         self._npu_layer_owner_blocking = _NPU_LAYER_OWNER_BLOCKING
         self._npu_layer_owner_collective = _NPU_LAYER_OWNER_COLLECTIVE
         self._online_freeze_cost_mode = _ONLINE_FREEZE_COST_MODE
-        self._online_freeze_calibration_step = _ONLINE_FREEZE_CALIBRATION_STEP
+        self._auto_calibration = bool(auto_calibration)
+        self._auto_calibration_finalized = not self._auto_calibration
+        self._auto_calibration_runtime_perf_model_path = str(runtime_perf_model_path)
+        self._online_freeze_calibration_step = (
+            int(_PLACEMOE_RUNTIME_CONFIG.calibration.warmup_steps)
+            if self._auto_calibration
+            else _ONLINE_FREEZE_CALIBRATION_STEP
+        )
         self._online_freeze_communication_ratio = _ONLINE_FREEZE_COMMUNICATION_RATIO
         self._online_freeze_compute_ratio = _ONLINE_FREEZE_COMPUTE_RATIO
         self._online_freeze_inter_ms_per_byte = _ONLINE_FREEZE_INTER_MS_PER_BYTE
         self._online_freeze_intra_ms_per_byte = _ONLINE_FREEZE_INTRA_MS_PER_BYTE
         self._online_freeze_route_ms_per_assignment = _ONLINE_FREEZE_ROUTE_MS_PER_ASSIGNMENT
         self._online_freeze_traffic_intercept_ms = _ONLINE_FREEZE_TRAFFIC_INTERCEPT_MS
-        self._cost_model_verify = _COST_MODEL_VERIFY
-        self._cost_model_validation_steps = _COST_MODEL_VALIDATION_STEPS
+        self._cost_model_verify = cost_model_verify
+        self._cost_model_validation_steps = (
+            int(_PLACEMOE_RUNTIME_CONFIG.calibration.validation_steps)
+            if self._auto_calibration
+            else _COST_MODEL_VALIDATION_STEPS
+        )
+        self._export_cost_model_samples = bool(_EXPORT_COST_MODEL_SAMPLES or self._auto_calibration)
+        self._cost_model_reports: dict[int, dict[str, Any]] = {}
+        self._auto_calibration_compute_mape = 0.0
+        self._auto_calibration_communication_mape = 0.0
+        self._auto_calibration_joint_mape = 0.0
         self._cost_model_verify_coefficients: tuple[float, float, float, float] | None = None
         self._cost_model_verify_receive_only_coefficients: tuple[float, float] | None = None
         self._cost_model_verify_feature_coefficients: (
@@ -3226,6 +3246,14 @@ class ExpertSwapManager:
         self._cpu_training_affinity: tuple[int, ...] = ()
         self._cpu_planner_affinity: tuple[int, ...] = ()
         self._hot_update_resources = _HOT_UPDATE_RESOURCES
+        self._hot_update_calibration = PlaceMoECalibration(
+            inter_ms_per_byte=_HOT_UPDATE_INTER_MS_PER_BYTE,
+            intra_ms_per_byte=_HOT_UPDATE_INTRA_MS_PER_BYTE,
+            route_ms_per_assignment=_HOT_UPDATE_ROUTE_MS_PER_ASSIGNMENT,
+            communication_multiplier=_HOT_UPDATE_COMMUNICATION_MULTIPLIER,
+            compute_ms_per_assignment=_HOT_UPDATE_COMPUTE_MS_PER_ASSIGNMENT,
+            compute_multiplier=_HOT_UPDATE_COMPUTE_MULTIPLIER,
+        )
         self._hot_update_affinity_automatic = False
         self._hot_update_planner_physical_cores = 0
         self._pipeline_step = -1
@@ -3676,6 +3704,9 @@ class ExpertSwapManager:
             "hiermoe/online_lut_start_step": self._online_lut_start_step,
             "hiermoe/online_lut_min_gain": self._online_lut_min_gain,
             "placemoe/hot_update_enabled": int(self._hot_update),
+            "placemoe/calibration_compute_mape_percent": self._auto_calibration_compute_mape,
+            "placemoe/calibration_communication_mape_percent": self._auto_calibration_communication_mape,
+            "placemoe/calibration_joint_mape_percent": self._auto_calibration_joint_mape,
             "placemoe/cpu_affinity_automatic": int(self._hot_update_affinity_automatic),
             "placemoe/planner_physical_cores": self._hot_update_planner_physical_cores,
             "placemoe/planner_workers": self._hot_update_resources.workers,
@@ -5879,6 +5910,23 @@ class ExpertSwapManager:
     def _uses_compact_identity_dispatch(layer: ExpertLayerState) -> bool:
         return layer.slot_layout_enabled and layer.is_identity and not layer.redundant_copy_groups()
 
+    @classmethod
+    def _routes_for_cost_model_planner(
+        cls,
+        layer: ExpertLayerState,
+        physical_routes: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode compact identity routes with the expanded planner slot stride."""
+
+        if not cls._uses_compact_identity_dispatch(layer):
+            return physical_routes
+        rank_offsets = torch.div(
+            physical_routes,
+            layer.base_num_local_experts,
+            rounding_mode="floor",
+        ) * (layer.num_local_experts - layer.base_num_local_experts)
+        return physical_routes + rank_offsets
+
     @staticmethod
     def _validate_checkpoint_replay(
         layer: ExpertLayerState,
@@ -7669,6 +7717,8 @@ class ExpertSwapManager:
         local_assignment_packed_rows: list[torch.Tensor] = []
         local_timing_rows: list[tuple[float, ...]] = []
         local_expert_token_rows: list[torch.Tensor] = []
+        row_layer_indices: list[int] = []
+        row_call_indices: list[int] = []
         layer_row_ranges: list[tuple[GreedyCommunicationPlanner, int, int]] = []
         row_start = 0
         if int(self.hierarchy.selected_dim) == 3:
@@ -7684,7 +7734,7 @@ class ExpertSwapManager:
             communication_event_names = ("stage1_a2a", "stage2_a2a", "combine_stage2_a2a", "combine_stage1_a2a")
         else:
             communication_event_names = ("stage2_a2a", "combine_stage2_a2a")
-        for layer in ordered_layers:
+        for layer_index, layer in enumerate(ordered_layers):
             timings = [timing for timing in layer.cost_model_timings if int(timing.step) == int(step)]
             if not all(
                 timing.dispatch_start.elapsed_time(timing.dispatch_end) >= 0.0
@@ -7703,7 +7753,7 @@ class ExpertSwapManager:
                 # Cost verification needs the exact hierarchical traffic
                 # feature extractor, independently of the runtime selector.
                 planner = self._cpu_exact_planner_for_layer(layer)
-            routes = [timing.physical_routes for timing in timings]
+            routes = [self._routes_for_cost_model_planner(layer, timing.physical_routes) for timing in timings]
             if all(route.shape == routes[0].shape for route in routes):
                 stacked_routes = torch.stack(routes, dim=0)
                 packed = planner._local_packed_counts(stacked_routes)
@@ -7716,7 +7766,7 @@ class ExpertSwapManager:
                 )
             local_packed_rows.append(packed)
             local_assignment_packed_rows.append(assignment_packed)
-            for timing in timings:
+            for call_index, timing in enumerate(timings):
                 stage_times = [-1.0 for _ in communication_event_names]
                 if timing.communication_events is not None and all(
                     name in timing.communication_events for name in communication_event_names
@@ -7735,6 +7785,8 @@ class ExpertSwapManager:
                     )
                 )
                 local_expert_token_rows.append(timing.local_expert_token_counts.to(dtype=torch.float32))
+                row_layer_indices.append(layer_index)
+                row_call_indices.append(call_index)
             row_end = row_start + len(timings)
             layer_row_ranges.append((planner, row_start, row_end))
             row_start = row_end
@@ -7831,6 +7883,11 @@ class ExpertSwapManager:
             stage_timings.max(dim=0).values if raw_a2a_available else torch.empty((0, 0), device=common_device)
         )
         actual_raw_a2a = actual_stage_a2a.sum(dim=1) if raw_a2a_available else torch.empty((0,), device=common_device)
+        source_destination_assignments = source_assignment_packed[:, :, : self.ep_size].sum(dim=0)
+        destination_assignments = gathered_timings[:, :, 2].transpose(0, 1)
+        destination_assignment_deltas = (source_destination_assignments - destination_assignments).abs()
+        source_assignment_totals = source_destination_assignments.sum(dim=1)
+        destination_assignment_totals = destination_assignments.sum(dim=1)
         return {
             "sample_count": row_start,
             "compute_fit_sample_count": int(self.ep_size * row_start),
@@ -7852,6 +7909,24 @@ class ExpertSwapManager:
             "actual_raw_a2a_ms": actual_raw_a2a.detach().cpu().tolist(),
             "actual_stage_a2a_ms": actual_stage_a2a.detach().cpu().tolist(),
             "actual_stage_a2a_names": list(communication_event_names),
+            "sample_alignment": {
+                "ep_size": int(self.ep_size),
+                "row_count_per_rank": int(row_start),
+                "layer_keys": [layer.key for layer in ordered_layers],
+                "row_layer_indices": row_layer_indices,
+                "row_call_indices": row_call_indices,
+                "source_assignment_totals": source_assignment_totals.detach().cpu().tolist(),
+                "destination_assignment_totals": destination_assignment_totals.detach().cpu().tolist(),
+                "destination_rank_mismatch_counts": (destination_assignment_deltas > 0.5)
+                .sum(dim=1)
+                .detach()
+                .cpu()
+                .tolist(),
+                "destination_rank_max_abs_deltas": destination_assignment_deltas.max(dim=1)
+                .values.detach()
+                .cpu()
+                .tolist(),
+            },
             "paired_expert_token_counts": gathered_expert_tokens.reshape(-1, gathered_expert_tokens.shape[-1])
             .detach()
             .cpu()
@@ -8141,9 +8216,10 @@ class ExpertSwapManager:
                 }
                 for name, values in traffic_features.items()
             },
+            "sample_alignment": observations.get("sample_alignment", {"available": False}),
             "elapsed_ms": (time.perf_counter() - started) * 1000.0,
         }
-        if _EXPORT_COST_MODEL_SAMPLES:
+        if self._export_cost_model_samples:
             paired_assignments = [float(value) for value in observations["paired_assignments"]]
             paired_compute = [float(value) for value in observations["paired_compute_ms"]]
             actual_stage_rows = [
@@ -8268,6 +8344,7 @@ class ExpertSwapManager:
                 }
                 for level_index, level in enumerate(level_names)
             }
+        self._cost_model_reports[int(step)] = report
         self._record_cost_model_report(phase, report)
         for layer in layers:
             layer.cost_model_timings = [timing for timing in layer.cost_model_timings if int(timing.step) != int(step)]
@@ -8275,6 +8352,235 @@ class ExpertSwapManager:
             self._cost_model_verify_complete = True
         self.latest_pair = "none"
         return self.latest_pair
+
+    def finalize_auto_calibration(
+        self,
+        *,
+        trainer_step: int,
+        local_timing_rows: Sequence[dict[str, Any]],
+    ) -> None:
+        """Build and install a report-only planner artifact inside the training job."""
+
+        if not self._auto_calibration or self._auto_calibration_finalized:
+            return
+        schedule_end = int(self._online_freeze_calibration_step) + int(self._cost_model_validation_steps) + 1
+        if int(trainer_step) < schedule_end:
+            return
+
+        gathered_rows: list[Any] = [None for _ in range(self.ep_size)]
+        if self.ep_group is not None and self.ep_size > 1:
+            dist.all_gather_object(gathered_rows, list(local_timing_rows), group=self.ep_group)
+        else:
+            gathered_rows[0] = list(local_timing_rows)
+
+        artifact: dict[str, Any] | None = None
+        runtime_perf_model_sha256 = ""
+        local_error = ""
+        try:
+            import hashlib
+
+            from .placemoe.calibration import (
+                ModelCalibrationSchedule,
+                build_planner_calibration_artifact,
+                sha256_path,
+                summarize_phase_timing_rows,
+            )
+
+            timing_rows = [row for rank_rows in gathered_rows for row in rank_rows]
+            expected_timing_steps = range(
+                int(self._online_freeze_calibration_step) + 1,
+                schedule_end + 1,
+            )
+            phase_summary = summarize_phase_timing_rows(
+                timing_rows,
+                expected_ranks=range(self.ep_size),
+                expected_steps=expected_timing_steps,
+            )
+            report_steps = range(
+                int(self._online_freeze_calibration_step),
+                int(self._online_freeze_calibration_step) + int(self._cost_model_validation_steps) + 1,
+            )
+            missing_reports = [step for step in report_steps if step not in self._cost_model_reports]
+            if missing_reports:
+                raise RuntimeError(f"missing in-training cost-model reports for steps {missing_reports}")
+            training_log_lines = []
+            for index, step in enumerate(report_steps):
+                phase = "calibration" if index == 0 else "validation"
+                training_log_lines.append(
+                    f"HierMoE cost model {phase} report: " + json.dumps(self._cost_model_reports[step], sort_keys=True)
+                )
+            training_log_text = "\n".join(training_log_lines) + "\n"
+
+            runtime_perf_model_path = Path(self._auto_calibration_runtime_perf_model_path).expanduser().resolve()
+            if not runtime_perf_model_path.is_file():
+                raise RuntimeError(
+                    "PlaceMoE in-training calibration requires a readable runtime performance model, "
+                    f"got {runtime_perf_model_path}."
+                )
+            runtime_perf_model = json.loads(runtime_perf_model_path.read_text(encoding="utf-8"))
+            if not isinstance(runtime_perf_model, dict):
+                raise RuntimeError("runtime performance model must contain a JSON object")
+            runtime_perf_model_sha256 = sha256_path(runtime_perf_model_path)
+            calibration_config = _PLACEMOE_RUNTIME_CONFIG.calibration
+            model_id = str(calibration_config.expected_scope.get("model_id") or "runtime-model")
+            training_config = {
+                "model": {"model_path": model_id},
+                "train": {
+                    "accelerator": {"ep_size": self.ep_size},
+                    "hiermoe": {"hierarchy_group_sizes": list(self.hierarchy.group_sizes)},
+                },
+            }
+            schedule = ModelCalibrationSchedule(
+                warmup_steps=int(calibration_config.warmup_steps),
+                validation_steps=int(calibration_config.validation_steps),
+            )
+            artifact = build_planner_calibration_artifact(
+                training_config=training_config,
+                runtime_perf_model=runtime_perf_model,
+                runtime_perf_model_sha256=runtime_perf_model_sha256,
+                training_log_text=training_log_text,
+                training_log_sha256=hashlib.sha256(training_log_text.encode("utf-8")).hexdigest(),
+                phase_timing_summaries=[phase_summary],
+                ranks_per_node=int(self.hierarchy.local_world_size),
+                schedule=schedule,
+                model_id=model_id,
+            )
+            artifact["provenance"]["generation_mode"] = "in_training"
+        except Exception as error:  # keep ranks in lockstep before surfacing a structural failure
+            local_error = str(error)
+
+        build_states: list[Any] = [None for _ in range(self.ep_size)]
+        build_state = {
+            "ep_rank": int(self.ep_rank),
+            "error": local_error,
+            "runtime_perf_model_sha256": runtime_perf_model_sha256,
+            "artifact": artifact if int(self.ep_rank) == 0 else None,
+        }
+        if self.ep_group is not None and self.ep_size > 1:
+            dist.all_gather_object(build_states, build_state, group=self.ep_group)
+        else:
+            build_states[0] = build_state
+
+        build_errors = [
+            f"ep_rank={state['ep_rank']}: {state['error']}"
+            for state in build_states
+            if isinstance(state, dict) and state.get("error")
+        ]
+        if build_errors:
+            raise RuntimeError("PlaceMoE in-training calibration failed: " + "; ".join(build_errors))
+        runtime_hashes = {
+            str(state["runtime_perf_model_sha256"])
+            for state in build_states
+            if isinstance(state, dict) and state.get("runtime_perf_model_sha256")
+        }
+        if len(runtime_hashes) != 1:
+            raise RuntimeError(
+                "PlaceMoE in-training calibration requires the same runtime performance model on every EP rank; "
+                f"observed SHA-256 values {sorted(runtime_hashes)}."
+            )
+        authoritative_artifacts = [
+            state["artifact"]
+            for state in build_states
+            if isinstance(state, dict) and int(state.get("ep_rank", -1)) == 0 and state.get("artifact") is not None
+        ]
+        if len(authoritative_artifacts) != 1:
+            raise RuntimeError("PlaceMoE in-training calibration did not receive one authoritative artifact.")
+        artifact_payload = json.dumps(authoritative_artifacts[0], indent=2, sort_keys=True, allow_nan=False) + "\n"
+        artifact = json.loads(artifact_payload)
+
+        calibration_config = _PLACEMOE_RUNTIME_CONFIG.calibration
+        output = Path(calibration_config.output)
+        local_world_size = int(self.hierarchy.local_world_size)
+        is_node_leader = self.ep_rank % local_world_size == 0
+        temporary = output.with_name(f".{output.name}.rank{self.ep_rank}.tmp")
+        previous_contents: bytes | None = None
+        previous_existed = False
+        local_error = ""
+        if is_node_leader:
+            try:
+                output.parent.mkdir(parents=True, exist_ok=True)
+                previous_existed = output.exists()
+                if previous_existed:
+                    previous_contents = output.read_bytes()
+                temporary.write_text(artifact_payload, encoding="utf-8")
+            except Exception as error:
+                local_error = str(error)
+
+        device = self._pipeline_device(next(iter(self.layers.values())))
+        failure = torch.tensor([bool(local_error)], dtype=torch.int32, device=device)
+        if self.ep_group is not None and self.ep_size > 1:
+            dist.all_reduce(failure, op=dist.ReduceOp.MAX, group=self.ep_group)
+        if int(failure.item()) != 0:
+            if is_node_leader:
+                temporary.unlink(missing_ok=True)
+            if local_error:
+                logger.error("PlaceMoE in-training calibration staging failed: %s", local_error)
+            raise RuntimeError("PlaceMoE in-training calibration staging failed; existing artifacts are unchanged.")
+
+        committed = False
+        local_error = ""
+        if is_node_leader:
+            try:
+                os.replace(temporary, output)
+                committed = True
+            except Exception as error:
+                local_error = str(error)
+
+        failure.fill_(bool(local_error))
+        if self.ep_group is not None and self.ep_size > 1:
+            dist.all_reduce(failure, op=dist.ReduceOp.MAX, group=self.ep_group)
+        if int(failure.item()) != 0:
+            rollback_error = ""
+            if is_node_leader:
+                try:
+                    temporary.unlink(missing_ok=True)
+                    if committed:
+                        if previous_existed:
+                            rollback = output.with_name(f".{output.name}.rank{self.ep_rank}.rollback")
+                            assert previous_contents is not None
+                            rollback.write_bytes(previous_contents)
+                            os.replace(rollback, output)
+                        else:
+                            output.unlink(missing_ok=True)
+                except Exception as error:
+                    rollback_error = str(error)
+            failure.fill_(bool(rollback_error))
+            if self.ep_group is not None and self.ep_size > 1:
+                dist.all_reduce(failure, op=dist.ReduceOp.MAX, group=self.ep_group)
+            if local_error:
+                logger.error("PlaceMoE in-training calibration commit failed: %s", local_error)
+            if rollback_error:
+                logger.error("PlaceMoE in-training calibration rollback failed: %s", rollback_error)
+            suffix = " Some ranks could not restore their previous artifact." if int(failure.item()) != 0 else ""
+            raise RuntimeError("PlaceMoE in-training calibration commit failed; rolled back node outputs." + suffix)
+
+        coefficients = artifact["coefficients"]
+        self._hot_update_calibration = PlaceMoECalibration(
+            inter_ms_per_byte=float(coefficients["inter_ms_per_byte"]),
+            intra_ms_per_byte=float(coefficients["intra_ms_per_byte"]),
+            route_ms_per_assignment=float(coefficients["route_ms_per_assignment"]),
+            communication_multiplier=float(coefficients["communication_multiplier"]),
+            compute_ms_per_assignment=float(coefficients["compute_ms_per_assignment"]),
+            compute_multiplier=float(coefficients["compute_multiplier"]),
+        )
+        self._auto_calibration_finalized = True
+        self._cost_model_verify = False
+        os.environ["VEOMNI_PLACEMOE_AUTO_CALIBRATION"] = "0"
+        from .all_to_all import configure_hiermoe_internal_timing
+
+        configure_hiermoe_internal_timing(_env_flag("VEOMNI_HIERMOE_INTERNAL_TIMING"))
+        validation = artifact["held_out_validation"]
+        self._auto_calibration_compute_mape = float(validation["compute"]["mape_percent"])
+        self._auto_calibration_communication_mape = float(validation["communication"]["mape_percent"])
+        self._auto_calibration_joint_mape = float(validation["joint"]["mape_percent"])
+        logger.info_rank0(
+            "PlaceMoE in-training calibration installed coefficients and wrote %s. "
+            "MAPE compute=%.3f%% communication=%.3f%% joint=%.3f%%.",
+            _PLACEMOE_RUNTIME_CONFIG.calibration.output,
+            validation["compute"]["mape_percent"],
+            validation["communication"]["mape_percent"],
+            validation["joint"]["mape_percent"],
+        )
 
     @torch.no_grad()
     def _prepare_online_freeze_calibrations(
@@ -10798,13 +11104,17 @@ class ExpertSwapManager:
             redundant_slots = layers[0].num_local_experts - primary_slots
             self._write_hot_update_current_layout(layers, input_layout_path, update_mode)
             resources = self._hot_update_resources
-            calibration = PlaceMoECalibration(
-                inter_ms_per_byte=_HOT_UPDATE_INTER_MS_PER_BYTE,
-                intra_ms_per_byte=_HOT_UPDATE_INTRA_MS_PER_BYTE,
-                route_ms_per_assignment=_HOT_UPDATE_ROUTE_MS_PER_ASSIGNMENT,
-                communication_multiplier=_HOT_UPDATE_COMMUNICATION_MULTIPLIER,
-                compute_ms_per_assignment=_HOT_UPDATE_COMPUTE_MS_PER_ASSIGNMENT,
-                compute_multiplier=_HOT_UPDATE_COMPUTE_MULTIPLIER,
+            calibration = getattr(
+                self,
+                "_hot_update_calibration",
+                PlaceMoECalibration(
+                    inter_ms_per_byte=_HOT_UPDATE_INTER_MS_PER_BYTE,
+                    intra_ms_per_byte=_HOT_UPDATE_INTRA_MS_PER_BYTE,
+                    route_ms_per_assignment=_HOT_UPDATE_ROUTE_MS_PER_ASSIGNMENT,
+                    communication_multiplier=_HOT_UPDATE_COMMUNICATION_MULTIPLIER,
+                    compute_ms_per_assignment=_HOT_UPDATE_COMPUTE_MS_PER_ASSIGNMENT,
+                    compute_multiplier=_HOT_UPDATE_COMPUTE_MULTIPLIER,
+                ),
             )
             command = build_planner_command(
                 PlannerCommandSpec(
@@ -11166,6 +11476,11 @@ class ExpertSwapManager:
     @torch.no_grad()
     def maybe_swap(self, step: int) -> str:
         self._begin_metrics_step(step)
+        if self._auto_calibration and not self._auto_calibration_finalized:
+            if self._hot_update:
+                self._hot_update_controller.observe_step(int(step) + 1)
+            layers = [self.layers[layer_key] for layer_key in sorted(self.layers)]
+            return self._run_cost_model_verification(layers, int(step))
         if self._hot_update:
             return self._run_hot_update_step(int(step))
         if self._online_lut_update:

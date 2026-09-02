@@ -645,6 +645,10 @@ class PlaceMoECalibrationArguments:
     compute_ms_per_assignment: Optional[float] = None
     compute_multiplier: Optional[float] = None
     artifact: str = ""
+    auto_generate: bool = False
+    output: str = ""
+    warmup_steps: int = 12
+    validation_steps: int = 2
     require_scope: bool = False
     expected_scope: Dict[str, Any] = field(default_factory=dict)
 
@@ -657,6 +661,14 @@ class PlaceMoEPlannerResourceArguments:
     candidate_workers: int = 4
     worker_threads: int = 1
     fast_approx: bool = False
+    replica_candidate_limit: Optional[int] = None
+    partition_restarts: Optional[int] = None
+    alternations: Optional[int] = None
+    lut_iterations: Optional[int] = None
+    partition_iterations: Optional[int] = None
+    assignment_iterations: Optional[int] = None
+    community_shortlist: Optional[int] = None
+    community_sweeps: Optional[int] = None
     planner_cpu_ids: str = ""
     training_cpu_ids: str = ""
 

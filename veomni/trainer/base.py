@@ -393,11 +393,16 @@ class BaseTrainer(Stateful, ABC):
         ps = get_parallel_state()
         mixed_precision = self.args.train.accelerator.fsdp_config.mixed_precision
         placemoe = self.args.train.hiermoe.placemoe
-        if placemoe.enabled and placemoe.calibration.artifact:
+        if placemoe.enabled and (placemoe.calibration.artifact or placemoe.calibration.auto_generate):
             model_id = os.path.basename(
                 os.path.normpath(str(self.args.model.model_path or self.args.model.config_path))
             )
             placemoe.calibration.expected_scope["model_id"] = model_id
+        if placemoe.enabled and placemoe.calibration.auto_generate and self.args.train.checkpoint.load_path:
+            raise ValueError(
+                "PlaceMoE in-training calibration requires a fresh run. For checkpoint resume, "
+                "set calibration.artifact to the previously generated output and disable auto_generate."
+            )
         configure_moe_runtime_bridge(
             self.args.train.hiermoe,
             ep_group=ps.ep_group if getattr(ps, "ep_enabled", False) else None,
@@ -678,6 +683,15 @@ class BaseTrainer(Stateful, ABC):
 
     def _init_callbacks(self):
         """Initialize callbacks."""
+        calibration = self.args.train.hiermoe.placemoe.calibration
+        if self.args.train.hiermoe.placemoe.enabled and calibration.auto_generate:
+            required_steps = int(calibration.warmup_steps) + 1 + int(calibration.validation_steps)
+            available_steps = int(self.train_steps) * int(self.args.train.num_train_epochs)
+            if available_steps < required_steps:
+                raise ValueError(
+                    "PlaceMoE in-training calibration requires at least "
+                    f"{required_steps} training steps, but this run has {available_steps}."
+                )
         self.environ_meter_callback = EnvironMeterCallback(self)
         self.tqdm_callback = TqdmCallback(self)
         self.wandb_callback = WandbTraceCallback(self)

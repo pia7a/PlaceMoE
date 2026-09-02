@@ -9,13 +9,13 @@ from pathlib import Path
 import pytest
 
 from veomni.distributed.moe.hiermoe.placemoe.calibration import (
-    CalibrationThresholds,
     ModelCalibrationError,
     ModelCalibrationSchedule,
     build_planner_calibration_artifact,
     load_local_phase_timing_summary,
     materialize_model_calibration_config,
     parse_cost_model_reports,
+    summarize_phase_timing_rows,
 )
 
 
@@ -38,8 +38,20 @@ def _report(step: int, *, communication_scale: float = 1.0) -> dict:
             "peak_assignments": peak_assignments,
             "actual_stage1_a2a_ms": [0.6 * value for value in communication],
             "actual_stage2_a2a_ms": [0.4 * value for value in communication],
+            "paired_expert_token_counts": [[2.0, 3.0], [10.0, 7.0], [3.0, 5.0], [20.0, 1.0]],
             "paired_assignments": paired_assignments,
             "paired_compute_ms": paired_compute,
+        },
+        "sample_alignment": {
+            "ep_size": 4,
+            "row_count_per_rank": 4,
+            "layer_keys": ["model.layers.0.mlp"],
+            "row_layer_indices": [0, 0, 0, 0],
+            "row_call_indices": [0, 1, 2, 3],
+            "source_assignment_totals": [20.0, 36.0, 24.0, 52.0],
+            "destination_assignment_totals": [20.0, 36.0, 24.0, 52.0],
+            "destination_rank_mismatch_counts": [0, 0, 0, 0],
+            "destination_rank_max_abs_deltas": [0.0, 0.0, 0.0, 0.0],
         },
         "sample_data": {
             "network_joint": {
@@ -125,6 +137,7 @@ def _runtime_model() -> dict:
             "ep_size": 4,
             "ranks_per_node": 2,
             "hierarchy_group_sizes": [2, 4],
+            "message_bytes_requested": [4, 10, 20, 50],
         },
         "inter": [{"alpha": 0.0, "beta": 2.0}],
         "intra": {"alpha": 0.0, "beta": 1.0},
@@ -144,6 +157,29 @@ def _phase_summaries(tmp_path: Path) -> list[dict]:
             )
         )
     return summaries
+
+
+def test_in_memory_phase_timing_matches_file_summary(tmp_path) -> None:
+    timing_directory = tmp_path / "timing"
+    _write_timing(timing_directory, (0, 1))
+    rows = [
+        json.loads(line)
+        for path in sorted(timing_directory.glob("*.jsonl"))
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    in_memory = summarize_phase_timing_rows(
+        rows,
+        expected_ranks=(0, 1),
+        expected_steps=(3, 4, 5),
+    )
+    from_files = load_local_phase_timing_summary(
+        timing_directory,
+        expected_ranks=(0, 1),
+        expected_steps=(3, 4, 5),
+    )
+
+    assert in_memory == from_files
 
 
 def test_default_model_calibration_schedule_uses_five_steps() -> None:
@@ -220,7 +256,7 @@ def test_materialized_single_node_config_does_not_enable_two_level_pipeline(tmp_
     assert result["train"]["hiermoe"]["fixed_pipeline_overlap"] is False
 
 
-def test_builds_scoped_accepted_artifact_from_fit_and_held_out_steps(tmp_path) -> None:
+def test_builds_scoped_artifact_with_mape_diagnostics(tmp_path) -> None:
     artifact = build_planner_calibration_artifact(
         training_config=_config(),
         runtime_perf_model=_runtime_model(),
@@ -232,7 +268,7 @@ def test_builds_scoped_accepted_artifact_from_fit_and_held_out_steps(tmp_path) -
         schedule=ModelCalibrationSchedule(),
     )
 
-    assert artifact["status"] == "accepted"
+    assert "status" not in artifact
     assert artifact["scope"] == {
         "model_id": "demo-moe",
         "ep_size": 4,
@@ -247,12 +283,23 @@ def test_builds_scoped_accepted_artifact_from_fit_and_held_out_steps(tmp_path) -
     assert coefficients["communication_multiplier"] == 3.0
     assert coefficients["compute_multiplier"] == 2.0
     assert artifact["fit"]["total_training_steps"] == 5
-    assert artifact["held_out_validation"]["checks"] == {
-        "communication": True,
-        "compute": True,
-        "joint": True,
-    }
+    assert "checks" not in artifact["held_out_validation"]
+    assert "thresholds" not in artifact["held_out_validation"]
+    assert artifact["held_out_validation"]["communication"]["mape_percent"] == pytest.approx(0.0)
     assert artifact["held_out_validation"]["basis"].startswith("serialized variable-cost")
+    context = artifact["held_out_validation"]["diagnostic_context"]
+    assert context["gate_effect"] == "none"
+    assert context["fit_step"]["step"] == 2
+    assert context["fit_step"]["communication"]["feature_matrix"]["full_rank"] is True
+    assert context["compute"]["raw_affine"]["mape_percent"] == pytest.approx(0.0)
+    assert context["compute"]["serialized_variable"]["zero_truth_sample_count"] == 0
+    assert context["compute"]["feature_target_pearson"]["paired_assignments"] == pytest.approx(1.0)
+    assert context["sample_alignment"]["expert_count_sums"]["mismatch_sample_count"] == 0
+    assert context["sample_alignment"]["route_assignment_conservation"]["mismatch_sample_count"] == 0
+    assert context["sample_alignment"]["destination_rank_assignment_alignment"]["mismatch_sample_count"] == 0
+    assert context["runtime_message_coverage"]["stage1"]["outside_requested_range_sample_count"] == 0
+    assert context["runtime_message_coverage"]["stage2"]["outside_requested_range_sample_count"] == 0
+    assert context["signals"]["validation_feature_outside_fit_range_sample_count"] == 0
 
 
 def test_builds_single_node_artifact_from_intra_node_calibration(tmp_path) -> None:
@@ -274,12 +321,12 @@ def test_builds_single_node_artifact_from_intra_node_calibration(tmp_path) -> No
         schedule=ModelCalibrationSchedule(),
     )
 
-    assert artifact["status"] == "accepted"
+    assert "status" not in artifact
     assert artifact["scope"]["hierarchy_group_sizes"] == [4]
     assert artifact["coefficients"]["inter_ms_per_byte"] == artifact["coefficients"]["intra_ms_per_byte"]
 
 
-def test_rejects_artifact_when_held_out_error_exceeds_threshold(tmp_path) -> None:
+def test_reports_held_out_error_without_acceptance_gate(tmp_path) -> None:
     artifact = build_planner_calibration_artifact(
         training_config=_config(),
         runtime_perf_model=_runtime_model(),
@@ -289,15 +336,115 @@ def test_rejects_artifact_when_held_out_error_exceeds_threshold(tmp_path) -> Non
         phase_timing_summaries=_phase_summaries(tmp_path),
         ranks_per_node=2,
         schedule=ModelCalibrationSchedule(validation_steps=1),
-        thresholds=CalibrationThresholds(
-            compute_mape_percent=5.0,
-            communication_mape_percent=10.0,
-            joint_mape_percent=10.0,
-        ),
     )
 
-    assert artifact["status"] == "rejected"
-    assert artifact["held_out_validation"]["checks"]["communication"] is False
+    assert "status" not in artifact
+    assert "checks" not in artifact["held_out_validation"]
+    assert artifact["held_out_validation"]["communication"]["mape_percent"] > 10.0
+    context = artifact["held_out_validation"]["diagnostic_context"]
+    assert context["signals"]["communication_raw_affine_r_squared_negative"] is True
+    assert context["trainer_validation_reports"][0]["step"] == 3
+
+
+def test_nonfinite_trainer_diagnostics_are_serialized_as_null(tmp_path) -> None:
+    fit = _report(2)
+    validation = _report(3)
+    fit["communication"] = {"r_squared": float("nan")}
+    validation["joint"] = {"r_squared": float("inf")}
+
+    artifact = build_planner_calibration_artifact(
+        training_config=_config(),
+        runtime_perf_model=_runtime_model(),
+        runtime_perf_model_sha256="runtime-sha",
+        training_log_text=_training_log(fit, validation),
+        training_log_sha256="training-sha",
+        phase_timing_summaries=_phase_summaries(tmp_path),
+        ranks_per_node=2,
+        schedule=ModelCalibrationSchedule(validation_steps=1),
+    )
+
+    context = artifact["held_out_validation"]["diagnostic_context"]
+    assert context["trainer_calibration_report"]["communication"]["r_squared"] is None
+    assert context["trainer_validation_reports"][0]["joint"]["r_squared"] is None
+    json.dumps(artifact, allow_nan=False)
+
+
+def test_reports_alignment_mismatches_as_diagnostics(tmp_path) -> None:
+    validation = _report(3)
+    validation["offline_scorer_samples"]["paired_expert_token_counts"][0][0] += 1.0
+    validation["sample_alignment"]["source_assignment_totals"][0] += 2.0
+    validation["sample_alignment"]["destination_rank_mismatch_counts"][0] = 1
+    validation["sample_alignment"]["destination_rank_max_abs_deltas"][0] = 2.0
+
+    artifact = build_planner_calibration_artifact(
+        training_config=_config(),
+        runtime_perf_model=_runtime_model(),
+        runtime_perf_model_sha256="runtime-sha",
+        training_log_text=_training_log(_report(2), validation),
+        training_log_sha256="training-sha",
+        phase_timing_summaries=_phase_summaries(tmp_path),
+        ranks_per_node=2,
+        schedule=ModelCalibrationSchedule(validation_steps=1),
+    )
+
+    assert "status" not in artifact
+    context = artifact["held_out_validation"]["diagnostic_context"]
+    assert context["gate_effect"] == "none"
+    assert context["sample_alignment"]["expert_count_sums"]["mismatch_sample_count"] == 1
+    assert context["sample_alignment"]["route_assignment_conservation"]["mismatch_sample_count"] == 1
+    assert context["sample_alignment"]["destination_rank_assignment_alignment"]["mismatch_sample_count"] == 1
+    mismatch = context["sample_alignment"]["per_step"][0]["destination_rank_alignment"]["mismatch_examples"][0]
+    assert mismatch["layer_key"] == "model.layers.0.mlp"
+    assert mismatch["call_index"] == 0
+    assert context["signals"]["sample_alignment_mismatch"] is True
+
+
+def test_diagnostics_remain_backward_compatible_with_older_reports(tmp_path) -> None:
+    fit = _report(2)
+    validation = _report(3)
+    for report in (fit, validation):
+        report["offline_scorer_samples"].pop("paired_expert_token_counts")
+        report.pop("sample_alignment")
+
+    artifact = build_planner_calibration_artifact(
+        training_config=_config(),
+        runtime_perf_model=_runtime_model(),
+        runtime_perf_model_sha256="runtime-sha",
+        training_log_text=_training_log(fit, validation),
+        training_log_sha256="training-sha",
+        phase_timing_summaries=_phase_summaries(tmp_path),
+        ranks_per_node=2,
+        schedule=ModelCalibrationSchedule(validation_steps=1),
+    )
+
+    assert "status" not in artifact
+    alignment = artifact["held_out_validation"]["diagnostic_context"]["sample_alignment"]
+    assert alignment["expert_count_sums"]["available"] is False
+    assert alignment["route_assignment_conservation"]["available"] is False
+    assert alignment["destination_rank_assignment_alignment"]["available"] is False
+
+
+def test_diagnostics_identify_intercept_clamping_as_mape_risk(tmp_path) -> None:
+    validation = _report(3)
+    validation["offline_scorer_samples"]["paired_compute_ms"][0] = 0.25
+
+    artifact = build_planner_calibration_artifact(
+        training_config=_config(),
+        runtime_perf_model=_runtime_model(),
+        runtime_perf_model_sha256="runtime-sha",
+        training_log_text=_training_log(_report(2), validation),
+        training_log_sha256="training-sha",
+        phase_timing_summaries=_phase_summaries(tmp_path),
+        ranks_per_node=2,
+        schedule=ModelCalibrationSchedule(validation_steps=1),
+    )
+
+    context = artifact["held_out_validation"]["diagnostic_context"]
+    variable = context["compute"]["serialized_variable"]
+    assert variable["zero_truth_sample_count"] == 1
+    assert variable["zero_truth_fraction"] == pytest.approx(0.25)
+    assert variable["absolute_percentage_error_percent"]["max"] > 1_000_000.0
+    assert context["signals"]["compute_zero_truth_sample_count"] == 1
 
 
 def test_report_parser_deduplicates_identical_distributed_log_lines() -> None:

@@ -97,6 +97,40 @@ def test_split_projection_adapter_expands_and_registers_all_expert_parameters() 
     assert all(manager.param_id_to_key[id(parameter)] == layer.key for parameter in layer.expert_parameters)
 
 
+def test_cost_model_normalizes_compact_identity_routes_for_expanded_slots() -> None:
+    module = _SplitProjectionExperts()
+    expand_redundant_expert_slots(module, ep_size=2, redundant_slot_increment_per_device=1)
+    manager = _manager()
+    manager.register_layer("layers.0.mlp.experts", module)
+    layer = manager.layers["layers.0.mlp.experts"]
+    layer.latest_hidden_size = 3
+    layer.latest_bytes_per_element = 4
+    compact_routes = torch.arange(4, dtype=torch.long).view(1, 4, 1)
+
+    planner_routes = manager._routes_for_cost_model_planner(layer, compact_routes)
+
+    assert planner_routes.flatten().tolist() == [0, 1, 3, 4]
+    planner = manager._cpu_exact_planner_for_layer(layer)
+    assignment_counts = planner._local_packed_assignment_counts(planner_routes)
+    assert assignment_counts[:, : manager.ep_size].tolist() == [[2.0, 2.0]]
+
+
+def test_cost_model_preserves_routes_after_expanded_layout_activation() -> None:
+    module = _SplitProjectionExperts()
+    expand_redundant_expert_slots(module, ep_size=2, redundant_slot_increment_per_device=1)
+    manager = _manager()
+    manager.register_layer("layers.0.mlp.experts", module)
+    layer = manager.layers["layers.0.mlp.experts"]
+    assert layer.slot_to_logical is not None
+    layer.slot_to_logical[2] = 0
+    layer.refresh_identity()
+    expanded_routes = torch.tensor([[[0], [1], [3], [4]]], dtype=torch.long)
+
+    planner_routes = manager._routes_for_cost_model_planner(layer, expanded_routes)
+
+    assert planner_routes is expanded_routes
+
+
 def test_split_projection_adapter_normalizes_fused_kernel_arguments() -> None:
     module = _SplitProjectionExperts()
     captured = {}
@@ -304,3 +338,10 @@ def test_rank_only_cost_model_collects_direct_a2a_observations(monkeypatch) -> N
     assert observations["actual_stage_a2a_ms"][0] == pytest.approx([1.0, 1.0])
     assert observations["traffic_features"]["stage1_payload_endpoint_bytes"] == [0.0]
     assert observations["traffic_features"]["stage2_payload_endpoint_bytes"][0] > 0.0
+    alignment = observations["sample_alignment"]
+    assert alignment["row_layer_indices"] == [0]
+    assert alignment["row_call_indices"] == [0]
+    assert alignment["source_assignment_totals"] == pytest.approx([2.0])
+    assert alignment["destination_assignment_totals"] == pytest.approx([2.0])
+    assert alignment["destination_rank_mismatch_counts"] == [0]
+    assert alignment["destination_rank_max_abs_deltas"] == pytest.approx([0.0])

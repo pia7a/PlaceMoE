@@ -127,6 +127,10 @@ class PlaceMoECalibration:
     compute_ms_per_assignment: float = _DEFAULT_COMPUTE_MS_PER_ASSIGNMENT
     compute_multiplier: float = _DEFAULT_COMPUTE_MULTIPLIER
     artifact: str = ""
+    auto_generate: bool = False
+    output: str = ""
+    warmup_steps: int = 12
+    validation_steps: int = 2
     artifact_type: str = ""
     require_scope: bool = False
     expected_scope: Mapping[str, Any] = field(default_factory=dict)
@@ -136,10 +140,23 @@ class PlaceMoECalibration:
     def from_mapping(cls, payload: Mapping[str, Any], *, base_directory: Path) -> "PlaceMoECalibration":
         data = dict(payload)
         artifact = _resolve_path(data.pop("artifact", ""), base_directory, "calibration.artifact")
+        auto_generate = _strict_bool(data.pop("auto_generate", False), "calibration.auto_generate")
+        output = _resolve_path(data.pop("output", ""), base_directory, "calibration.output")
+        warmup_steps = _positive_int(data.pop("warmup_steps", 12), "calibration.warmup_steps")
+        validation_steps = _positive_int(data.pop("validation_steps", 2), "calibration.validation_steps")
+        # Accepted for compatibility with pre-report-only configs; these no
+        # longer gate artifact generation or coefficient installation.
+        data.pop("compute_mape_threshold", None)
+        data.pop("communication_mape_threshold", None)
+        data.pop("joint_mape_threshold", None)
         require_scope = _strict_bool(data.pop("require_scope", False), "calibration.require_scope")
         expected_scope = dict(_mapping(data.pop("expected_scope", None), "calibration.expected_scope"))
         data = {key: value for key, value in data.items() if value is not None}
-        if require_scope and not artifact:
+        if auto_generate and artifact:
+            raise PlaceMoEConfigurationError("calibration.auto_generate requires calibration.artifact to be empty.")
+        if auto_generate and not output:
+            output = str((base_directory / "placemoe_calibration.json").resolve())
+        if require_scope and not artifact and not auto_generate:
             raise PlaceMoEConfigurationError("calibration.artifact is required when require_scope is true.")
         if require_scope and not expected_scope:
             raise PlaceMoEConfigurationError(
@@ -165,11 +182,6 @@ class PlaceMoECalibration:
                     "expected 'placemoe_planner_calibration'."
                 )
             artifact_type = str(raw_artifact_type or "")
-            if artifact_payload.get("status", "accepted") != "accepted":
-                raise PlaceMoEConfigurationError(
-                    f"calibration artifact {artifact} has status "
-                    f"{artifact_payload.get('status')!r}, expected 'accepted'."
-                )
             raw_artifact_scope = artifact_payload.get("scope")
             if isinstance(raw_artifact_scope, Mapping):
                 artifact_scope = dict(raw_artifact_scope)
@@ -222,6 +234,10 @@ class PlaceMoECalibration:
                 data.get("compute_multiplier", defaults.compute_multiplier), "calibration.compute_multiplier"
             ),
             artifact=artifact,
+            auto_generate=auto_generate,
+            output=output,
+            warmup_steps=warmup_steps,
+            validation_steps=validation_steps,
             artifact_type=artifact_type,
             require_scope=require_scope,
             expected_scope=expected_scope,
@@ -244,6 +260,14 @@ class PlaceMoEPlannerResources:
     candidate_workers: int = 4
     worker_threads: int = 1
     fast_approx: bool = False
+    replica_candidate_limit: int | None = None
+    partition_restarts: int | None = None
+    alternations: int | None = None
+    lut_iterations: int | None = None
+    partition_iterations: int | None = None
+    assignment_iterations: int | None = None
+    community_shortlist: int | None = None
+    community_sweeps: int | None = None
     planner_cpu_ids: str = ""
     training_cpu_ids: str = ""
 
@@ -254,6 +278,14 @@ class PlaceMoEPlannerResources:
             "candidate_workers",
             "worker_threads",
             "fast_approx",
+            "replica_candidate_limit",
+            "partition_restarts",
+            "alternations",
+            "lut_iterations",
+            "partition_iterations",
+            "assignment_iterations",
+            "community_shortlist",
+            "community_sweeps",
             "planner_cpu_ids",
             "training_cpu_ids",
         }
@@ -261,6 +293,16 @@ class PlaceMoEPlannerResources:
         if unknown:
             raise PlaceMoEConfigurationError(f"unknown resource fields: {', '.join(unknown)}.")
         defaults = cls()
+
+        def search_limit(name: str) -> int | None:
+            raw = payload.get(name)
+            if raw is None:
+                return None
+            value = _nonnegative_int(raw, f"resources.{name}")
+            if value == 0 and name != "community_sweeps":
+                raise PlaceMoEConfigurationError(f"resources.{name} must be positive.")
+            return value
+
         result = cls(
             workers=_positive_int(payload.get("workers", defaults.workers), "resources.workers"),
             candidate_workers=_positive_int(
@@ -270,6 +312,14 @@ class PlaceMoEPlannerResources:
                 payload.get("worker_threads", defaults.worker_threads), "resources.worker_threads"
             ),
             fast_approx=_strict_bool(payload.get("fast_approx", defaults.fast_approx), "resources.fast_approx"),
+            replica_candidate_limit=search_limit("replica_candidate_limit"),
+            partition_restarts=search_limit("partition_restarts"),
+            alternations=search_limit("alternations"),
+            lut_iterations=search_limit("lut_iterations"),
+            partition_iterations=search_limit("partition_iterations"),
+            assignment_iterations=search_limit("assignment_iterations"),
+            community_shortlist=search_limit("community_shortlist"),
+            community_sweeps=search_limit("community_sweeps"),
             planner_cpu_ids=str(payload.get("planner_cpu_ids", defaults.planner_cpu_ids)).strip(),
             training_cpu_ids=str(payload.get("training_cpu_ids", defaults.training_cpu_ids)).strip(),
         )
@@ -427,6 +477,17 @@ class PlaceMoERuntimeConfig:
         return cls()
 
     def validate(self) -> None:
+        if self.calibration.auto_generate:
+            output_path = os.path.realpath(self.calibration.output)
+            conflicting_inputs = {
+                "runtime_perf_model": self.runtime_perf_model,
+                "initial_artifact": self.initial_artifact,
+            }
+            for input_name, input_path in conflicting_inputs.items():
+                if input_path and output_path == os.path.realpath(input_path):
+                    raise PlaceMoEConfigurationError(
+                        f"calibration.output must not overwrite {input_name}: {output_path}."
+                    )
         if self.hot_update.enabled:
             if not self.hot_update.work_root:
                 raise PlaceMoEConfigurationError("hot_update.work_root must not be empty.")

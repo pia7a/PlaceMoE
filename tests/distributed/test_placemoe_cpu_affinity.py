@@ -80,6 +80,7 @@ def test_explicit_affinity_is_preserved_and_parallelism_is_bounded() -> None:
         candidate_workers=4,
         worker_threads=1,
         fast_approx=True,
+        partition_iterations=11,
         training_cpu_ids="0-5,8-13",
         planner_cpu_ids="6-7,14-15",
     )
@@ -93,6 +94,7 @@ def test_explicit_affinity_is_preserved_and_parallelism_is_bounded() -> None:
     assert plan.workers == 2
     assert plan.fast_approx
     assert plan.planner_resources().fast_approx
+    assert plan.planner_resources().partition_iterations == 11
     assert plan.planner_resources().planner_cpu_ids == "6-7,14-15"
 
 

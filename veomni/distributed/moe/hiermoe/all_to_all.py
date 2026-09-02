@@ -112,6 +112,15 @@ def _env_flag(name: str) -> bool:
 
 
 _HIERMOE_INTERNAL_TIMING = _env_flag("VEOMNI_HIERMOE_INTERNAL_TIMING")
+
+
+def configure_hiermoe_internal_timing(enabled: bool) -> None:
+    """Enable accelerator events before the first training forward."""
+
+    global _HIERMOE_INTERNAL_TIMING
+    _HIERMOE_INTERNAL_TIMING = bool(enabled)
+
+
 _BACKWARD_PREPARE_WINDOWS = {
     "backward_combine_stage1_a2a": 4,
     "backward_combine_stage2_a2a": 5,

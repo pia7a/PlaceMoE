@@ -25,7 +25,8 @@ _MOE_TIMING_SPANS: list[dict[str, Any]] = []
 
 
 def moe_timing_enabled() -> bool:
-    return bool(os.environ.get("VERL_MOE_TIMING_DIR")) and accelerator_timing_available()
+    requested = bool(os.environ.get("VERL_MOE_TIMING_DIR")) or _env_flag("VEOMNI_PLACEMOE_AUTO_CALIBRATION")
+    return requested and accelerator_timing_available()
 
 
 def _env_flag(name: str, default: bool = False) -> bool:

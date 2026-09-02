@@ -23,7 +23,10 @@ from veomni.distributed.moe.hiermoe.placemoe.runtime import (
     terminate_planner_process,
 )
 from veomni.distributed.moe.hiermoe.placemoe.runtime.config import PlaceMoEConfigurationError
-from veomni.distributed.moe.hiermoe.state import _resolve_placemoe_runtime_config
+from veomni.distributed.moe.hiermoe.state import (
+    _require_readable_runtime_perf_model,
+    _resolve_placemoe_runtime_config,
+)
 from veomni.distributed.parallel_plan import _hiermoe_initial_layout_path
 
 
@@ -54,6 +57,14 @@ placemoe:
     candidate_workers: 2
     worker_threads: 1
     fast_approx: true
+    replica_candidate_limit: 3
+    partition_restarts: 4
+    alternations: 5
+    lut_iterations: 6
+    partition_iterations: 12
+    assignment_iterations: 8
+    community_shortlist: 4
+    community_sweeps: 3
     planner_cpu_ids: 8-15
     training_cpu_ids: 0-7
 """,
@@ -69,6 +80,14 @@ placemoe:
     assert config.hot_update.work_root == str(tmp_path / "work")
     assert config.hot_update.failure_policy == "continue"
     assert config.resources.fast_approx
+    assert config.resources.replica_candidate_limit == 3
+    assert config.resources.partition_restarts == 4
+    assert config.resources.alternations == 5
+    assert config.resources.lut_iterations == 6
+    assert config.resources.partition_iterations == 12
+    assert config.resources.assignment_iterations == 8
+    assert config.resources.community_shortlist == 4
+    assert config.resources.community_sweeps == 3
     assert config.resources.planner_cpu_ids == "8-15"
     assert config.calibration.compute_ms_per_assignment == pytest.approx(4.0e-5)
 
@@ -146,14 +165,13 @@ def test_model_sharding_legacy_artifact_requires_explicit_opt_in(tmp_path, monke
         _hiermoe_initial_layout_path.cache_clear()
 
 
-def test_runtime_config_loads_accepted_calibration_artifact(tmp_path) -> None:
+def test_runtime_config_loads_calibration_artifact_without_status(tmp_path) -> None:
     initial = tmp_path / "initial.json"
     initial.write_text("{}", encoding="utf-8")
     calibration = tmp_path / "calibration.json"
     calibration.write_text(
         json.dumps(
             {
-                "status": "accepted",
                 "coefficients": {
                     "inter_ms_per_byte": 1.0e-8,
                     "intra_ms_per_byte": 2.0e-9,
@@ -182,6 +200,76 @@ def test_runtime_config_loads_accepted_calibration_artifact(tmp_path) -> None:
 
     assert config.calibration.artifact == str(calibration)
     assert config.calibration.compute_ms_per_assignment == pytest.approx(4.0e-5)
+
+
+def test_runtime_config_enables_in_training_report_only_calibration(tmp_path) -> None:
+    config = PlaceMoERuntimeConfig.from_training_config(
+        {
+            "base_directory": str(tmp_path),
+            "calibration": {
+                "artifact": "",
+                "auto_generate": True,
+                "output": "model.json",
+                "warmup_steps": 12,
+                "validation_steps": 2,
+                "compute_mape_threshold": -1,
+                "communication_mape_threshold": 0,
+                "joint_mape_threshold": "ignored",
+            },
+        }
+    )
+
+    assert config.calibration.auto_generate
+    assert config.calibration.output == str(tmp_path / "model.json")
+    assert config.calibration.warmup_steps == 12
+    assert config.calibration.validation_steps == 2
+    assert not hasattr(config.calibration, "compute_mape_threshold")
+
+
+def test_runtime_config_ignores_legacy_calibration_status(tmp_path) -> None:
+    calibration = tmp_path / "calibration.json"
+    calibration.write_text(
+        json.dumps(
+            {
+                "artifact_type": "placemoe_planner_calibration",
+                "status": "rejected",
+                "coefficients": {"compute_ms_per_assignment": 9.0e-5},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = PlaceMoERuntimeConfig.from_training_config(
+        {"base_directory": str(tmp_path), "calibration": {"artifact": "calibration.json"}}
+    )
+
+    assert config.calibration.compute_ms_per_assignment == pytest.approx(9.0e-5)
+    assert not hasattr(config.calibration, "artifact_status")
+
+
+def test_runtime_config_rejects_artifact_with_auto_generation(tmp_path) -> None:
+    artifact = tmp_path / "calibration.json"
+    artifact.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(PlaceMoEConfigurationError, match="requires calibration.artifact to be empty"):
+        PlaceMoERuntimeConfig.from_training_config(
+            {
+                "base_directory": str(tmp_path),
+                "calibration": {"artifact": "calibration.json", "auto_generate": True},
+            }
+        )
+
+
+def test_runtime_config_rejects_auto_output_overwriting_runtime_model(tmp_path) -> None:
+    runtime_model = tmp_path / "runtime.json"
+
+    with pytest.raises(PlaceMoEConfigurationError, match="must not overwrite runtime_perf_model"):
+        PlaceMoERuntimeConfig.from_training_config(
+            {
+                "runtime_perf_model": str(runtime_model),
+                "calibration": {"auto_generate": True, "output": str(runtime_model)},
+            }
+        )
 
 
 def test_runtime_config_rejects_wrong_calibration_artifact_type(tmp_path) -> None:
@@ -259,6 +347,17 @@ def test_training_config_path_accepts_default_inline_fields(tmp_path) -> None:
 
     assert config.enabled
     assert config.source_path == str(config_path)
+
+
+def test_in_training_calibration_requires_runtime_perf_model_before_startup(tmp_path) -> None:
+    runtime_model = tmp_path / "runtime.json"
+    runtime_model.write_text("{}", encoding="utf-8")
+
+    assert _require_readable_runtime_perf_model(runtime_model) == str(runtime_model.resolve())
+    with pytest.raises(ValueError, match="requires a readable runtime performance model"):
+        _require_readable_runtime_perf_model("")
+    with pytest.raises(ValueError, match="requires a readable runtime performance model"):
+        _require_readable_runtime_perf_model(tmp_path / "missing.json")
 
 
 def test_runtime_config_loads_inline_training_config_without_initial_artifact(tmp_path) -> None:

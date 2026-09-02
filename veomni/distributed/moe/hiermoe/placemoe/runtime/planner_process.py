@@ -131,6 +131,19 @@ def build_planner_command(
         command.extend(("--input-layout", spec.input_layout))
     if resources.fast_approx:
         command.append("--fast-approx")
+    for name in (
+        "replica_candidate_limit",
+        "partition_restarts",
+        "alternations",
+        "lut_iterations",
+        "partition_iterations",
+        "assignment_iterations",
+        "community_shortlist",
+        "community_sweeps",
+    ):
+        value = getattr(resources, name)
+        if value is not None:
+            command.extend((f"--{name.replace('_', '-')}", str(value)))
     if resources.planner_cpu_ids:
         command = ["taskset", "-c", resources.planner_cpu_ids, *command]
     return command

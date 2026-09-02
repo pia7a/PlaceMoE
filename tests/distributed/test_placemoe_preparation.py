@@ -99,7 +99,6 @@ def _write_planner(spec, *, runtime_sha256: str | None = None) -> None:
             {
                 "schema_version": 1,
                 "artifact_type": "placemoe_planner_calibration",
-                "status": "accepted",
                 "scope": {
                     "model_id": spec.model_id,
                     "ep_size": spec.ep_size,
@@ -114,7 +113,11 @@ def _write_planner(spec, *, runtime_sha256: str | None = None) -> None:
                     "compute_ms_per_assignment": 4.0e-5,
                     "compute_multiplier": 2.0,
                 },
-                "held_out_validation": {"checks": {"communication": True, "compute": True, "joint": True}},
+                "held_out_validation": {
+                    "communication": {"mape_percent": 1.0},
+                    "compute": {"mape_percent": 2.0},
+                    "joint": {"mape_percent": 3.0},
+                },
                 "provenance": {
                     "runtime_perf_model_sha256": runtime_sha256 or sha256_path(spec.runtime_artifact),
                     "calibration_input_sha256": spec.calibration_input_sha256,
@@ -199,12 +202,12 @@ def test_planner_cache_requires_scope_validation_and_runtime_hash(tmp_path) -> N
     assert "runtime performance model changed" in stale.detail
 
 
-def test_planner_cache_requires_all_held_out_checks(tmp_path) -> None:
+def test_planner_cache_requires_all_held_out_mape_components(tmp_path) -> None:
     spec = _spec(tmp_path)
     _write_runtime(spec)
     _write_planner(spec)
     payload = json.loads(spec.planner_artifact.read_text(encoding="utf-8"))
-    del payload["held_out_validation"]["checks"]["compute"]
+    del payload["held_out_validation"]["compute"]
     spec.planner_artifact.write_text(json.dumps(payload), encoding="utf-8")
 
     result = inspect_planner_cache(
@@ -214,7 +217,24 @@ def test_planner_cache_requires_all_held_out_checks(tmp_path) -> None:
     )
 
     assert result.state == "invalid"
-    assert "missing checks" in result.detail
+    assert "missing MAPE components" in result.detail
+
+
+def test_planner_cache_ignores_legacy_acceptance_status(tmp_path) -> None:
+    spec = _spec(tmp_path)
+    _write_runtime(spec)
+    _write_planner(spec)
+    payload = json.loads(spec.planner_artifact.read_text(encoding="utf-8"))
+    payload["status"] = "rejected"
+    spec.planner_artifact.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = inspect_planner_cache(
+        spec.planner_artifact,
+        spec,
+        runtime_artifact_sha256=sha256_path(spec.runtime_artifact),
+    )
+
+    assert result.state == "valid"
 
 
 def test_planner_cache_requires_matching_execution_inputs(tmp_path) -> None:

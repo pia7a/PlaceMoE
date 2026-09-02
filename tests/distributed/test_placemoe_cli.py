@@ -284,7 +284,6 @@ def test_prepare_reuses_valid_artifacts_without_running_calibrators(tmp_path, mo
             {
                 "schema_version": 1,
                 "artifact_type": "placemoe_planner_calibration",
-                "status": "accepted",
                 "scope": {
                     "model_id": "Qwen",
                     "ep_size": 2,
@@ -299,7 +298,11 @@ def test_prepare_reuses_valid_artifacts_without_running_calibrators(tmp_path, mo
                     "compute_ms_per_assignment": 4.0e-5,
                     "compute_multiplier": 2.0,
                 },
-                "held_out_validation": {"checks": {"communication": True, "compute": True, "joint": True}},
+                "held_out_validation": {
+                    "communication": {"mape_percent": 1.0},
+                    "compute": {"mape_percent": 2.0},
+                    "joint": {"mape_percent": 3.0},
+                },
                 "provenance": {"runtime_perf_model_sha256": sha256_path(runtime)},
             }
         ),
@@ -434,7 +437,6 @@ train:
                 {
                     "schema_version": 1,
                     "artifact_type": "placemoe_planner_calibration",
-                    "status": "accepted",
                     "scope": {
                         "model_id": "Qwen",
                         "ep_size": 2,
@@ -449,7 +451,11 @@ train:
                         "compute_ms_per_assignment": 4.0e-5,
                         "compute_multiplier": 2.0,
                     },
-                    "held_out_validation": {"checks": {"communication": True, "compute": True, "joint": True}},
+                    "held_out_validation": {
+                        "communication": {"mape_percent": 1.0},
+                        "compute": {"mape_percent": 2.0},
+                        "joint": {"mape_percent": 3.0},
+                    },
                     "provenance": {
                         "runtime_perf_model_sha256": sha256_path(runtime_path),
                         "calibration_input_sha256": fingerprint_calibration_inputs(
@@ -588,6 +594,74 @@ train:
     calibration = next(result for result in results if result.name == "calibration")
     assert calibration.status == "FAIL"
     assert "calibration.artifact" in calibration.detail
+
+
+def test_doctor_accepts_in_training_calibration(tmp_path, monkeypatch) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    dataset = tmp_path / "data"
+    dataset.mkdir()
+    perf_model = tmp_path / "perf.json"
+    perf_model.write_text("{}", encoding="utf-8")
+    config = tmp_path / "train.yaml"
+    config.write_text(
+        f"""
+model:
+  model_path: {model}
+data:
+  train_path: {dataset}
+train:
+  accelerator:
+    ep_size: 4
+  hiermoe:
+    enable: true
+    hierarchy_group_sizes: [2, 4]
+    redundant_slot_increment_per_device: 1
+    perf_model_path: {perf_model}
+    placemoe:
+      enabled: true
+      calibration:
+        artifact: ""
+        auto_generate: true
+        output: {tmp_path / "model.json"}
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_version", lambda name: "2.9.0" if name == "torch" else None)
+    monkeypatch.setenv("WORLD_SIZE", "4")
+
+    results = cli.run_doctor(config, require_npu=False)
+
+    calibration = next(result for result in results if result.name == "calibration")
+    assert calibration.status == "PASS"
+    assert "in-training report-only" in calibration.detail
+
+
+def test_doctor_rejects_auto_calibration_with_multiple_ep_groups(tmp_path, monkeypatch) -> None:
+    config = tmp_path / "train.yaml"
+    config.write_text(
+        """
+train:
+  accelerator:
+    ep_size: 4
+  hiermoe:
+    enable: true
+    hierarchy_group_sizes: [2, 4]
+    placemoe:
+      enabled: true
+      calibration:
+        auto_generate: true
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_version", lambda name: "2.9.0" if name == "torch" else None)
+    monkeypatch.setenv("WORLD_SIZE", "8")
+
+    results = cli.run_doctor(config, require_npu=False)
+
+    calibration = next(result for result in results if result.name == "calibration")
+    assert calibration.status == "FAIL"
+    assert "exactly one EP group" in calibration.detail
 
 
 def test_doctor_command_reports_missing_calibration_artifact(tmp_path, monkeypatch, capsys) -> None:

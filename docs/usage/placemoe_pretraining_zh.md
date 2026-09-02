@@ -42,6 +42,7 @@ train:
     ep_size: 16
     dp_shard_size: 16
   hiermoe:
+    enable: true
     # 每个 EP rank 为额外副本预留的物理槽位容量。
     redundant_slot_increment_per_device: 4
     # 节点内通信组，以及完整 EP 通信组。
@@ -77,6 +78,51 @@ swap/cover planners。
 - `calibration.artifact` 包含每个 planner 进程使用的通信与 expert-compute
   系数；
 - 模型和数据集路径继续使用已有 VeOmni schema。
+
+如果不想单独运行模型校准任务，可在恰好只有一个完整 EP group 的训练中启用训练内
+校准：
+
+```yaml
+      calibration:
+        artifact: ""
+        auto_generate: true
+        output: calibration/model_and_topology.json
+        warmup_steps: 12
+        validation_steps: 2
+```
+
+`auto_generate` 必须显式开启，避免历史配置中原本表示“使用默认系数”的空
+`artifact` 突然改变行为。训练会保持当前 layout，在 step 12 拟合、step 13–14
+做 held-out 验证，并在 trainer step 15 原子覆盖 `output`、立即安装新系数。
+校准期间到期的 hot-update 会排队，产物安装后再提交。JSON 始终记录 compute、
+communication 和 joint MAPE，不再包含阈值、acceptance checks 或
+accepted/rejected 状态，由用户自行判断误差是否可接受。采样缺失、runtime 模型
+损坏或拓扑不匹配仍属于无法生成产物的结构性错误。
+每个节点的 local leader 都会原子写入相同的 `output` 路径，因此该路径既可位于
+共享文件系统，也可是在各节点一致挂载的本地路径；不得与 runtime perf model 或
+initial layout 输入路径相同。
+训练总步数必须至少为 `warmup_steps + 1 + validation_steps`；checkpoint resume
+应关闭 `auto_generate`，并把上一次的 `output` 配置为 `artifact`。
+
+hot-update 的 8 个有界搜索维度都可以覆盖；未配置的字段使用下面的新 Fast 默认值：
+
+```yaml
+      resources:
+        fast_approx: true
+        replica_candidate_limit: 1
+        partition_restarts: 2
+        alternations: 2
+        lut_iterations: 2
+        partition_iterations: 8
+        assignment_iterations: 4
+        community_shortlist: 2
+        community_sweeps: 2
+```
+
+这 8 个字段都可省略。显式值会原样使用，即使大于 Fast 默认值也不会再次截断；
+增大它们意味着用更长规划时间换取更宽的 L/M 搜索空间。`fast_approx: false` 时，
+未配置字段分别沿用完整搜索默认值 `64, 3, 3, 6, 24, 12, 2, 4`。仅更新 mapping
+时只有 `lut_iterations` 生效。
 
 单节点配置应使用仅含 rank 层级的 `[8]`，并设置 `ep_size: 8`；多个同构节点使用
 `[ranks_per_node, ep_size]`，例如 `[8, 16]`。系统支持将
@@ -158,6 +204,30 @@ MASTER_ADDR=192.168.0.10 MASTER_PORT=29502 \
 `placemoe prepare`。当前可迁移的准备流程支持经过验证的两级 node-to-rank
 层级，并要求任务恰好包含一个完整 EP group。为 torchrun、timing exchange 和
 准备协调保留 `MASTER_PORT` 及其后续 4 个端口。
+
+模型校准不再应用 MAPE 阈值或 acceptance gate；命令会写入实际误差和完整诊断，
+由用户自行检查：
+
+```bash
+jq '.held_out_validation.diagnostic_context | {
+  signals,
+  fit_step,
+  communication,
+  compute,
+  feature_distribution_shift,
+  runtime_message_coverage,
+  sample_alignment
+}' calibration/model_and_topology.json
+```
+
+`sample_alignment.destination_rank_assignment_alignment` 检查同一 layer/call 的
+源路由计数与各目标 EP rank 实收计数；任何 mismatch 都优先指向采样错位或插桩
+不一致。若它通过，则比较 `raw_affine` 与 `serialized_variable`：只有后者 MAPE
+异常且 `zero_truth_sample_count` 很大时，误差主要来自扣除截距后接近零的分母。
+`feature_distribution_shift`、`feature_matrix.full_rank` 和
+`runtime_message_coverage` 分别用于发现拟合/验证分布漂移、退化特征和 runtime
+消息尺寸覆盖不足。这些诊断字段不参与系数拟合或系数安装，由用户决定是否继续使用
+或重新校准。
 
 ## 4. 启动前验证
 
