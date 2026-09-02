@@ -85,6 +85,84 @@ def test_planner_uses_only_intra_node_cost_for_single_node_hierarchy():
     assert gamma == 20.0
 
 
+def test_fast_approx_caps_every_search_dimension():
+    args = SimpleNamespace(
+        fast_approx=True,
+        replica_candidate_limit=64,
+        partition_restarts=3,
+        alternations=3,
+        lut_iterations=6,
+        partition_iterations=24,
+        assignment_iterations=12,
+    )
+
+    placemoe_planner._configure_search(args)
+
+    assert args.search_budget["mode"] == "fast_approx"
+    assert args.search_budget["effective"] == {
+        "replica_candidate_limit": 1,
+        "partition_restarts": 1,
+        "alternations": 1,
+        "lut_iterations": 1,
+        "partition_iterations": 2,
+        "assignment_iterations": 2,
+        "community_shortlist": 1,
+        "community_sweeps": 1,
+    }
+    assert not args.search_budget["calibrated_proposals"]
+    assert args.search_budget["normalized_proposals"]
+    assert args.search_budget["community_proposals"]
+    assert not args.search_budget["legacy_structured_proposals"]
+    assert not args.search_budget["legacy_hyperedge_proposals"]
+    assert not args.search_budget["legacy_proposals"]
+
+
+def test_full_search_preserves_requested_budget():
+    args = SimpleNamespace(
+        fast_approx=False,
+        replica_candidate_limit=7,
+        partition_restarts=2,
+        alternations=4,
+        lut_iterations=5,
+        partition_iterations=9,
+        assignment_iterations=8,
+    )
+
+    placemoe_planner._configure_search(args)
+
+    assert args.search_budget["mode"] == "full"
+    assert args.search_budget["effective"] == args.search_budget["requested"]
+    assert args.search_budget["calibrated_proposals"]
+    assert args.search_budget["normalized_proposals"]
+    assert args.search_budget["community_proposals"]
+    assert not args.search_budget["legacy_structured_proposals"]
+    assert not args.search_budget["legacy_hyperedge_proposals"]
+    assert not args.search_budget["legacy_proposals"]
+
+
+def test_mapping_search_budget_reports_only_the_lut_search():
+    args = SimpleNamespace(
+        update_mode="mapping",
+        fast_approx=True,
+        replica_candidate_limit=64,
+        partition_restarts=3,
+        alternations=3,
+        lut_iterations=6,
+        partition_iterations=24,
+        assignment_iterations=12,
+    )
+
+    placemoe_planner._configure_search(args)
+
+    assert args.search_budget["update_mode"] == "mapping"
+    assert args.search_budget["requested"] == {"lut_iterations": 6}
+    assert args.search_budget["effective"] == {"lut_iterations": 1}
+    assert not args.search_budget["calibrated_proposals"]
+    assert not args.search_budget["normalized_proposals"]
+    assert not args.search_budget["community_proposals"]
+    assert not args.search_budget["legacy_proposals"]
+
+
 def test_rank_only_dispatch_records_one_stage_a2a_events(monkeypatch):
     monkeypatch.setattr(all_to_all_module, "_HIERMOE_INTERNAL_TIMING", True)
     monkeypatch.setattr(all_to_all_module, "_hiermoe_internal_event", object)
@@ -194,6 +272,7 @@ def test_hot_update_schedules_independent_layout_and_mapping_intervals(
 
 def test_hot_update_passes_calibration_coefficients_to_planner(monkeypatch, tmp_path):
     manager = _runtime_manager()
+    manager._hot_update_resources = PlaceMoEPlannerResources(fast_approx=True)
     layer = SimpleNamespace(
         key="layers.0.experts",
         num_experts=2,
@@ -245,6 +324,7 @@ def test_hot_update_passes_calibration_coefficients_to_planner(monkeypatch, tmp_
     }
     for flag, value in expected.items():
         assert command[command.index(flag) + 1] == value
+    assert "--fast-approx" in command
 
 
 def test_canonical_hot_update_keeps_current_pair_when_planner_fails(monkeypatch) -> None:

@@ -129,6 +129,8 @@ def build_planner_command(
         if not spec.input_layout:
             raise ValueError("mapping-only planning requires input_layout.")
         command.extend(("--input-layout", spec.input_layout))
+    if resources.fast_approx:
+        command.append("--fast-approx")
     if resources.planner_cpu_ids:
         command = ["taskset", "-c", resources.planner_cpu_ids, *command]
     return command

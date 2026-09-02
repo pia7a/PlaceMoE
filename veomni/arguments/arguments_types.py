@@ -656,6 +656,7 @@ class PlaceMoEPlannerResourceArguments:
     workers: int = 48
     candidate_workers: int = 4
     worker_threads: int = 1
+    fast_approx: bool = False
     planner_cpu_ids: str = ""
     training_cpu_ids: str = ""
 

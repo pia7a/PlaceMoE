@@ -64,6 +64,7 @@ train:
         workers: 48
         candidate_workers: 4
         worker_threads: 1
+        fast_approx: false
 ```
 
 该 preset 会自动启用分层 token deduplication、source-aware dispatch 和 step
@@ -210,6 +211,18 @@ artifact 必须通过 schema 验证后才能安装。Mapping-only 更新不移�
 
 验证和生产发布建议使用 `failure_policy: raise`。只有在自适应更新失败时明确
 希望保留当前有效决策并继续训练，才使用 `continue`。
+
+当重规划延迟比穷举候选质量更重要时，可设置 `resources.fast_approx: true`；离线
+入口也可使用 `scripts/profile/plan_placemoe.py --fast-approx ...`。该模式把搜索
+限制为一个 replica allocation、一次 partition restart、一次 L/M 交替、一次
+mapping sweep、两次 partition/assignment iteration，并各保留一个 normalized 和
+community proposal，同时关闭 calibrated 和 legacy proposal families。保留的候选
+仍会经过容量校验和完整 route replay，
+但不保证得到完整搜索的最优解。报告会在 `aggregate.search_budget` 同时记录请求值
+和实际生效值。
+
+在 CPU 核数足够且各模型层并行规划时，该模式的目标是数秒到十几秒 wall time；
+route 加载、拓扑规模和 CPU 争用仍是硬下限，因此它不承诺严格低于一秒。
 
 ## 7. 适配其他 MoE 模型
 

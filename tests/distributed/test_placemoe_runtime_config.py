@@ -53,6 +53,7 @@ placemoe:
     workers: 8
     candidate_workers: 2
     worker_threads: 1
+    fast_approx: true
     planner_cpu_ids: 8-15
     training_cpu_ids: 0-7
 """,
@@ -67,6 +68,7 @@ placemoe:
     assert config.hot_update.mapping_interval_steps == 20
     assert config.hot_update.work_root == str(tmp_path / "work")
     assert config.hot_update.failure_policy == "continue"
+    assert config.resources.fast_approx
     assert config.resources.planner_cpu_ids == "8-15"
     assert config.calibration.compute_ms_per_assignment == pytest.approx(4.0e-5)
 
@@ -266,6 +268,7 @@ def test_runtime_config_loads_inline_training_config_without_initial_artifact(tm
     training_config.hot_update.mapping_interval_steps = 20
     training_config.hot_update.work_root = "runtime"
     training_config.resources.workers = 8
+    training_config.resources.fast_approx = True
 
     config = PlaceMoERuntimeConfig.from_training_config(training_config)
 
@@ -275,6 +278,7 @@ def test_runtime_config_loads_inline_training_config_without_initial_artifact(tm
     assert config.hot_update.enabled
     assert config.hot_update.work_root == str(tmp_path / "runtime")
     assert config.resources.workers == 8
+    assert config.resources.fast_approx
 
 
 def test_placemoe_preset_selects_canonical_hiermoe_runtime() -> None:

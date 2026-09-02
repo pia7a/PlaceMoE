@@ -96,6 +96,18 @@ class _CapacityPlan:
     empty_slots: int
 
 
+_FAST_APPROX_LIMITS = {
+    "replica_candidate_limit": 1,
+    "partition_restarts": 1,
+    "alternations": 1,
+    "lut_iterations": 1,
+    "partition_iterations": 2,
+    "assignment_iterations": 2,
+    "community_shortlist": 1,
+    "community_sweeps": 1,
+}
+
+
 def _parse_int_list(value: str) -> tuple[int, ...]:
     values = tuple(int(item) for item in value.split(",") if item.strip())
     if not values:
@@ -225,10 +237,19 @@ def _parse_args() -> argparse.Namespace:
         default=64,
         help="Maximum exact-budget replica allocations evaluated per logical partition.",
     )
+    parser.add_argument(
+        "--fast-approx",
+        action="store_true",
+        help=(
+            "Use a bounded approximate search: one allocation, one normalized proposal, "
+            "one community proposal, one L/M alternation, and no legacy proposals."
+        ),
+    )
     parser.add_argument("--partition-restarts", type=int, default=3)
     parser.add_argument("--alternations", type=int, default=3)
     parser.add_argument("--lut-iterations", type=int, default=6)
     parser.add_argument("--partition-iterations", type=int, default=24)
+    parser.add_argument("--assignment-iterations", type=int, default=12)
     parser.add_argument("--hyperedge-token-sample", type=int, default=16384)
     parser.add_argument("--structured-shortlist", type=int, default=2)
     parser.add_argument("--community-shortlist", type=int, default=2)
@@ -304,6 +325,60 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-layout", type=Path, required=True)
     parser.add_argument("--output-report", type=Path, required=True)
     return parser.parse_args()
+
+
+def _configure_search(args: argparse.Namespace) -> None:
+    """Validate the requested search budget and apply the fast approximation cap."""
+
+    search_fields = tuple(_FAST_APPROX_LIMITS)
+    defaults = {"community_shortlist": 2, "community_sweeps": 4}
+    requested = {name: int(getattr(args, name, defaults.get(name))) for name in search_fields}
+    for name, value in requested.items():
+        if not hasattr(args, name):
+            setattr(args, name, value)
+    invalid = [name for name, value in requested.items() if value < 0 or (name != "community_sweeps" and value == 0)]
+    if invalid:
+        raise ValueError(f"Planner search limits must be positive: {', '.join(invalid)}.")
+    if args.fast_approx:
+        for name, limit in _FAST_APPROX_LIMITS.items():
+            setattr(args, name, min(requested[name], limit))
+    update_mode = str(getattr(args, "update_mode", "full"))
+    mapping_only = update_mode == "mapping"
+    reported_fields = ("lut_iterations",) if mapping_only else search_fields
+    communication_blind = bool(getattr(args, "communication_blind_proposals", False))
+    community_proposals = bool(
+        not mapping_only
+        and not communication_blind
+        and (
+            not getattr(args, "disable_community_block_candidates", False)
+            or getattr(args, "include_community_block_candidates", False)
+        )
+    )
+    legacy_structured_proposals = bool(
+        not mapping_only
+        and not args.fast_approx
+        and not communication_blind
+        and getattr(args, "include_legacy_structured_candidates", False)
+        and not getattr(args, "disable_structured_overlap_candidates", False)
+    )
+    legacy_hyperedge_proposals = bool(
+        not mapping_only
+        and not args.fast_approx
+        and not communication_blind
+        and getattr(args, "include_legacy_hyperedge_candidates", False)
+    )
+    args.search_budget = {
+        "mode": "fast_approx" if args.fast_approx else "full",
+        "update_mode": update_mode,
+        "requested": {name: requested[name] for name in reported_fields},
+        "effective": {name: int(getattr(args, name)) for name in reported_fields},
+        "calibrated_proposals": not mapping_only and not args.fast_approx,
+        "normalized_proposals": not mapping_only,
+        "community_proposals": community_proposals,
+        "legacy_structured_proposals": legacy_structured_proposals,
+        "legacy_hyperedge_proposals": legacy_hyperedge_proposals,
+        "legacy_proposals": legacy_structured_proposals or legacy_hyperedge_proposals,
+    }
 
 
 def _is_e2e_eligible(
@@ -385,6 +460,7 @@ def _logical_base_partitions(
     num_nodes: int,
     restarts: int,
     iterations: int,
+    assignment_iterations: int,
     seed: int,
     omega: float = 1.0,
     gamma: float = 1.0,
@@ -398,6 +474,7 @@ def _logical_base_partitions(
         omega=omega,
         gamma=gamma,
         restarts=restarts,
+        assignment_iterations=assignment_iterations,
         exchange_limit=iterations,
         seed=seed,
     )
@@ -443,6 +520,7 @@ def _replica_allocations(
     replicas: int,
     restarts: int,
     iterations: int,
+    assignment_iterations: int,
     seed: int,
     candidate_limit: int,
     omega: float = 1.0,
@@ -488,6 +566,7 @@ def _replica_allocations(
             num_nodes=num_groups,
             restarts=restarts,
             iterations=iterations,
+            assignment_iterations=assignment_iterations,
             seed=seed,
             omega=omega,
             gamma=gamma,
@@ -1279,6 +1358,7 @@ def _build_placemoe_candidate(
                 rank_omega=rank_omega,
                 gamma=gamma,
                 rounds=args.alternations,
+                assignment_iterations=args.assignment_iterations,
                 node_exchange_limit=args.partition_iterations,
                 rank_exchange_limit=max(1, args.partition_iterations // 2),
                 mapping_sweep_limit=args.lut_iterations,
@@ -1539,6 +1619,8 @@ def _preloaded_replay_payload(
         ),
         source={
             "algorithm": algorithm,
+            "search_mode": args.search_budget["mode"],
+            "search_budget": args.search_budget,
             "route_root": str(args.route_root.resolve()),
             "optimize_steps": list(args.optimize_steps),
             "validation_steps": list(args.validation_steps),
@@ -1716,6 +1798,7 @@ def _plan_layer(
         num_nodes=args.ep_size // args.ranks_per_node,
         restarts=args.partition_restarts,
         iterations=args.partition_iterations,
+        assignment_iterations=args.assignment_iterations,
         seed=args.seed + 100_003 * layer,
         omega=node_omega,
         gamma=gamma,
@@ -1726,6 +1809,7 @@ def _plan_layer(
         replicas=capacity.active_replicas,
         restarts=args.partition_restarts,
         iterations=args.partition_iterations,
+        assignment_iterations=args.assignment_iterations,
         seed=args.seed + 100_003 * layer + 53_123,
         candidate_limit=args.replica_candidate_limit,
         omega=node_omega,
@@ -1750,21 +1834,23 @@ def _plan_layer(
             allocation_key = logical_instances.tobytes()
             if allocation_key not in seen_generic_allocations:
                 seen_generic_allocations.add(allocation_key)
-                # Keep the calibrated paper heuristic and the normalized
-                # compatibility heuristic as independent state machines. A
-                # shared alternation state can silently remove the historical
-                # low-A2A candidate even when both refinements are invoked.
+                # Full search keeps the calibrated and normalized heuristics
+                # as independent state machines. The bounded search keeps the
+                # normalized state machine because held-out EP32/EP64 replays
+                # showed it dominates the calibrated proposal when the
+                # partition and assignment budgets are aggressively capped.
                 for proposal_restart in range(args.partition_restarts):
                     proposal_seed = args.seed + 100_003 * layer + 997 * proposal_restart + 31 * combination_index
-                    candidate_jobs.append(
-                        {
-                            "logical_instances": logical_instances,
-                            "demand_by_source": source_demand,
-                            "affinity_by_source": source_affinity,
-                            "seed": proposal_seed,
-                            "strategy": f"placemoe_p{proposal_restart}_c{combination_index}",
-                        }
-                    )
+                    if not args.fast_approx:
+                        candidate_jobs.append(
+                            {
+                                "logical_instances": logical_instances,
+                                "demand_by_source": source_demand,
+                                "affinity_by_source": source_affinity,
+                                "seed": proposal_seed,
+                                "strategy": f"placemoe_p{proposal_restart}_c{combination_index}",
+                            }
+                        )
                     candidate_jobs.append(
                         {
                             "logical_instances": logical_instances,
@@ -1861,7 +1947,11 @@ def _plan_layer(
                     source_demand,
                     ranks_per_node=args.ranks_per_node,
                 )
-                if (args.include_legacy_structured_candidates and not args.disable_structured_overlap_candidates)
+                if (
+                    not args.fast_approx
+                    and args.include_legacy_structured_candidates
+                    and not args.disable_structured_overlap_candidates
+                )
                 and not args.communication_blind_proposals
                 else []
             )
@@ -1917,7 +2007,11 @@ def _plan_layer(
                         "fixed_initial_lut": coherent_lut,
                     }
                 )
-            if args.include_legacy_hyperedge_candidates and not args.communication_blind_proposals:
+            if (
+                not args.fast_approx
+                and args.include_legacy_hyperedge_candidates
+                and not args.communication_blind_proposals
+            ):
                 hyperedge_nodes = _hyperedge_instance_nodes(
                     optimize_samples,
                     logical_instances,
@@ -2030,6 +2124,7 @@ def _plan_layer(
 
 def main() -> None:
     args = _parse_args()
+    _configure_search(args)
     if args.layer_keys and len(args.layer_keys) != args.layers:
         raise ValueError(f"--layer-keys contains {len(args.layer_keys)} keys, expected {args.layers}.")
     if len(set(args.layer_keys)) != len(args.layer_keys):
@@ -2109,6 +2204,8 @@ def main() -> None:
         },
         "layers": rows,
         "aggregate": {
+            "search_mode": args.search_budget["mode"],
+            "search_budget": args.search_budget,
             "replica_slots": capacity.active_replicas,
             "reserved_replica_slots": capacity.reserved_replicas,
             "active_replica_slots": capacity.active_replicas,

@@ -66,6 +66,7 @@ train:
         workers: 48
         candidate_workers: 4
         worker_threads: 1
+        fast_approx: false
 ```
 
 The preset automatically enables hierarchical token deduplication,
@@ -227,6 +228,21 @@ states, and install `L` and `M` at a training-step boundary.
 `failure_policy: raise` is recommended for validation and production rollout.
 Use `continue` only when explicitly preferring the current valid pair over
 terminating the job after an adaptive-update failure.
+
+Set `resources.fast_approx: true` when replanning latency is more important
+than exhaustive candidate quality. The same mode is available to the offline
+entry point as `scripts/profile/plan_placemoe.py --fast-approx ...`. It caps
+the search at one replica allocation, one partition restart, one L/M
+alternation, one mapping sweep, two partition/assignment iterations, and
+retains one normalized and one community proposal while disabling calibrated
+and legacy proposal families. The planner
+still validates capacity and evaluates the retained candidates by complete
+route replay; it does not guarantee the full-search optimum. The report writes
+both requested and effective limits under `aggregate.search_budget`.
+
+This mode targets seconds-to-tens-of-seconds wall time when model layers run in
+parallel on sufficient CPU cores. Route loading, topology size, and CPU
+contention remain hard lower bounds, so it is not a strict sub-second deadline.
 
 ## 7. Adapting another MoE model
 

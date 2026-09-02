@@ -18,10 +18,12 @@ _PLAN_FIELDS = ("slot_to_logical", "owner_slots", "source_logical_to_physical")
 
 
 @pytest.mark.parametrize(("redundant_slots", "copies_per_expert"), [(0, 1), (1, 2)])
+@pytest.mark.parametrize("fast_approx", [False, True])
 def test_single_node_planner_builds_valid_layout(
     tmp_path: Path,
     redundant_slots: int,
     copies_per_expert: int,
+    fast_approx: bool,
 ) -> None:
     route_root = tmp_path / "routes"
     samples = (
@@ -80,6 +82,8 @@ def test_single_node_planner_builds_valid_layout(
         "--output-report",
         str(output_report),
     ]
+    if fast_approx:
+        command.append("--fast-approx")
 
     subprocess.run(command, check=True, cwd=Path(__file__).resolve().parents[2])
 
@@ -91,6 +95,14 @@ def test_single_node_planner_builds_valid_layout(
     assert all(len(set(row)) == 4 for row in layer["source_logical_to_physical"])
     assert report["aggregate"]["active_replica_slots"] == 4 * redundant_slots
     assert report["aggregate"]["empty_slots"] == 0
+    budget = report["aggregate"]["search_budget"]
+    assert budget["mode"] == ("fast_approx" if fast_approx else "full")
+    assert budget["calibrated_proposals"] is not fast_approx
+    assert budget["normalized_proposals"]
+    assert not budget["community_proposals"]
+    strategies = {candidate["strategy"] for candidate in report["layers"][0]["candidates"]}
+    assert any(strategy.startswith("placemoe_normalized_") for strategy in strategies)
+    assert any(strategy.startswith("placemoe_p") for strategy in strategies) is not fast_approx
 
 
 def _required_path(name: str) -> Path:
@@ -124,6 +136,7 @@ def _planner_command(configuration: dict, route_root: Path, output_layout: Path,
         "alternations": "alternations",
         "lut-iterations": "lut_iterations",
         "partition-iterations": "partition_iterations",
+        "assignment-iterations": "assignment_iterations",
         "hyperedge-token-sample": "hyperedge_token_sample",
         "structured-shortlist": "structured_shortlist",
         "community-shortlist": "community_shortlist",
@@ -163,6 +176,8 @@ def _planner_command(configuration: dict, route_root: Path, output_layout: Path,
             command.extend((f"--{option}", str(value)))
     if configuration.get("disable_structured_overlap_candidates", False):
         command.append("--disable-structured-overlap-candidates")
+    if configuration.get("fast_approx", False):
+        command.append("--fast-approx")
     return command
 
 

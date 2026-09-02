@@ -36,12 +36,14 @@ class CPUAffinityPlan:
     workers: int
     candidate_workers: int
     worker_threads: int
+    fast_approx: bool
 
     def planner_resources(self) -> PlaceMoEPlannerResources:
         return PlaceMoEPlannerResources(
             workers=self.workers,
             candidate_workers=self.candidate_workers,
             worker_threads=self.worker_threads,
+            fast_approx=self.fast_approx,
             planner_cpu_ids=format_cpu_ids(self.planner_cpu_ids),
             training_cpu_ids=format_cpu_ids(self.training_cpu_ids),
         )
@@ -198,6 +200,7 @@ def _build_plan(
         workers=workers,
         candidate_workers=candidate_workers,
         worker_threads=worker_threads,
+        fast_approx=resources.fast_approx,
     )
 
 

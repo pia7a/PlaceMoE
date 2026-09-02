@@ -243,12 +243,20 @@ class PlaceMoEPlannerResources:
     workers: int = 48
     candidate_workers: int = 4
     worker_threads: int = 1
+    fast_approx: bool = False
     planner_cpu_ids: str = ""
     training_cpu_ids: str = ""
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "PlaceMoEPlannerResources":
-        allowed = {"workers", "candidate_workers", "worker_threads", "planner_cpu_ids", "training_cpu_ids"}
+        allowed = {
+            "workers",
+            "candidate_workers",
+            "worker_threads",
+            "fast_approx",
+            "planner_cpu_ids",
+            "training_cpu_ids",
+        }
         unknown = sorted(set(payload) - allowed)
         if unknown:
             raise PlaceMoEConfigurationError(f"unknown resource fields: {', '.join(unknown)}.")
@@ -261,6 +269,7 @@ class PlaceMoEPlannerResources:
             worker_threads=_positive_int(
                 payload.get("worker_threads", defaults.worker_threads), "resources.worker_threads"
             ),
+            fast_approx=_strict_bool(payload.get("fast_approx", defaults.fast_approx), "resources.fast_approx"),
             planner_cpu_ids=str(payload.get("planner_cpu_ids", defaults.planner_cpu_ids)).strip(),
             training_cpu_ids=str(payload.get("training_cpu_ids", defaults.training_cpu_ids)).strip(),
         )
